@@ -7,7 +7,7 @@ Manages agent wrappers, routes messages, maintains task state.
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 
 from ..protocol.messages import (
@@ -187,7 +187,7 @@ class Daemon:
             constraints=constraints or [],
             context=context,
             body=body,
-            assigned_at=datetime.utcnow().isoformat() + "Z",
+            assigned_at=datetime.now(UTC).isoformat(),
         )
 
         self.state.tasks[task_id] = task
@@ -205,7 +205,7 @@ class Daemon:
 
         msg_state = MessageState(
             msg_id=msg.id,
-            sent_at=datetime.utcnow().isoformat() + "Z",
+            sent_at=datetime.now(UTC).isoformat(),
         )
         self.state.messages[msg.id] = msg_state
 
@@ -227,7 +227,7 @@ class Daemon:
 
             if response and response.type == MessageType.WRAPPER_ACK:
                 msg_state.state = MessageDeliveryState.DELIVERED
-                msg_state.delivered_at = datetime.utcnow().isoformat() + "Z"
+                msg_state.delivered_at = datetime.now(UTC).isoformat()
 
         self._save_state()
         return task
@@ -243,7 +243,7 @@ class Daemon:
 
         task.state = new_state
         if new_state == TaskState.COMPLETED:
-            task.completed_at = datetime.utcnow().isoformat() + "Z"
+            task.completed_at = datetime.now(UTC).isoformat()
 
         self._save_state()
         return True

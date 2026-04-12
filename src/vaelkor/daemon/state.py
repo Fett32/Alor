@@ -5,7 +5,7 @@ The daemon owns all task state. Wrappers only report process state.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, UTC
 from enum import Enum
 from pathlib import Path
 import json
@@ -37,7 +37,7 @@ class Task:
     summary: str
     assigned_to: str
     state: TaskState = TaskState.ASSIGNED
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     assigned_at: str | None = None
     completed_at: str | None = None
     scope: list[str] = field(default_factory=lambda: ["*"])
@@ -122,7 +122,7 @@ class MessageState:
 @dataclass
 class SessionState:
     session_id: str
-    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    started_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     clean_shutdown: bool = False
     agents: dict[str, AgentState] = field(default_factory=dict)
     tasks: dict[str, Task] = field(default_factory=dict)

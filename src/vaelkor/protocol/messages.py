@@ -5,7 +5,7 @@ All IPC uses newline-delimited JSON over unix sockets.
 """
 
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, UTC
 from enum import Enum
 from typing import Any
 import json
@@ -80,7 +80,7 @@ class Message:
     id: str = field(default_factory=lambda: f"msg-{uuid.uuid4().hex[:8]}")
     task_id: str | None = None
     reply_to: str | None = None
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     summary: str | None = None
     body: dict[str, Any] = field(default_factory=dict)
 
