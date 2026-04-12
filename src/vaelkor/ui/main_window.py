@@ -148,6 +148,27 @@ class TaskListWidget(QGroupBox):
     def clear_tasks(self):
         self.task_list.clear()
 
+    def update_task_state(self, task_id: str, new_state: str):
+        """Update the display state of a task."""
+        for i in range(self.task_list.count()):
+            item = self.task_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == task_id:
+                # Update the icon based on new state
+                text = item.text()
+                lines = text.split("\n")
+                if len(lines) >= 2:
+                    # Extract parts and rebuild
+                    if new_state == "COMPLETED":
+                        icon = "✓"
+                    elif new_state == "ACCEPTED":
+                        icon = "●"
+                    else:
+                        icon = "○"
+                    # Replace first character (icon)
+                    lines[0] = icon + lines[0][1:]
+                    item.setText("\n".join(lines))
+                break
+
 
 class AgentStatusWidget(QGroupBox):
     """Agent status panel with connect buttons."""
@@ -391,11 +412,16 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self):
         self.controller.task_added.connect(self._on_task_added)
+        self.controller.task_updated.connect(self._on_task_updated)
         self.controller.agent_status_changed.connect(self._on_agent_status)
         self.controller.connected.connect(self._on_connected)
 
     def _on_task_added(self, task_id: str, summary: str, agent: str, state: str):
         self.task_list.add_task(task_id, summary, agent, state)
+
+    def _on_task_updated(self, task_id: str, new_state: str):
+        self.task_list.update_task_state(task_id, new_state)
+        self.statusBar().showMessage(f"Task {task_id} {new_state.lower()}", 3000)
 
     def _on_agent_status(self, agent: str, status: str):
         self.agent_status.set_agent_status(agent, status)

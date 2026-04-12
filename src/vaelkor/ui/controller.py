@@ -53,8 +53,17 @@ class DaemonController(QObject):
 
         self.daemon = Daemon()
 
+        def on_task_complete(task_id: str, agent_name: str):
+            # This runs in daemon thread, emit signal to UI thread
+            self.task_updated.emit(task_id, "COMPLETED")
+            self.agent_status_changed.emit(agent_name, "idle")
+
         async def run():
             await self.daemon.start(session_id)
+
+            # Register task completion callback
+            self.daemon._on_task_complete.append(on_task_complete)
+
             self.connected.emit()
 
             # Connect to autostart wrappers
