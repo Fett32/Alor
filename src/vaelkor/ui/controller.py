@@ -5,12 +5,16 @@ Runs daemon in a background thread, signals UI updates via Qt signals.
 """
 
 import asyncio
+import os
+import subprocess
+import sys
+from pathlib import Path
 from threading import Thread
 from typing import Callable
 
 from PySide6.QtCore import QObject, Signal
 
-from ..config import load_config
+from ..config import load_config, SOCKET_DIR
 from ..daemon.core import Daemon
 from ..daemon.state import Task, TaskState
 
@@ -36,6 +40,13 @@ class DaemonController(QObject):
 
     def start(self, session_id: str | None = None):
         """Start daemon in background thread."""
+        # Auto-resume last session if not specified
+        if session_id is None:
+            from ..config import DATA_DIR
+            last_session_file = DATA_DIR / "last_session"
+            if last_session_file.exists():
+                session_id = last_session_file.read_text().strip()
+
         self._running = True
         self._thread = Thread(target=self._run_daemon_thread, args=(session_id,), daemon=True)
         self._thread.start()
@@ -51,7 +62,10 @@ class DaemonController(QObject):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
-        self.daemon = Daemon()
+        self.daemon = Daemon(
+            heartbeat_interval=self.config.heartbeat_interval,
+            task_assignment_timeout=self.config.task_assignment_timeout,
+        )
 
         def on_task_complete(task_id: str, agent_name: str):
             # This runs in daemon thread, emit signal to UI thread
@@ -66,8 +80,35 @@ class DaemonController(QObject):
 
             self.connected.emit()
 
-            # Connect to autoconnect wrappers
+            # Launch and connect to wrappers
             for name, agent_config in self.config.agents.items():
+                socket_path = SOCKET_DIR / f"{name}.sock"
+                pid_path = SOCKET_DIR / f"{name}.pid"
+
+                # Launch wrapper if autolaunch
+                if agent_config.autolaunch:
+                    # Kill previous wrapper using PID file (not pattern-based)
+                    if pid_path.exists():
+                        try:
+                            old_pid = int(pid_path.read_text().strip())
+                            os.kill(old_pid, 15)  # SIGTERM
+                            await asyncio.sleep(0.2)
+                        except (ValueError, ProcessLookupError, PermissionError):
+                            pass
+                        pid_path.unlink(missing_ok=True)
+
+                    if socket_path.exists():
+                        socket_path.unlink()
+
+                    # Launch fresh wrapper (will reattach to existing tmux session)
+                    self._launch_wrapper(name)
+                    # Wait for wrapper to start
+                    for _ in range(20):  # 2 second timeout
+                        await asyncio.sleep(0.1)
+                        if socket_path.exists():
+                            break
+
+                # Connect if autoconnect
                 if agent_config.autoconnect:
                     success = await self.daemon.connect_wrapper(name)
                     status = "running" if success else "disconnected"
@@ -150,3 +191,33 @@ class DaemonController(QObject):
             return success
 
         return self._run_async(_connect())
+
+    def _launch_wrapper(self, agent_name: str):
+        """Launch a wrapper process for an agent (headless)."""
+        log_path = SOCKET_DIR / f"{agent_name}.log"
+        log_file = open(log_path, "w")
+        env = dict(os.environ, TERM="xterm-256color")
+        subprocess.Popen(
+            [sys.executable, "-m", "vaelkor.wrapper.cli", agent_name],
+            start_new_session=True,
+            env=env,
+            stdout=log_file,
+            stderr=log_file,
+        )
+        # Don't close log_file - let wrapper write to it
+
+    def launch_wrapper(self, agent_name: str) -> bool:
+        """Launch wrapper and wait for it to be ready."""
+        socket_path = SOCKET_DIR / f"{agent_name}.sock"
+        if socket_path.exists():
+            return True  # Already running
+
+        self._launch_wrapper(agent_name)
+
+        # Wait for socket (sync version for UI calls)
+        import time
+        for _ in range(20):
+            time.sleep(0.1)
+            if socket_path.exists():
+                return True
+        return False

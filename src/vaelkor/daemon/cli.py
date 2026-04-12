@@ -37,7 +37,10 @@ def main():
 
 async def run_daemon(config, session_id: str | None):
     """Run daemon with graceful shutdown."""
-    daemon = Daemon()
+    daemon = Daemon(
+        heartbeat_interval=config.heartbeat_interval,
+        task_assignment_timeout=config.task_assignment_timeout,
+    )
 
     loop = asyncio.get_event_loop()
     stop_event = asyncio.Event()

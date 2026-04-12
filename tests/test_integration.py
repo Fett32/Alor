@@ -5,6 +5,7 @@ Requires tmux to be installed: sudo apt install tmux
 """
 
 import asyncio
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 
 from vaelkor.wrapper.base import AgentWrapper, WrapperConfig
 from vaelkor.daemon.core import Daemon
+from vaelkor.daemon.state import AgentState, SessionState, Task, TaskState
 from vaelkor.protocol.messages import Message, MessageType
 
 
@@ -256,3 +258,307 @@ async def test_task_timeout():
             await daemon.stop()
         finally:
             pass
+
+
+@pytest.mark.asyncio
+async def test_task_accepted_after_ack():
+    """Task transitions to ACCEPTED state after wrapper ACKs."""
+    with tempfile.TemporaryDirectory() as socket_tmpdir, \
+         tempfile.TemporaryDirectory() as data_tmpdir:
+
+        socket_dir = Path(socket_tmpdir)
+        data_dir = Path(data_tmpdir)
+
+        # Start wrapper
+        config = WrapperConfig(
+            agent_name="claude",
+            socket_path=socket_dir / "claude.sock",
+            command=["bash"],
+            session_prefix="vaelkor-test",
+        )
+        wrapper = AgentWrapper(config)
+        await wrapper.start()
+
+        try:
+            # Start daemon and connect
+            daemon = Daemon(data_dir=data_dir)
+            daemon.socket_dir = socket_dir
+            await daemon.start()
+            await daemon.connect_wrapper("claude")
+
+            # Task should be ASSIGNED initially, then ACCEPTED after wrapper ACKs
+            task = await daemon.assign_task(
+                to_agent="claude",
+                summary="Test task for acceptance",
+            )
+
+            assert task is not None
+            # After ACK, task should be ACCEPTED
+            assert task.state.value == "ACCEPTED"
+
+            await daemon.stop()
+        finally:
+            await wrapper.stop()
+
+
+@pytest.mark.asyncio
+async def test_task_timeout_state_transition():
+    """Task transitions to TIMED_OUT after timeout when unacknowledged."""
+    with tempfile.TemporaryDirectory() as data_tmpdir:
+        data_dir = Path(data_tmpdir)
+
+        # Start daemon with very short timeout
+        daemon = Daemon(data_dir=data_dir, task_assignment_timeout=0.5)
+        await daemon.start()
+
+        try:
+            task = await daemon.assign_task(
+                to_agent="nonexistent",
+                summary="This will timeout quickly",
+            )
+
+            assert task is not None
+            assert task.state.value == "ASSIGNED"
+
+            # Wait for timeout
+            await asyncio.sleep(0.7)
+
+            # Task should now be TIMED_OUT
+            updated_task = daemon.get_task(task.task_id)
+            assert updated_task.state.value == "TIMED_OUT"
+
+            await daemon.stop()
+        finally:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_input_mode_override():
+    """Override mode wraps input with task context."""
+    with tempfile.TemporaryDirectory() as socket_tmpdir, \
+         tempfile.TemporaryDirectory() as data_tmpdir:
+
+        socket_dir = Path(socket_tmpdir)
+        data_dir = Path(data_tmpdir)
+
+        config = WrapperConfig(
+            agent_name="claude",
+            socket_path=socket_dir / "claude.sock",
+            command=["bash"],
+            session_prefix="vaelkor-test",
+        )
+        wrapper = AgentWrapper(config)
+        await wrapper.start()
+
+        try:
+            daemon = Daemon(data_dir=data_dir)
+            daemon.socket_dir = socket_dir
+            await daemon.start()
+            await daemon.connect_wrapper("claude")
+
+            # Assign task first so override has context
+            await daemon.assign_task(
+                to_agent="claude",
+                summary="Test task",
+            )
+
+            # Send override input
+            await daemon.send_user_input("claude", "focus on auth", "override")
+
+            # Check transcript for OVERRIDE prefix
+            await asyncio.sleep(0.3)
+            transcript = await daemon.get_agent_transcript("claude", 50)
+            transcript_text = "\n".join(transcript)
+
+            assert "[OVERRIDE for task-001]" in transcript_text
+            assert "focus on auth" in transcript_text
+
+            await daemon.stop()
+        finally:
+            await wrapper.stop()
+
+
+@pytest.mark.asyncio
+async def test_input_mode_chat():
+    """Chat mode passes input without wrapping."""
+    with tempfile.TemporaryDirectory() as socket_tmpdir, \
+         tempfile.TemporaryDirectory() as data_tmpdir:
+
+        socket_dir = Path(socket_tmpdir)
+        data_dir = Path(data_tmpdir)
+
+        config = WrapperConfig(
+            agent_name="claude",
+            socket_path=socket_dir / "claude.sock",
+            command=["bash"],
+            session_prefix="vaelkor-test",
+        )
+        wrapper = AgentWrapper(config)
+        await wrapper.start()
+
+        try:
+            daemon = Daemon(data_dir=data_dir)
+            daemon.socket_dir = socket_dir
+            await daemon.start()
+            await daemon.connect_wrapper("claude")
+
+            # Assign task first
+            await daemon.assign_task(
+                to_agent="claude",
+                summary="Test task",
+            )
+
+            # Send chat input
+            await daemon.send_user_input("claude", "hello there", "chat")
+
+            # Check transcript - should NOT have OVERRIDE prefix
+            await asyncio.sleep(0.3)
+            transcript = await daemon.get_agent_transcript("claude", 50)
+            transcript_text = "\n".join(transcript)
+
+            assert "hello there" in transcript_text
+            assert "[OVERRIDE" not in transcript_text
+
+            await daemon.stop()
+        finally:
+            await wrapper.stop()
+
+
+@pytest.mark.asyncio
+async def test_recovery_tasks_become_stale_without_wrapper():
+    """Tasks in flight during crash become STALE if wrapper unreachable."""
+    with tempfile.TemporaryDirectory() as data_tmpdir:
+        data_dir = Path(data_tmpdir)
+        session_id = "test-recovery-session"
+
+        # Create a crashed session state with in-flight tasks
+        session_dir = data_dir / "sessions" / session_id
+        session_dir.mkdir(parents=True)
+
+        state = SessionState(session_id=session_id, clean_shutdown=False)
+        state.agents["claude"] = AgentState(name="claude", status="running")
+        state.tasks["task-001"] = Task(
+            task_id="task-001",
+            summary="Task that was in flight",
+            assigned_to="claude",
+            state=TaskState.ACCEPTED,
+        )
+        state.tasks["task-002"] = Task(
+            task_id="task-002",
+            summary="Another in-flight task",
+            assigned_to="claude",
+            state=TaskState.ASSIGNED,
+        )
+        state.save(session_dir / "state.json")
+
+        # Start daemon with crashed session - no wrapper available
+        daemon = Daemon(data_dir=data_dir)
+        await daemon.start(session_id)
+
+        try:
+            # Both tasks should be STALE since wrapper is unreachable
+            assert daemon.state.tasks["task-001"].state == TaskState.STALE
+            assert daemon.state.tasks["task-002"].state == TaskState.STALE
+
+            await daemon.stop()
+        finally:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_recovery_resolves_to_accepted_if_current():
+    """Task resolves to ACCEPTED if wrapper reports it as current."""
+    with tempfile.TemporaryDirectory() as socket_tmpdir, \
+         tempfile.TemporaryDirectory() as data_tmpdir:
+
+        socket_dir = Path(socket_tmpdir)
+        data_dir = Path(data_tmpdir)
+        session_id = "test-recovery-current"
+
+        # Start wrapper first and give it a current task
+        config = WrapperConfig(
+            agent_name="claude",
+            socket_path=socket_dir / "claude.sock",
+            command=["bash"],
+            session_prefix="vaelkor-test",
+        )
+        wrapper = AgentWrapper(config)
+        await wrapper.start()
+        wrapper.current_task_id = "task-001"  # Simulate task in progress
+
+        try:
+            # Create crashed session state
+            session_dir = data_dir / "sessions" / session_id
+            session_dir.mkdir(parents=True)
+
+            state = SessionState(session_id=session_id, clean_shutdown=False)
+            state.agents["claude"] = AgentState(name="claude", status="running")
+            state.tasks["task-001"] = Task(
+                task_id="task-001",
+                summary="Task still running in wrapper",
+                assigned_to="claude",
+                state=TaskState.ACCEPTED,
+            )
+            state.save(session_dir / "state.json")
+
+            # Start daemon - should recover and find task still active
+            daemon = Daemon(data_dir=data_dir)
+            daemon.socket_dir = socket_dir
+            await daemon.start(session_id)
+
+            # Task should resolve back to ACCEPTED
+            assert daemon.state.tasks["task-001"].state == TaskState.ACCEPTED
+
+            await daemon.stop()
+        finally:
+            await wrapper.stop()
+
+
+@pytest.mark.asyncio
+async def test_recovery_resolves_to_completed_if_done():
+    """Task resolves to COMPLETED if wrapper reports it in completed_tasks."""
+    with tempfile.TemporaryDirectory() as socket_tmpdir, \
+         tempfile.TemporaryDirectory() as data_tmpdir:
+
+        socket_dir = Path(socket_tmpdir)
+        data_dir = Path(data_tmpdir)
+        session_id = "test-recovery-completed"
+
+        # Start wrapper and mark task as completed
+        config = WrapperConfig(
+            agent_name="claude",
+            socket_path=socket_dir / "claude.sock",
+            command=["bash"],
+            session_prefix="vaelkor-test",
+        )
+        wrapper = AgentWrapper(config)
+        await wrapper.start()
+        wrapper._completed_tasks.append("task-001")  # Task finished during crash
+
+        try:
+            # Create crashed session state
+            session_dir = data_dir / "sessions" / session_id
+            session_dir.mkdir(parents=True)
+
+            state = SessionState(session_id=session_id, clean_shutdown=False)
+            state.agents["claude"] = AgentState(name="claude", status="running")
+            state.tasks["task-001"] = Task(
+                task_id="task-001",
+                summary="Task that completed during crash",
+                assigned_to="claude",
+                state=TaskState.ACCEPTED,
+            )
+            state.save(session_dir / "state.json")
+
+            # Start daemon - should recover and find task completed
+            daemon = Daemon(data_dir=data_dir)
+            daemon.socket_dir = socket_dir
+            await daemon.start(session_id)
+
+            # Task should resolve to COMPLETED
+            assert daemon.state.tasks["task-001"].state == TaskState.COMPLETED
+            assert daemon.state.tasks["task-001"].completed_at is not None
+
+            await daemon.stop()
+        finally:
+            await wrapper.stop()

@@ -42,7 +42,8 @@ CONSTRAINT_TEMPLATES = {
 # These are checked against the last few lines of output
 IDLE_PATTERNS = {
     "claude": [
-        r"^claude>",           # Claude CLI prompt
+        r"^❯\s*$",             # Claude Code prompt (unicode arrow)
+        r"^claude>",           # Claude CLI prompt (legacy)
         r"^>\s*$",             # Generic prompt
     ],
     "codex": [
@@ -192,26 +193,30 @@ class AgentWrapper:
             self._on_task_complete(task_id)
 
     async def _start_agent(self):
-        """Launch the agent CLI in a tmux session."""
+        """Launch or attach to agent CLI in a tmux session."""
         self.status = AgentStatus.STARTING
 
         if self._session_exists():
-            subprocess.run(["tmux", "kill-session", "-t", self.session_name])
-
-        cmd = ["tmux", "new-session", "-d", "-s", self.session_name]
-        cmd.extend(self.config.command)
-
-        result = subprocess.run(cmd, capture_output=True)
-        if result.returncode == 0:
+            # Reattach to existing session
             self.status = AgentStatus.RUNNING
             self.pid = self._get_session_pid()
         else:
-            self.status = AgentStatus.DEAD
+            # Create new session
+            cmd = ["tmux", "new-session", "-d", "-s", self.session_name]
+            cmd.extend(self.config.command)
+
+            env = os.environ.copy()
+            env["TERM"] = "xterm-256color"
+            result = subprocess.run(cmd, capture_output=True, env=env)
+            if result.returncode == 0:
+                self.status = AgentStatus.RUNNING
+                self.pid = self._get_session_pid()
+            else:
+                self.status = AgentStatus.DEAD
 
     async def _stop_agent(self):
-        """Kill the tmux session."""
-        if self._session_exists():
-            subprocess.run(["tmux", "kill-session", "-t", self.session_name])
+        """Disconnect from tmux session (leave it running)."""
+        # Don't kill the session - let it persist for reconnection
         self.status = AgentStatus.STOPPED
         self.pid = None
 
@@ -319,6 +324,12 @@ class AgentWrapper:
 
             case MessageType.WRAPPER_APPEND_INPUT:
                 text = msg.body.get("text", "")
+                mode = msg.body.get("mode", "chat")
+
+                if mode == "override" and self.current_task_id:
+                    # Override mode: wrap input with task context
+                    text = f"[OVERRIDE for {self.current_task_id}]: {text}"
+
                 self._send_to_agent(text)
                 return Message(
                     type=MessageType.WRAPPER_ACK,

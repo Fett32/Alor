@@ -25,6 +25,7 @@ class AgentConfig:
     role: str  # orchestrator, reviewer, etc.
     command: list[str]
     autoconnect: bool = False
+    autolaunch: bool = False  # Launch wrapper automatically if not running
     constraints: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -33,6 +34,7 @@ class AgentConfig:
             "role": self.role,
             "command": self.command,
             "autoconnect": self.autoconnect,
+            "autolaunch": self.autolaunch,
             "constraints": self.constraints,
         }
 
@@ -44,6 +46,7 @@ class AgentConfig:
             role=d.get("role", "agent"),
             command=d.get("command", []),
             autoconnect=d.get("autoconnect", False),
+            autolaunch=d.get("autolaunch", False),
             constraints=d.get("constraints", []),
         )
 
@@ -164,6 +167,7 @@ def _create_default_agents():
         role="orchestrator",
         command=["claude"],
         autoconnect=True,
+        autolaunch=True,
         constraints=[],
     )
     save_agent_config(claude)

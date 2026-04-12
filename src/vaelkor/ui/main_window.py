@@ -4,11 +4,17 @@ Vaelkor main window - task-first UI.
 
 import os
 import pty
+import re
 import subprocess
 
 import pyte
-from PySide6.QtCore import Qt, QSocketNotifier, QTimer
-from PySide6.QtGui import QFont, QTextCursor
+
+# Regex to strip ANSI escape sequences
+ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|[\x00-\x1f]')
+import sys
+
+from PySide6.QtCore import Qt, QSocketNotifier, QTimer, QProcess
+from PySide6.QtGui import QFont, QTextCursor, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -206,7 +212,7 @@ class AgentStatusWidget(QGroupBox):
         row.addWidget(status_label)
 
         connect_btn = QPushButton("Connect")
-        connect_btn.setFixedWidth(70)
+        connect_btn.setFixedWidth(85)
         connect_btn.clicked.connect(lambda: self._on_connect_clicked(name))
         row.addWidget(connect_btn)
 
@@ -357,6 +363,8 @@ class TerminalWidget(QWidget):
                 self.screen.buffer[y][x].data or " "
                 for x in range(self.screen.columns)
             ).rstrip()
+            # Strip any leftover escape code fragments (e.g., "5:246m", "44m")
+            line = re.sub(r'\d*;?\d*:?\d+m\b', '', line)
             lines.append(line)
 
         while lines and not lines[-1]:
@@ -406,9 +414,16 @@ class MainWindow(QMainWindow):
         self._apply_style()
         self._setup_ui()
         self._connect_signals()
+        self._setup_shortcuts()
 
         # Start daemon
         self.controller.start()
+
+    def _setup_shortcuts(self):
+        """Setup keyboard shortcuts."""
+        # F5 to restart
+        restart_shortcut = QShortcut(QKeySequence("F5"), self)
+        restart_shortcut.activated.connect(self._restart_app)
 
     def _connect_signals(self):
         self.controller.task_added.connect(self._on_task_added)
@@ -429,6 +444,22 @@ class MainWindow(QMainWindow):
     def _on_connected(self):
         self.statusBar().showMessage("Daemon connected", 3000)
         self.terminal.refresh_sessions()
+
+        # Reload existing tasks from resumed session
+        if self.controller.daemon and self.controller.daemon.state:
+            for task in self.controller.daemon.state.tasks.values():
+                self.task_list.add_task(
+                    task.task_id, task.summary, task.assigned_to, task.state
+                )
+
+    def _restart_app(self):
+        """Restart the application (F5)."""
+        self.statusBar().showMessage("Restarting...", 1000)
+        self.controller.stop()
+        self.terminal._detach()
+        # Launch new instance and quit
+        QProcess.startDetached(sys.executable, ["-m", "vaelkor.main"])
+        self.close()
 
     def closeEvent(self, event):
         self.controller.stop()

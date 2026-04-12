@@ -74,11 +74,17 @@ class WrapperConnection:
 class Daemon:
     """Core orchestration daemon."""
 
-    def __init__(self, data_dir: Path | None = None, heartbeat_interval: float = 5.0):
+    def __init__(
+        self,
+        data_dir: Path | None = None,
+        heartbeat_interval: float = 5.0,
+        task_assignment_timeout: float = 30.0,
+    ):
         self.data_dir = data_dir or Path.home() / ".local/share/vaelkor"
         self.session_dir = self.data_dir / "sessions"
         self.socket_dir = Path("/tmp/vaelkor")
         self.heartbeat_interval = heartbeat_interval
+        self.task_assignment_timeout = task_assignment_timeout
 
         self.state: SessionState | None = None
         self.wrappers: dict[str, WrapperConnection] = {}
@@ -311,7 +317,7 @@ class Daemon:
         if to_agent not in self.wrappers or not self.wrappers[to_agent].connected:
             # No wrapper connected - task stays ASSIGNED, will timeout
             # Schedule timeout check
-            asyncio.create_task(self._check_task_timeout(task_id, 30.0))
+            asyncio.create_task(self._check_task_timeout(task_id, self.task_assignment_timeout))
             self._save_state()
             return task
 
@@ -342,7 +348,7 @@ class Daemon:
                 self.state.agents[to_agent].current_task_id = task_id
         else:
             # Wrapper didn't respond properly - schedule timeout
-            asyncio.create_task(self._check_task_timeout(task_id, 30.0))
+            asyncio.create_task(self._check_task_timeout(task_id, self.task_assignment_timeout))
 
         self._save_state()
         return task

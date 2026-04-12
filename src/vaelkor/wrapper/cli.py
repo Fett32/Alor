@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import asyncio
+import os
 import signal
 import sys
 from pathlib import Path
@@ -43,6 +44,7 @@ def main():
 async def run_wrapper(config: WrapperConfig):
     """Run wrapper with graceful shutdown."""
     wrapper = AgentWrapper(config)
+    pid_file = config.socket_path.with_suffix(".pid")
 
     loop = asyncio.get_event_loop()
     stop_event = asyncio.Event()
@@ -57,6 +59,9 @@ async def run_wrapper(config: WrapperConfig):
     print(f"Socket: {config.socket_path}")
     print(f"Command: {' '.join(config.command)}")
 
+    # Write PID file
+    pid_file.write_text(str(os.getpid()))
+
     await wrapper.start()
     print(f"Wrapper running. Session: {wrapper.session_name}")
 
@@ -64,6 +69,10 @@ async def run_wrapper(config: WrapperConfig):
 
     print("\nShutting down...")
     await wrapper.stop()
+
+    # Clean up PID file
+    if pid_file.exists():
+        pid_file.unlink()
     print("Wrapper stopped.")
 
 
