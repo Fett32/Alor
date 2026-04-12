@@ -8,9 +8,11 @@ over unix sockets using newline-delimited JSON.
 import asyncio
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from ..protocol.messages import (
     AgentStatus,
@@ -36,6 +38,24 @@ CONSTRAINT_TEMPLATES = {
 }
 
 
+# Patterns that indicate agent is idle/ready for input
+# These are checked against the last few lines of output
+IDLE_PATTERNS = {
+    "claude": [
+        r"^claude>",           # Claude CLI prompt
+        r"^>\s*$",             # Generic prompt
+    ],
+    "codex": [
+        r"^codex>",            # Codex prompt (if it has one)
+        r"^>\s*$",
+    ],
+    "default": [
+        r"^\$\s*$",            # Shell prompt
+        r"^>\s*$",
+    ],
+}
+
+
 @dataclass
 class WrapperConfig:
     agent_name: str
@@ -43,6 +63,8 @@ class WrapperConfig:
     command: list[str]
     session_prefix: str = "vaelkor"
     transcript_lines: int = 1000
+    idle_check_interval: float = 2.0  # Seconds between idle checks
+    idle_pattern_lines: int = 5       # Lines to check for idle pattern
 
 
 class AgentWrapper:
@@ -56,6 +78,15 @@ class AgentWrapper:
         self.server: asyncio.Server | None = None
         self.transcript: list[str] = []
         self.current_task_id: str | None = None
+        self._monitor_task: asyncio.Task | None = None
+        self._last_output_hash: int = 0
+        self._idle_since: float | None = None
+        self._on_task_complete: Callable[[str], None] | None = None
+        self._completed_tasks: list[str] = []  # Queue of completed task IDs
+
+        # Compile idle patterns for this agent
+        patterns = IDLE_PATTERNS.get(config.agent_name, IDLE_PATTERNS["default"])
+        self._idle_patterns = [re.compile(p) for p in patterns]
 
     async def start(self):
         """Start the wrapper server and agent process."""
@@ -71,14 +102,94 @@ class AgentWrapper:
 
         await self._start_agent()
 
+        # Start output monitoring
+        self._monitor_task = asyncio.create_task(self._monitor_output())
+
     async def stop(self):
         """Stop the agent and wrapper server."""
+        # Stop monitoring
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+
         await self._stop_agent()
         if self.server:
             self.server.close()
             await self.server.wait_closed()
         if self.config.socket_path.exists():
             self.config.socket_path.unlink()
+
+    async def _monitor_output(self):
+        """Background task to monitor agent output for idle state."""
+        import time
+
+        while True:
+            try:
+                await asyncio.sleep(self.config.idle_check_interval)
+
+                if not self.current_task_id:
+                    # No active task, skip monitoring
+                    self._idle_since = None
+                    continue
+
+                # Capture recent output
+                lines = self._capture_pane(self.config.idle_pattern_lines)
+                if not lines:
+                    continue
+
+                # Check if output changed
+                output_hash = hash(tuple(lines))
+                if output_hash == self._last_output_hash:
+                    # Output unchanged, check if idle pattern matches
+                    if self._check_idle_pattern(lines):
+                        if self._idle_since is None:
+                            self._idle_since = time.time()
+                        elif time.time() - self._idle_since > 3.0:
+                            # Idle for 3+ seconds with matching pattern = task complete
+                            await self._signal_task_complete()
+                else:
+                    # Output changed, reset idle timer
+                    self._last_output_hash = output_hash
+                    self._idle_since = None
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Don't crash monitor on errors
+                pass
+
+    def _check_idle_pattern(self, lines: list[str]) -> bool:
+        """Check if recent output matches idle pattern."""
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            for pattern in self._idle_patterns:
+                if pattern.match(line):
+                    return True
+            # First non-empty line doesn't match
+            return False
+        return False
+
+    async def _signal_task_complete(self):
+        """Signal that the current task appears complete."""
+        if not self.current_task_id:
+            return
+
+        task_id = self.current_task_id
+        self.current_task_id = None
+        self._idle_since = None
+        self.status = AgentStatus.IDLE
+
+        # Queue completion for daemon to pick up
+        self._completed_tasks.append(task_id)
+
+        # Notify via callback if set
+        if self._on_task_complete:
+            self._on_task_complete(task_id)
 
     async def _start_agent(self):
         """Launch the agent CLI in a tmux session."""
@@ -185,13 +296,25 @@ class AgentWrapper:
 
             case MessageType.WRAPPER_GET_STATUS:
                 if self._session_exists():
-                    self.status = AgentStatus.RUNNING
+                    if not self.current_task_id:
+                        self.status = AgentStatus.IDLE
+                    else:
+                        self.status = AgentStatus.RUNNING
                     self.pid = self._get_session_pid()
                 else:
                     self.status = AgentStatus.DEAD
                     self.pid = None
+
+                # Drain completed tasks queue
+                completed = self._completed_tasks.copy()
+                self._completed_tasks.clear()
+
                 return make_wrapper_status(
-                    self.config.agent_name, self.status, self.pid
+                    self.config.agent_name,
+                    self.status,
+                    self.pid,
+                    completed_tasks=completed,
+                    current_task=self.current_task_id,
                 )
 
             case MessageType.WRAPPER_APPEND_INPUT:

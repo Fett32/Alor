@@ -74,14 +74,17 @@ class WrapperConnection:
 class Daemon:
     """Core orchestration daemon."""
 
-    def __init__(self, data_dir: Path | None = None):
+    def __init__(self, data_dir: Path | None = None, heartbeat_interval: float = 5.0):
         self.data_dir = data_dir or Path.home() / ".local/share/vaelkor"
         self.session_dir = self.data_dir / "sessions"
         self.socket_dir = Path("/tmp/vaelkor")
+        self.heartbeat_interval = heartbeat_interval
 
         self.state: SessionState | None = None
         self.wrappers: dict[str, WrapperConnection] = {}
         self.running = False
+        self._heartbeat_task: asyncio.Task | None = None
+        self._on_task_complete: list[callable] = []  # Callbacks for task completion
 
     async def start(self, session_id: str | None = None):
         """Start the daemon with a new or existing session."""
@@ -100,9 +103,20 @@ class Daemon:
         self._save_last_session()
         self.running = True
 
+        # Start heartbeat polling
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
     async def stop(self):
         """Clean shutdown."""
         self.running = False
+
+        # Stop heartbeat
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
         for conn in self.wrappers.values():
             await conn.disconnect()
@@ -146,6 +160,59 @@ class Daemon:
                 if response and response.type == MessageType.WRAPPER_STATUS:
                     self.state.agents[agent_name].status = response.body.get("status", "unknown")
                     self.state.agents[agent_name].pid = response.body.get("pid")
+
+    async def _heartbeat_loop(self):
+        """Periodically poll wrappers for status and handle task completions."""
+        while self.running:
+            try:
+                await asyncio.sleep(self.heartbeat_interval)
+
+                for agent_name, conn in list(self.wrappers.items()):
+                    if not conn.connected:
+                        continue
+
+                    status_msg = Message(
+                        type=MessageType.WRAPPER_GET_STATUS,
+                        from_agent="daemon",
+                        to_agent="wrapper",
+                    )
+                    response = await conn.send(status_msg)
+
+                    if response and response.type == MessageType.WRAPPER_STATUS:
+                        # Update agent state
+                        if self.state and agent_name in self.state.agents:
+                            self.state.agents[agent_name].status = response.body.get("status", "unknown")
+                            self.state.agents[agent_name].pid = response.body.get("pid")
+
+                        # Handle completed tasks
+                        completed = response.body.get("completed_tasks", [])
+                        for task_id in completed:
+                            await self._handle_task_completion(agent_name, task_id)
+
+                self._save_state()
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Don't crash heartbeat on errors
+                pass
+
+    async def _handle_task_completion(self, agent_name: str, task_id: str):
+        """Handle a task completion from a wrapper."""
+        if not self.state or task_id not in self.state.tasks:
+            return
+
+        task = self.state.tasks[task_id]
+        if task.state in (TaskState.ASSIGNED, TaskState.ACCEPTED):
+            task.state = TaskState.COMPLETED
+            task.completed_at = datetime.now(UTC).isoformat()
+
+            # Notify callbacks
+            for callback in self._on_task_complete:
+                try:
+                    callback(task_id, agent_name)
+                except Exception:
+                    pass
 
     async def connect_wrapper(self, agent_name: str) -> bool:
         """Connect to an agent's wrapper."""

@@ -43,6 +43,7 @@ class MessageType(Enum):
     WRAPPER_STATUS = "wrapper.status"
     WRAPPER_TRANSCRIPT = "wrapper.transcript"
     WRAPPER_ERROR = "wrapper.error"
+    WRAPPER_TASK_COMPLETE = "wrapper.task_complete"
 
 
 class TaskState(Enum):
@@ -148,11 +149,21 @@ def make_wrapper_start(session_name: str, command: list[str]) -> Message:
 
 
 def make_wrapper_status(
-    agent_name: str, status: AgentStatus, pid: int | None = None
+    agent_name: str,
+    status: AgentStatus,
+    pid: int | None = None,
+    completed_tasks: list[str] | None = None,
+    current_task: str | None = None,
 ) -> Message:
     return Message(
         type=MessageType.WRAPPER_STATUS,
         from_agent="wrapper",
         to_agent="daemon",
-        body={"agent": agent_name, "status": status.value, "pid": pid},
+        body={
+            "agent": agent_name,
+            "status": status.value,
+            "pid": pid,
+            "completed_tasks": completed_tasks or [],
+            "current_task": current_task,
+        },
     )
