@@ -150,24 +150,74 @@ class TaskListWidget(QGroupBox):
 
 
 class AgentStatusWidget(QGroupBox):
-    """Agent status panel."""
+    """Agent status panel with connect buttons."""
 
-    def __init__(self):
+    def __init__(self, on_connect_callback=None, on_start_callback=None):
         super().__init__("Agents")
+        self.on_connect = on_connect_callback
+        self.on_start = on_start_callback
         self._setup_ui()
-        self.agent_labels: dict[str, QLabel] = {}
+        self.agent_rows: dict[str, dict] = {}
 
     def _setup_ui(self):
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(8, 16, 8, 8)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(8, 16, 8, 8)
+        self.main_layout.setSpacing(4)
+
+    def add_agent(self, name: str, identity: str, status: str = "disconnected"):
+        if name in self.agent_rows:
+            self.set_agent_status(name, status)
+            return
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        identity_label = QLabel(identity)
+        identity_label.setFixedWidth(20)
+        row.addWidget(identity_label)
+
+        name_label = QLabel(name)
+        name_label.setMinimumWidth(60)
+        row.addWidget(name_label)
+
+        status_label = QLabel(status)
+        status_label.setMinimumWidth(80)
+        row.addWidget(status_label)
+
+        connect_btn = QPushButton("Connect")
+        connect_btn.setFixedWidth(70)
+        connect_btn.clicked.connect(lambda: self._on_connect_clicked(name))
+        row.addWidget(connect_btn)
+
+        start_btn = QPushButton("Start")
+        start_btn.setFixedWidth(50)
+        start_btn.clicked.connect(lambda: self._on_start_clicked(name))
+        row.addWidget(start_btn)
+
+        row.addStretch()
+
+        self.main_layout.addLayout(row)
+        self.agent_rows[name] = {
+            "status_label": status_label,
+            "connect_btn": connect_btn,
+            "start_btn": start_btn,
+        }
 
     def set_agent_status(self, name: str, status: str):
-        if name not in self.agent_labels:
-            label = QLabel(f"[{name}: {status}]")
-            self.agent_labels[name] = label
-            self.layout.addWidget(label)
-        else:
-            self.agent_labels[name].setText(f"[{name}: {status}]")
+        if name in self.agent_rows:
+            self.agent_rows[name]["status_label"].setText(status)
+            # Update button states
+            connected = status in ("running", "connected")
+            self.agent_rows[name]["connect_btn"].setEnabled(not connected)
+            self.agent_rows[name]["connect_btn"].setText("Connected" if connected else "Connect")
+
+    def _on_connect_clicked(self, name: str):
+        if self.on_connect:
+            self.on_connect(name)
+
+    def _on_start_clicked(self, name: str):
+        if self.on_start:
+            self.on_start(name)
 
 
 class TerminalWidget(QWidget):
@@ -424,8 +474,15 @@ class MainWindow(QMainWindow):
         self.task_list = TaskListWidget()
         left_layout.addWidget(self.task_list, 2)
 
-        self.agent_status = AgentStatusWidget()
+        self.agent_status = AgentStatusWidget(
+            on_connect_callback=self._on_connect_agent,
+            on_start_callback=self._on_start_agent,
+        )
         left_layout.addWidget(self.agent_status, 1)
+
+        # Populate agents from config
+        for name, agent_cfg in self.controller.config.agents.items():
+            self.agent_status.add_agent(name, agent_cfg.identity, "disconnected")
 
         splitter.addWidget(left_panel)
 
@@ -459,3 +516,38 @@ class MainWindow(QMainWindow):
         else:
             # Send as direct input (override or chat)
             self.controller.send_input(agent, text)
+
+    def _on_connect_agent(self, agent: str):
+        """Connect to a running wrapper."""
+        self.statusBar().showMessage(f"Connecting to {agent}...")
+        success = self.controller.connect_wrapper(agent)
+        if success:
+            self.statusBar().showMessage(f"Connected to {agent}", 3000)
+            self.terminal.refresh_sessions()
+        else:
+            self.statusBar().showMessage(f"Failed to connect to {agent} - is wrapper running?", 5000)
+
+    def _on_start_agent(self, agent: str):
+        """Start a wrapper for an agent (opens in new terminal)."""
+        import subprocess
+        agent_cfg = self.controller.config.agents.get(agent)
+        if not agent_cfg:
+            return
+
+        # Start wrapper in a new terminal
+        wrapper_cmd = f"cd ~/Projects/vaelkor && ./run.sh wrapper {agent}"
+        try:
+            # Try common terminal emulators
+            for term in ["foot", "alacritty", "gnome-terminal", "xterm"]:
+                try:
+                    if term == "gnome-terminal":
+                        subprocess.Popen([term, "--", "bash", "-c", wrapper_cmd])
+                    else:
+                        subprocess.Popen([term, "-e", "bash", "-c", wrapper_cmd])
+                    self.statusBar().showMessage(f"Started wrapper for {agent}", 3000)
+                    return
+                except FileNotFoundError:
+                    continue
+            self.statusBar().showMessage("No terminal emulator found", 5000)
+        except Exception as e:
+            self.statusBar().showMessage(f"Failed to start wrapper: {e}", 5000)
