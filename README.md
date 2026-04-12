@@ -129,11 +129,13 @@ identity: "?"
 role: reviewer
 command:
   - codex
-autostart: false
+autoconnect: true   # Auto-connect to wrapper on startup (wrapper must be running)
 constraints:
   - no_file_edits
   - review_only
 ```
+
+**Note:** `autoconnect` attempts to connect to an already-running wrapper on daemon startup. It does NOT launch the wrapper process. Start wrappers manually with `./run.sh wrapper <agent>` or use the UI's "Start" button.
 
 ## Project Structure
 
@@ -162,6 +164,19 @@ src/vaelkor/
 - Agents instructed not to edit files (proposals only, not enforced)
 - Automatic completion detection via idle pattern matching
 - Session persistence and crash recovery
+- Task timeout (30s) for unresponsive wrappers
+
+## Input Modes
+
+The terminal input supports three modes (selectable via dropdown):
+
+| Mode | Behavior |
+|------|----------|
+| **task** | Creates a new task assignment to the current agent |
+| **override** | Logged input, attached to current task context. Saved to `user_inputs.log` |
+| **chat** | Unlogged passthrough for casual interaction. Not saved to session |
+
+**Default:** `override` (safe middle ground - visible to recovery, doesn't create new tasks)
 
 ## V2 Ideas
 

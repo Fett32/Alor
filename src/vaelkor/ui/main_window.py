@@ -535,13 +535,19 @@ class MainWindow(QMainWindow):
                 self.controller.assign_task(**data)
 
     def _on_terminal_input(self, agent: str, text: str, mode: str):
-        """Handle terminal input via daemon."""
+        """Handle terminal input via daemon.
+
+        Modes:
+        - task: Creates a new task assignment
+        - override: Logged input attached to current task
+        - chat: Unlogged passthrough (for casual interaction)
+        """
         if mode == "task":
             # Create a new task
             self.controller.assign_task(to_agent=agent, summary=text)
         else:
-            # Send as direct input (override or chat)
-            self.controller.send_input(agent, text)
+            # Send as direct input with mode (chat or override)
+            self.controller.send_input(agent, text, mode)
 
     def _on_connect_agent(self, agent: str):
         """Connect to a running wrapper."""

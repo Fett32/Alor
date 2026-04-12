@@ -24,7 +24,7 @@ class AgentConfig:
     identity: str  # Symbol: *, ?, >, @
     role: str  # orchestrator, reviewer, etc.
     command: list[str]
-    autostart: bool = False
+    autoconnect: bool = False
     constraints: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -32,7 +32,7 @@ class AgentConfig:
             "identity": self.identity,
             "role": self.role,
             "command": self.command,
-            "autostart": self.autostart,
+            "autoconnect": self.autoconnect,
             "constraints": self.constraints,
         }
 
@@ -43,7 +43,7 @@ class AgentConfig:
             identity=d.get("identity", "?"),
             role=d.get("role", "agent"),
             command=d.get("command", []),
-            autostart=d.get("autostart", False),
+            autoconnect=d.get("autoconnect", False),
             constraints=d.get("constraints", []),
         )
 
@@ -163,7 +163,7 @@ def _create_default_agents():
         identity="*",
         role="orchestrator",
         command=["claude"],
-        autostart=True,
+        autoconnect=True,
         constraints=[],
     )
     save_agent_config(claude)
@@ -173,7 +173,7 @@ def _create_default_agents():
         identity="?",
         role="reviewer",
         command=["codex"],
-        autostart=False,
+        autoconnect=False,
         constraints=["no_file_edits", "review_only"],
     )
     save_agent_config(codex)

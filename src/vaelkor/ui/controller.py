@@ -66,9 +66,9 @@ class DaemonController(QObject):
 
             self.connected.emit()
 
-            # Connect to autostart wrappers
+            # Connect to autoconnect wrappers
             for name, agent_config in self.config.agents.items():
-                if agent_config.autostart:
+                if agent_config.autoconnect:
                     success = await self.daemon.connect_wrapper(name)
                     status = "running" if success else "disconnected"
                     self.agent_status_changed.emit(name, status)
@@ -123,10 +123,15 @@ class DaemonController(QObject):
 
         return self._run_async(_get())
 
-    def send_input(self, agent_name: str, text: str):
-        """Send input to an agent."""
+    def send_input(self, agent_name: str, text: str, mode: str = "override"):
+        """Send input to an agent.
+
+        Modes:
+        - chat: Not logged, passes through
+        - override: Logged, attached to current task
+        """
         async def _send():
-            await self.daemon.send_user_input(agent_name, text)
+            await self.daemon.send_user_input(agent_name, text, mode)
 
         return self._run_async(_send())
 

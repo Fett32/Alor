@@ -52,9 +52,9 @@ async def run_daemon(config, session_id: str | None):
     await daemon.start(session_id)
     print(f"Session: {daemon.state.session_id}")
 
-    # Start wrappers for autostart agents
+    # Start wrappers for autoconnect agents
     for name, agent_config in config.agents.items():
-        if agent_config.autostart:
+        if agent_config.autoconnect:
             print(f"Connecting to wrapper: {name}")
             connected = await daemon.connect_wrapper(name)
             if connected:

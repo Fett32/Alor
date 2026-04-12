@@ -144,22 +144,53 @@ class Daemon:
         if not self.state:
             return
 
+        # Mark in-flight tasks as RECOVERING
+        recovering_tasks: dict[str, str] = {}  # task_id -> assigned_to
         for task_id, task in self.state.tasks.items():
             if task.state in (TaskState.ASSIGNED, TaskState.ACCEPTED, TaskState.BLOCKED):
                 task.state = TaskState.RECOVERING
+                recovering_tasks[task_id] = task.assigned_to
 
+        # Reconnect to wrappers and resolve task states
         for agent_name in self.state.agents:
-            await self.connect_wrapper(agent_name)
-            if agent_name in self.wrappers and self.wrappers[agent_name].connected:
+            connected = await self.connect_wrapper(agent_name)
+
+            # Get tasks assigned to this agent
+            agent_tasks = [tid for tid, agent in recovering_tasks.items() if agent == agent_name]
+
+            if connected and agent_name in self.wrappers:
                 status_msg = Message(
                     type=MessageType.WRAPPER_GET_STATUS,
                     from_agent="daemon",
                     to_agent="wrapper",
                 )
                 response = await self.wrappers[agent_name].send(status_msg)
+
                 if response and response.type == MessageType.WRAPPER_STATUS:
                     self.state.agents[agent_name].status = response.body.get("status", "unknown")
                     self.state.agents[agent_name].pid = response.body.get("pid")
+                    current_task = response.body.get("current_task")
+                    completed = response.body.get("completed_tasks", [])
+
+                    # Resolve recovering tasks for this agent
+                    for task_id in agent_tasks:
+                        task = self.state.tasks[task_id]
+                        if task_id in completed:
+                            # Task completed during crash
+                            task.state = TaskState.COMPLETED
+                            task.completed_at = datetime.now(UTC).isoformat()
+                        elif task_id == current_task:
+                            # Task still active
+                            task.state = TaskState.ACCEPTED
+                        else:
+                            # Task state unknown - mark stale
+                            task.state = TaskState.STALE
+            else:
+                # Wrapper not reachable - mark all its tasks stale
+                for task_id in agent_tasks:
+                    self.state.tasks[task_id].state = TaskState.STALE
+
+        self._save_state()
 
     async def _heartbeat_loop(self):
         """Periodically poll wrappers for status and handle task completions."""
@@ -276,28 +307,64 @@ class Daemon:
         )
         self.state.messages[msg.id] = msg_state
 
-        if to_agent in self.wrappers:
-            wrapper_msg = Message(
-                type=MessageType.WRAPPER_SEND_TASK,
-                from_agent="daemon",
-                to_agent="wrapper",
-                task_id=task_id,
-                summary=summary,
-                body={
-                    "scope": scope or ["*"],
-                    "constraints": constraints or [],
-                    "context": context,
-                    "body": body,
-                },
-            )
-            response = await self.wrappers[to_agent].send(wrapper_msg)
+        # Check if wrapper is connected
+        if to_agent not in self.wrappers or not self.wrappers[to_agent].connected:
+            # No wrapper connected - task stays ASSIGNED, will timeout
+            # Schedule timeout check
+            asyncio.create_task(self._check_task_timeout(task_id, 30.0))
+            self._save_state()
+            return task
 
-            if response and response.type == MessageType.WRAPPER_ACK:
-                msg_state.state = MessageDeliveryState.DELIVERED
-                msg_state.delivered_at = datetime.now(UTC).isoformat()
+        # Send task to wrapper
+        wrapper_msg = Message(
+            type=MessageType.WRAPPER_SEND_TASK,
+            from_agent="daemon",
+            to_agent="wrapper",
+            task_id=task_id,
+            summary=summary,
+            body={
+                "scope": scope or ["*"],
+                "constraints": constraints or [],
+                "context": context,
+                "body": body,
+            },
+        )
+        response = await self.wrappers[to_agent].send(wrapper_msg)
+
+        if response and response.type == MessageType.WRAPPER_ACK:
+            # Wrapper accepted - move to ACCEPTED state
+            msg_state.state = MessageDeliveryState.DELIVERED
+            msg_state.delivered_at = datetime.now(UTC).isoformat()
+            task.state = TaskState.ACCEPTED
+
+            # Update agent state
+            if to_agent in self.state.agents:
+                self.state.agents[to_agent].current_task_id = task_id
+        else:
+            # Wrapper didn't respond properly - schedule timeout
+            asyncio.create_task(self._check_task_timeout(task_id, 30.0))
 
         self._save_state()
         return task
+
+    async def _check_task_timeout(self, task_id: str, timeout: float):
+        """Check if task is still ASSIGNED after timeout and mark TIMED_OUT."""
+        await asyncio.sleep(timeout)
+
+        if not self.state or task_id not in self.state.tasks:
+            return
+
+        task = self.state.tasks[task_id]
+        if task.state == TaskState.ASSIGNED:
+            task.state = TaskState.TIMED_OUT
+            self._save_state()
+
+            # Notify callbacks
+            for callback in self._on_task_complete:
+                try:
+                    callback(task_id, task.assigned_to)
+                except Exception:
+                    pass
 
     async def update_task_state(self, task_id: str, new_state: TaskState) -> bool:
         """Update task state if transition is valid."""
@@ -332,8 +399,14 @@ class Daemon:
             return response.body.get("lines", [])
         return []
 
-    async def send_user_input(self, to_agent: str, text: str):
-        """Send direct user input to an agent."""
+    async def send_user_input(self, to_agent: str, text: str, mode: str = "override"):
+        """Send direct user input to an agent.
+
+        Modes:
+        - chat: Not logged, passes through to agent
+        - override: Logged, attached to current task context
+        - task: Should use assign_task() instead
+        """
         if to_agent not in self.wrappers:
             return
 
@@ -341,9 +414,32 @@ class Daemon:
             type=MessageType.WRAPPER_APPEND_INPUT,
             from_agent="daemon",
             to_agent="wrapper",
-            body={"text": text},
+            body={"text": text, "mode": mode},
         )
         await self.wrappers[to_agent].send(msg)
+
+        # Log override inputs to session (chat mode is intentionally not logged)
+        if mode == "override" and self.state:
+            # Find current task for this agent
+            current_task = None
+            for task in self.state.tasks.values():
+                if task.assigned_to == to_agent and task.state == TaskState.ACCEPTED:
+                    current_task = task
+                    break
+
+            # Log the input
+            log_entry = {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "agent": to_agent,
+                "mode": mode,
+                "text": text,
+                "task_id": current_task.task_id if current_task else None,
+            }
+            # Append to session log (simple approach - could be more sophisticated)
+            log_path = self.session_dir / self.state.session_id / "user_inputs.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
 
     def get_active_tasks(self) -> list[Task]:
         """Get all non-terminal tasks."""
