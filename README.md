@@ -2,10 +2,19 @@
 
 Multi-agent orchestration workspace. Run Claude, Codex, and other AI agents in parallel with a unified task management UI.
 
+## Dependencies
+
+- Python 3.11+
+- tmux (`sudo apt install tmux`)
+- PySide6, pyte, PyYAML (installed via pip)
+
 ## Quick Start
 
 ```bash
-# Install
+# Install tmux first
+sudo apt install tmux
+
+# Install Python package
 cd ~/Projects/vaelkor
 python -m venv .venv
 .venv/bin/pip install -e .
