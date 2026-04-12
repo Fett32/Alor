@@ -173,13 +173,14 @@ class AgentStatusWidget(QGroupBox):
 class TerminalWidget(QWidget):
     """Embedded terminal for agent output."""
 
-    def __init__(self):
+    def __init__(self, on_input_callback=None):
         super().__init__()
         self.screen = pyte.Screen(120, 30)
         self.stream = pyte.Stream(self.screen)
         self.master_fd = None
         self.pid = None
         self.session_name = None
+        self.on_input_callback = on_input_callback  # (agent, text, mode) -> None
 
         self._setup_ui()
 
@@ -297,9 +298,26 @@ class TerminalWidget(QWidget):
 
     def _send_input(self):
         text = self.input_line.text()
-        if self.master_fd and text:
+        if not text:
+            return
+
+        mode = self.mode_combo.currentText()
+        agent = self._get_current_agent()
+
+        # If we have a callback and mode is override/chat, use daemon routing
+        if self.on_input_callback and agent and mode in ("override", "chat"):
+            self.on_input_callback(agent, text, mode)
+            self.input_line.clear()
+        elif self.master_fd:
+            # Direct PTY write
             os.write(self.master_fd, (text + "\n").encode())
             self.input_line.clear()
+
+    def _get_current_agent(self) -> str | None:
+        """Extract agent name from session name (vaelkor-<agent>)."""
+        if self.session_name and self.session_name.startswith("vaelkor-"):
+            return self.session_name[8:]  # len("vaelkor-") = 8
+        return None
 
     def closeEvent(self, event):
         self._detach()
@@ -411,7 +429,7 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(left_panel)
 
-        self.terminal = TerminalWidget()
+        self.terminal = TerminalWidget(on_input_callback=self._on_terminal_input)
         splitter.addWidget(self.terminal)
 
         splitter.setSizes([350, 850])
@@ -432,3 +450,12 @@ class MainWindow(QMainWindow):
             data = dialog.get_task_data()
             if data["summary"]:
                 self.controller.assign_task(**data)
+
+    def _on_terminal_input(self, agent: str, text: str, mode: str):
+        """Handle terminal input via daemon."""
+        if mode == "task":
+            # Create a new task
+            self.controller.assign_task(to_agent=agent, summary=text)
+        else:
+            # Send as direct input (override or chat)
+            self.controller.send_input(agent, text)

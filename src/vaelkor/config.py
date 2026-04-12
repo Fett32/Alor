@@ -130,9 +130,10 @@ def load_agent_configs() -> dict[str, AgentConfig]:
     """Load all agent config files."""
     agents = {}
     agents_dir = CONFIG_DIR / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
 
-    if not agents_dir.exists():
-        # Create default agents
+    # Create defaults if no agents exist
+    if not any(agents_dir.glob("*.yaml")):
         _create_default_agents()
 
     for agent_file in agents_dir.glob("*.yaml"):
