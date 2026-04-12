@@ -5,6 +5,8 @@ description = "Multi-agent orchestration workspace"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6>=6.6",
+    "pyte>=0.8",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -15,6 +17,8 @@ dev = [
 
 [project.scripts]
 vaelkor = "vaelkor.main:main"
+vaelkor-wrapper = "vaelkor.wrapper.cli:main"
+vaelkor-daemon = "vaelkor.daemon.cli:main"
 
 [build-system]
 requires = ["hatchling"]

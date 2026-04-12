@@ -2,11 +2,9 @@
 Vaelkor main window - task-first UI.
 """
 
-import asyncio
 import os
 import pty
 import subprocess
-from pathlib import Path
 
 import pyte
 from PySide6.QtCore import Qt, QSocketNotifier, QTimer
@@ -24,11 +22,16 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QComboBox,
-    QFrame,
     QGroupBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QTextEdit,
+    QCheckBox,
 )
 
 from ..daemon.state import TaskState
+from .controller import DaemonController
 
 
 # Beskar-inspired colors
@@ -60,6 +63,61 @@ TASK_STATE_COLORS = {
 }
 
 
+class NewTaskDialog(QDialog):
+    """Dialog for creating a new task."""
+
+    def __init__(self, agents: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Task")
+        self.setMinimumWidth(400)
+        self._setup_ui(agents)
+
+    def _setup_ui(self, agents: list[str]):
+        layout = QFormLayout(self)
+
+        self.agent_combo = QComboBox()
+        self.agent_combo.addItems(agents)
+        layout.addRow("Agent:", self.agent_combo)
+
+        self.summary_edit = QLineEdit()
+        self.summary_edit.setPlaceholderText("Brief task summary")
+        layout.addRow("Summary:", self.summary_edit)
+
+        self.body_edit = QTextEdit()
+        self.body_edit.setPlaceholderText("Detailed task description (optional)")
+        self.body_edit.setMaximumHeight(100)
+        layout.addRow("Details:", self.body_edit)
+
+        self.scope_edit = QLineEdit()
+        self.scope_edit.setPlaceholderText("src/*, tests/* (comma-separated)")
+        layout.addRow("Scope:", self.scope_edit)
+
+        self.review_only = QCheckBox("Review only (no edits)")
+        layout.addRow("", self.review_only)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def get_task_data(self) -> dict:
+        constraints = []
+        if self.review_only.isChecked():
+            constraints = ["review_only", "no_file_edits"]
+
+        scope = [s.strip() for s in self.scope_edit.text().split(",") if s.strip()]
+
+        return {
+            "to_agent": self.agent_combo.currentText(),
+            "summary": self.summary_edit.text(),
+            "body": self.body_edit.toPlainText() or None,
+            "scope": scope or None,
+            "constraints": constraints or None,
+        }
+
+
 class TaskListWidget(QGroupBox):
     """Task list panel."""
 
@@ -75,13 +133,16 @@ class TaskListWidget(QGroupBox):
         self.task_list.setAlternatingRowColors(True)
         layout.addWidget(self.task_list)
 
-    def add_task(self, task_id: str, summary: str, agent: str, state: TaskState):
+        self.new_task_btn = QPushButton("+ New Task")
+        layout.addWidget(self.new_task_btn)
+
+    def add_task(self, task_id: str, summary: str, agent: str, state: TaskState | str):
+        if isinstance(state, str):
+            state = TaskState(state)
         icon = "●" if state == TaskState.ACCEPTED else "○" if state == TaskState.ASSIGNED else "✓"
         text = f"{icon} {task_id} ({agent})\n   {summary}"
         item = QListWidgetItem(text)
         item.setData(Qt.ItemDataRole.UserRole, task_id)
-        color = TASK_STATE_COLORS.get(state, COLORS["text"])
-        item.setForeground(Qt.GlobalColor.white)
         self.task_list.addItem(item)
 
     def clear_tasks(self):
@@ -248,12 +309,37 @@ class TerminalWidget(QWidget):
 class MainWindow(QMainWindow):
     """Vaelkor main application window."""
 
-    def __init__(self):
+    def __init__(self, controller: DaemonController | None = None):
         super().__init__()
+        self.controller = controller or DaemonController()
         self.setWindowTitle("Vaelkor")
         self.setGeometry(100, 100, 1200, 800)
         self._apply_style()
         self._setup_ui()
+        self._connect_signals()
+
+        # Start daemon
+        self.controller.start()
+
+    def _connect_signals(self):
+        self.controller.task_added.connect(self._on_task_added)
+        self.controller.agent_status_changed.connect(self._on_agent_status)
+        self.controller.connected.connect(self._on_connected)
+
+    def _on_task_added(self, task_id: str, summary: str, agent: str, state: str):
+        self.task_list.add_task(task_id, summary, agent, state)
+
+    def _on_agent_status(self, agent: str, status: str):
+        self.agent_status.set_agent_status(agent, status)
+
+    def _on_connected(self):
+        self.statusBar().showMessage("Daemon connected", 3000)
+        self.terminal.refresh_sessions()
+
+    def closeEvent(self, event):
+        self.controller.stop()
+        self.terminal._detach()
+        super().closeEvent(event)
 
     def _apply_style(self):
         self.setStyleSheet(f"""
@@ -331,14 +417,18 @@ class MainWindow(QMainWindow):
         splitter.setSizes([350, 850])
         main_layout.addWidget(splitter)
 
-        self._add_demo_data()
+        # Connect new task button
+        self.task_list.new_task_btn.clicked.connect(self._show_new_task_dialog)
 
-    def _add_demo_data(self):
-        self.task_list.add_task("task-001", "Implement login flow", "claude", TaskState.COMPLETED)
-        self.task_list.add_task("task-002", "Review auth for race conditions", "codex", TaskState.ACCEPTED)
-        self.task_list.add_task("task-003", "Add rate limiting", "claude", TaskState.ASSIGNED)
+        # Refresh timer for terminal sessions
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.terminal.refresh_sessions)
+        self.refresh_timer.start(5000)
 
-        self.agent_status.set_agent_status("claude", "running")
-        self.agent_status.set_agent_status("codex", "idle")
-
-        self.terminal.refresh_sessions()
+    def _show_new_task_dialog(self):
+        agents = list(self.controller.config.agents.keys())
+        dialog = NewTaskDialog(agents, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            data = dialog.get_task_data()
+            if data["summary"]:
+                self.controller.assign_task(**data)
