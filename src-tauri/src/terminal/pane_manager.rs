@@ -1,13 +1,13 @@
-/// Pane manager — controls the vaelkor-main tmux session layout.
+/// Pane manager — controls the alor-main tmux session layout.
 ///
 /// Architecture:
-///   Each agent has its own durable tmux session (vaelkor-<agent>).
-///   vaelkor-main is a display session whose panes attach to agent sessions.
-///   This module manages pane creation, removal, and layout in vaelkor-main.
+///   Each agent has its own durable tmux session (alor-<agent>).
+///   alor-main is a display session whose panes attach to agent sessions.
+///   This module manages pane creation, removal, and layout in alor-main.
 ///
-///   Pane command: `TMUX='' tmux new-session -A -t vaelkor-<agent>`
+///   Pane command: `TMUX='' tmux new-session -A -t alor-<agent>`
 ///   This attaches to the agent session inside a pane, keeping it durable.
-///   If vaelkor-main dies, agent sessions survive. If the agent session dies,
+///   If alor-main dies, agent sessions survive. If the agent session dies,
 ///   the pane exits and can be respawned.
 
 use anyhow::{Context, Result};
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-const MAIN_SESSION: &str = "vaelkor-main";
+const MAIN_SESSION: &str = "alor-main";
 /// Maximum right-side columns before we start stacking more aggressively.
 const MAX_RIGHT_COLUMNS: usize = 3;
 
@@ -47,7 +47,7 @@ impl PaneManager {
         Self::default()
     }
 
-    /// Ensure vaelkor-main exists. Creates it if needed.
+    /// Ensure alor-main exists. Creates it if needed.
     /// Called once at startup.
     pub async fn ensure_main_session(&self) -> Result<()> {
         if self.session_exists(MAIN_SESSION).await {
@@ -73,7 +73,7 @@ impl PaneManager {
             ])
             .output()
             .await
-            .context("create vaelkor-main session")?;
+            .context("create alor-main session")?;
 
         if !output.status.success() {
             anyhow::bail!(
@@ -98,7 +98,7 @@ impl PaneManager {
         let _ = Command::new("tmux")
             .args([
                 "send-keys", "-t", MAIN_SESSION,
-                "echo 'Vaelkor — waiting for agents...'", "Enter",
+                "echo 'Alor — waiting for agents...'", "Enter",
             ])
             .output()
             .await;
@@ -107,9 +107,9 @@ impl PaneManager {
         Ok(())
     }
 
-    /// Add an agent's session as a pane in vaelkor-main.
-    /// The pane runs `tmux attach -t vaelkor-<agent>` so the agent session
-    /// stays durable even if vaelkor-main is destroyed.
+    /// Add an agent's session as a pane in alor-main.
+    /// The pane runs `tmux attach -t alor-<agent>` so the agent session
+    /// stays durable even if alor-main is destroyed.
     pub async fn add_agent_pane(&self, agent_id: &str) -> Result<()> {
         let mut panes = self.panes.lock().await;
 
@@ -119,7 +119,7 @@ impl PaneManager {
             return Ok(());
         }
 
-        let agent_session = format!("vaelkor-{agent_id}");
+        let agent_session = format!("alor-{agent_id}");
         let pane_count = self.count_panes().await;
 
         // The attach command — TMUX='' prevents "sessions should be nested" error.
@@ -221,7 +221,7 @@ impl PaneManager {
         Ok(())
     }
 
-    /// Remove an agent's pane from vaelkor-main.
+    /// Remove an agent's pane from alor-main.
     pub async fn remove_agent_pane(&self, agent_id: &str) -> Result<()> {
         let mut panes = self.panes.lock().await;
 
@@ -239,10 +239,12 @@ impl PaneManager {
                 .args([
                     "respawn-pane", "-k",
                     "-t", &info.pane_id,
-                    "echo", "Vaelkor — waiting for agents...",
+                    "echo", "Alor — waiting for agents...",
                 ])
                 .output()
                 .await;
+            
+            panes.remove(agent_id);
             return Ok(());
         }
 
@@ -262,13 +264,20 @@ impl PaneManager {
 
         self.rebalance_layout().await;
 
+        panes.remove(agent_id);
+
         tracing::info!(agent_id, "removed agent pane from {MAIN_SESSION}");
         Ok(())
     }
 
-    /// Get list of agents with visible panes.
+    /// Return list of agent IDs that have visible panes.
     pub async fn visible_agents(&self) -> Vec<String> {
         self.panes.lock().await.keys().cloned().collect()
+    }
+
+    /// Clear all tracked panes from the in-memory map.
+    pub async fn clear_all_panes(&self) {
+        self.panes.lock().await.clear();
     }
 
     /// Split horizontally (new column to the right).
@@ -286,10 +295,27 @@ impl PaneManager {
             .context("split-window -h")?;
 
         if !output.status.success() {
-            anyhow::bail!(
-                "split-window -h failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            // Retry once after rebalancing
+            self.rebalance_layout().await;
+            let output = Command::new("tmux")
+                .args([
+                    "split-window", "-t", session,
+                    "-h",
+                    "-P", "-F", "#{pane_id}",
+                    cmd,
+                ])
+                .env("TMUX", "")
+                .output()
+                .await
+                .context("split-window -h retry")?;
+
+            if !output.status.success() {
+                anyhow::bail!(
+                    "split-window -h failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -309,24 +335,55 @@ impl PaneManager {
             .context("split-window -v")?;
 
         if !output.status.success() {
-            anyhow::bail!(
-                "split-window -v failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            // Retry once after rebalancing
+            self.rebalance_layout().await;
+            let output = Command::new("tmux")
+                .args([
+                    "split-window", "-t", target,
+                    "-v",
+                    "-P", "-F", "#{pane_id}",
+                    cmd,
+                ])
+                .env("TMUX", "")
+                .output()
+                .await
+                .context("split-window -v retry")?;
+
+            if !output.status.success() {
+                anyhow::bail!(
+                    "split-window -v failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Rebalance the pane layout in vaelkor-main.
-    /// Uses main-vertical: orchestrator gets full left column, agents stack on right.
+    /// Rebalance the pane layout in alor-main.
+    /// Applies main-vertical first (orchestrator full left, agents stacked right),
+    /// then switches to even-vertical within the right column so all pane
+    /// borders remain draggable. Named layouts lock borders; the even-*
+    /// re-layout converts it to a custom geometry that tmux lets you drag.
     async fn rebalance_layout(&self) {
+        // Step 1: main-vertical sets the overall shape.
         let _ = Command::new("tmux")
             .args(["select-layout", "-t", MAIN_SESSION, "main-vertical"])
             .output()
             .await;
+
+        // Step 2: even out the right-side panes so tmux treats borders as
+        // manually-set (draggable). We do this by selecting even-vertical
+        // on the non-orchestrator panes. A simpler approach: just re-select
+        // the same layout with -E (spread evenly) which makes it a custom
+        // layout internally.
+        let _ = Command::new("tmux")
+            .args(["select-layout", "-t", MAIN_SESSION, "-E"])
+            .output()
+            .await;
     }
 
-    /// Count current panes in vaelkor-main.
+    /// Count current panes in alor-main.
     async fn count_panes(&self) -> usize {
         let output = Command::new("tmux")
             .args(["list-panes", "-t", MAIN_SESSION, "-F", "#{pane_id}"])
@@ -359,7 +416,7 @@ impl PaneManager {
         }
     }
 
-    /// Scan existing panes in vaelkor-main and populate the in-memory map.
+    /// Scan existing panes in alor-main and populate the in-memory map.
     /// Called on startup when reusing an existing session to prevent duplicates.
     async fn scan_existing_panes(&self) {
         let output = Command::new("tmux")
@@ -383,7 +440,7 @@ impl PaneManager {
             if line.is_empty() {
                 continue;
             }
-            // Format: "%5 TMUX='' tmux attach -t vaelkor-claude"
+            // Format: "%5 TMUX='' tmux attach -t alor-claude"
             // Extract pane_id and agent_id from the attach target.
             let parts: Vec<&str> = line.splitn(2, ' ').collect();
             if parts.len() < 2 {
@@ -392,9 +449,9 @@ impl PaneManager {
             let pane_id = parts[0].to_string();
             let cmd = parts[1];
 
-            // Look for "vaelkor-<agent>" in the command.
-            if let Some(pos) = cmd.find("vaelkor-") {
-                let after = &cmd[pos + 8..]; // skip "vaelkor-"
+            // Look for "alor-" in the command.
+            if let Some(pos) = cmd.find("alor-") {
+                let after = &cmd[pos + 5..]; // skip "alor-" (5 chars)
                 let agent_id = after
                     .split_whitespace()
                     .next()
@@ -427,7 +484,7 @@ impl PaneManager {
     }
 
     /// Check if a tmux session exists.
-    async fn session_exists(&self, name: &str) -> bool {
+    pub async fn session_exists(&self, name: &str) -> bool {
         Command::new("tmux")
             .args(["has-session", "-t", name])
             .output()

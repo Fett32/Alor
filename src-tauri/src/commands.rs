@@ -7,7 +7,7 @@ use crate::daemon::session::SessionInfo;
 use crate::daemon::state::{Agent, AppState, Task, TaskState};
 use crate::terminal::bridge::TerminalBridge;
 use crate::terminal::pane_manager::PaneManager;
-use crate::wrapper::protocol::{Envelope, TaskAssign, MSG_TASK_ASSIGN};
+use crate::wrapper::protocol::{DaemonShutdown, Envelope, TaskAssign, MSG_SHUTDOWN, MSG_TASK_ASSIGN};
 use crate::wrapper::server::SocketServer;
 use tauri::State;
 use uuid::Uuid;
@@ -104,6 +104,36 @@ pub fn cancel_task(state: State<'_, AppState>, id: String) -> Result<Task, Strin
         .map_err(err)
 }
 
+/// Approve a proposed task, transitioning it to Staged and notifying the agent.
+#[tauri::command]
+pub async fn approve_task(
+    state: State<'_, AppState>,
+    server: State<'_, SocketServer>,
+    id: String,
+) -> Result<Task, String> {
+    let uuid = Uuid::parse_str(&id).map_err(err)?;
+    let task = state
+        .transition_task(uuid, TaskState::Staged)
+        .map_err(err)?;
+
+    // If task is assigned to an agent, notify them of the approval.
+    // We reuse MSG_TASK_ASSIGN to tell them to proceed with the now-approved work.
+    if let Some(ref aid) = task.assigned_to {
+        if server.is_connected(aid).await {
+            let payload = TaskAssign {
+                task_id: task.id,
+                title: task.title.clone(),
+                description: format!("APPROVED: {}", task.description),
+                timeout_secs: None,
+            };
+            let envelope = Envelope::new(MSG_TASK_ASSIGN, &payload).map_err(err)?;
+            let _ = server.send_to(aid, &envelope).await;
+        }
+    }
+
+    Ok(task)
+}
+
 // ---------------------------------------------------------------------------
 // Agent commands
 // ---------------------------------------------------------------------------
@@ -131,6 +161,103 @@ pub fn register_agent(
     clone
 }
 
+/// Spawn a new agent process based on its config kind.
+#[tauri::command]
+pub async fn spawn_agent(
+    state: State<'_, AppState>,
+    agent: String,
+    role: Option<String>,
+) -> Result<(), String> {
+    use crate::daemon::config;
+    
+    // Load config for just this kind
+    let configs = config::load_agent_configs().map_err(err)?;
+    let mut target_cfg = configs.into_iter()
+        .find(|(id, _)| id == &agent)
+        .ok_or_else(|| format!("agent config {agent} not found"))?;
+
+    if let Some(r) = role {
+        target_cfg.1.role = r;
+    }
+
+    // Launch it
+    tracing::info!(agent_id = %target_cfg.0, "manually spawning agent");
+    crate::daemon::config::force_launch_wrapper(target_cfg.0, target_cfg.1);
+    Ok(())
+}
+
+/// Kill a specific running agent and its tmux session.
+#[tauri::command]
+pub async fn kill_agent(
+    state: State<'_, AppState>,
+    pm: State<'_, PaneManager>,
+    server: State<'_, SocketServer>,
+    id: String,
+) -> Result<(), String> {
+    // 1. Tell the wrapper to shut down gracefully
+    if server.is_connected(&id).await {
+        let env = Envelope::new(MSG_SHUTDOWN, &DaemonShutdown {}).map_err(err)?;
+        let _ = server.send_to(&id, &env).await;
+        // Small grace period for wrapper exit
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // 2. Kill the specific tmux session (backup in case wrapper is stuck)
+    let session = format!("alor-{}", id);
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &session])
+        .output();
+
+    // 3. Clear internal state
+    let _ = state.set_agent_connected(&id, false).map_err(err)?;
+    
+    pm.remove_agent_pane(&id).await.map_err(err)?;
+    Ok(())
+}
+
+/// Kill all running agents and their tmux sessions.
+#[tauri::command]
+pub async fn kill_all_agents(
+    state: State<'_, AppState>,
+    pm: State<'_, PaneManager>,
+    server: State<'_, SocketServer>,
+) -> Result<(), String> {
+    // 1. Tell all wrappers to shut down
+    let agents = state.all_agents();
+    for agent in &agents {
+        if server.is_connected(&agent.id).await {
+            let env = Envelope::new(MSG_SHUTDOWN, &DaemonShutdown {}).map_err(err)?;
+            let _ = server.send_to(&agent.id, &env).await;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 2. Kill all tmux sessions managed by Alor
+    let _ = std::process::Command::new("bash")
+        .arg("-c")
+        .arg("tmux list-sessions -F '#{session_name}' | grep '^alor-' | xargs -I {} tmux kill-session -t {}")
+        .output();
+
+    // 3. Kill the main display session specifically
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", "alor-main"])
+        .output();
+
+    // 4. Kill all wrapper processes (backup)
+    let _ = std::process::Command::new("pkill")
+        .arg("-9")
+        .arg("-f")
+        .arg("alor-wrapper")
+        .output();
+
+    // 5. Clear internal state
+    state.clear_all_agents();
+    pm.clear_all_panes().await;
+    state.emit_event("tasks-changed");
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Session info
 // ---------------------------------------------------------------------------
@@ -143,7 +270,7 @@ pub fn get_session_info(info: State<'_, SessionInfo>) -> Result<SessionInfo, Str
 }
 
 // ---------------------------------------------------------------------------
-// Terminal commands (PTY relay to vaelkor-main)
+// Terminal commands (PTY relay to alor-main)
 // ---------------------------------------------------------------------------
 
 /// Check if the PTY relay is running.
@@ -177,7 +304,7 @@ pub async fn terminal_resize(
 // Pane management commands
 // ---------------------------------------------------------------------------
 
-/// Show an agent's pane in vaelkor-main.
+/// Show an agent's pane in alor-main.
 #[tauri::command]
 pub async fn pane_show(
     pm: State<'_, PaneManager>,
@@ -186,7 +313,7 @@ pub async fn pane_show(
     pm.add_agent_pane(&agent_id).await.map_err(err)
 }
 
-/// Hide an agent's pane from vaelkor-main.
+/// Hide an agent's pane from alor-main.
 #[tauri::command]
 pub async fn pane_hide(
     pm: State<'_, PaneManager>,

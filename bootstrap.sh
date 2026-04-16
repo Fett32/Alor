@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# vaelkor-rs bootstrap
+# Alor bootstrap
 # Run once to install Rust + Tauri prerequisites, then build the project.
 set -euo pipefail
 
-echo "=== Vaelkor bootstrap ==="
+echo "=== Alor bootstrap ==="
 
 # --------------------------------------------------------------------------
 # 1. Rust

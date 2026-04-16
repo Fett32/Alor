@@ -53,51 +53,57 @@ let $btnSubmit;
  * Initialise the task list.  Must be called after the DOM is ready.
  */
 export function initTaskList() {
-  $scroll       = document.getElementById("task-list-scroll");
-  $search       = document.getElementById("task-search");
-  $filterSelect = document.getElementById("task-filter-state");
-  $overlay      = document.getElementById("modal-overlay");
-  $titleInput   = document.getElementById("modal-title-input");
-  $descInput    = document.getElementById("modal-desc-input");
-  $agentSelect  = document.getElementById("modal-agent-select");
-  $btnNew       = document.getElementById("btn-new-task");
-  $btnClose     = document.getElementById("btn-close-modal");
-  $btnSubmit    = document.getElementById("btn-submit-task");
+  try {
+    $scroll       = document.getElementById("task-list-scroll");
+    $search       = document.getElementById("task-search");
+    $filterSelect = document.getElementById("task-filter-state");
+    $overlay      = document.getElementById("modal-overlay");
+    $titleInput   = document.getElementById("modal-title-input");
+    $descInput    = document.getElementById("modal-desc-input");
+    $agentSelect  = document.getElementById("modal-agent-select");
+    $btnNew       = document.getElementById("btn-new-task");
+    $btnClose     = document.getElementById("btn-close-modal");
+    $btnSubmit    = document.getElementById("btn-submit-task");
 
-  if ($btnNew) $btnNew.addEventListener("click", openModal);
-  if ($btnClose) $btnClose.addEventListener("click", closeModal);
-  if ($btnSubmit) $btnSubmit.addEventListener("click", handleSubmit);
+    if (!$btnNew) console.error("[TaskList] btn-new-task not found");
 
-  // Close modal on backdrop click.
-  if ($overlay) {
-    $overlay.addEventListener("click", (e) => {
-      if (e.target === $overlay) closeModal();
+    if ($btnNew) $btnNew.addEventListener("click", openModal);
+    if ($btnClose) $btnClose.addEventListener("click", closeModal);
+    if ($btnSubmit) $btnSubmit.addEventListener("click", handleSubmit);
+
+    // Close modal on backdrop click.
+    if ($overlay) {
+      $overlay.addEventListener("click", (e) => {
+        if (e.target === $overlay) closeModal();
+      });
+    }
+
+    // Keyboard: Escape closes modal.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && $overlay?.classList.contains("open")) closeModal();
     });
-  }
 
-  // Keyboard: Escape closes modal.
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && $overlay?.classList.contains("open")) closeModal();
-  });
+    if ($search) {
+      $search.addEventListener("input", () => {
+        filterSearch = $search.value.toLowerCase();
+        renderTasks();
+      });
+    }
 
-  if ($search) {
-    $search.addEventListener("input", () => {
-      filterSearch = $search.value.toLowerCase();
-      renderTasks();
+    if ($filterSelect) {
+      $filterSelect.addEventListener("change", () => {
+        filterState = $filterSelect.value;
+        renderTasks();
+      });
+    }
+
+    fetchTasks();
+    listen("tasks-changed", () => fetchTasks()).then((fn) => {
+      unlistenTasks = fn;
     });
+  } catch (err) {
+    console.error("[TaskList] init failed:", err);
   }
-
-  if ($filterSelect) {
-    $filterSelect.addEventListener("change", () => {
-      filterState = $filterSelect.value;
-      renderTasks();
-    });
-  }
-
-  fetchTasks();
-  listen("tasks-changed", () => fetchTasks()).then((fn) => {
-    unlistenTasks = fn;
-  });
 }
 
 /**
@@ -159,6 +165,19 @@ async function cancelTask(id) {
   }
 }
 
+async function approveTask(id) {
+  try {
+    const updated = await invoke("approve_task", { id });
+    const idx = tasks.findIndex((t) => t.id === id);
+    if (idx >= 0) tasks[idx] = updated;
+    renderTasks();
+    closeProposalModal();
+  } catch (err) {
+    console.error("[TaskList] approve_task failed:", err);
+    alert(`Failed to approve task: ${err}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Modal helpers
 // ---------------------------------------------------------------------------
@@ -172,6 +191,36 @@ function openModal() {
 
 function closeModal() {
   $overlay.classList.remove("open");
+}
+
+function showProposal(task) {
+  const $title = document.getElementById("proposal-title");
+  const $brief = document.getElementById("proposal-brief");
+  const $diff  = document.getElementById("proposal-diff");
+  const $btnApprove = document.getElementById("btn-approve-task");
+  const $modal = document.getElementById("proposal-overlay");
+
+  if ($title) $title.textContent = task.title;
+  if ($brief) $brief.textContent = task.proposal_brief || "(No logic brief provided)";
+  if ($diff)  $diff.textContent  = task.proposal_diff  || "(No diff provided)";
+
+  if ($btnApprove) {
+    // Remove old listeners
+    const newBtn = $btnApprove.cloneNode(true);
+    $btnApprove.parentNode.replaceChild(newBtn, $btnApprove);
+    newBtn.addEventListener("click", () => approveTask(task.id));
+  }
+
+  const $btnClose = document.getElementById("btn-close-proposal");
+  if ($btnClose) {
+    $btnClose.addEventListener("click", closeProposalModal);
+  }
+
+  $modal.classList.add("open");
+}
+
+function closeProposalModal() {
+  document.getElementById("proposal-overlay").classList.remove("open");
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +305,7 @@ function buildTaskCard(task) {
 
   metaEl.append(badge, agentSpan, timeSpan);
 
-  // Cancel button for active tasks
+  // Actions: Cancel for active tasks, Review for PROPOSED
   const terminalStates = new Set([
     "COMPLETED", "CANCELLED", "REJECTED", "TIMED_OUT",
   ]);
@@ -264,6 +313,15 @@ function buildTaskCard(task) {
   if (!terminalStates.has(task.state)) {
     const actions = document.createElement("div");
     actions.className = "task-actions";
+
+    if (task.state === "PROPOSED") {
+      const btnReview = document.createElement("button");
+      btnReview.className = "review";
+      btnReview.textContent = "Review";
+      btnReview.addEventListener("click", () => showProposal(task));
+      actions.appendChild(btnReview);
+    }
+
     const btnCancel = document.createElement("button");
     btnCancel.className = "cancel";
     btnCancel.textContent = "Cancel";

@@ -1,6 +1,6 @@
 /// Project profiles: metadata about projects the orchestrator manages.
 ///
-/// Stored at ~/.local/share/vaelkor/projects/<name>.yaml
+/// Stored at ~/.local/share/alor/projects/<name>.yaml
 /// Only the orchestrator writes these. Agents read them via pointers.
 
 use anyhow::{Context, Result};
@@ -35,6 +35,9 @@ pub struct ProjectProfile {
     /// Path to Claude memory index, if applicable.
     #[serde(default)]
     pub memory_index: Option<String>,
+    /// Path to the Alor memory hub directory for this project.
+    #[serde(default)]
+    pub memory_hub: Option<String>,
     /// Free-form notes from the orchestrator.
     #[serde(default)]
     pub notes: Vec<String>,
@@ -50,6 +53,7 @@ impl ProjectProfile {
             key_files: Vec::new(),
             doc_paths: Vec::new(),
             memory_index: None,
+            memory_hub: None,
             notes: Vec::new(),
         }
     }
@@ -66,12 +70,27 @@ fn projects_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Get the memory hub directory for a specific project.
+pub fn memory_hub_dir(project_name: &str) -> Result<PathBuf> {
+    let data = session::data_dir()?;
+    let dir = data.join("hubs").join(project_name);
+    Ok(dir)
+}
+
 /// Ensure the projects directory exists.
 pub fn ensure_projects_dir() -> Result<PathBuf> {
     let dir = projects_dir()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Ensure project-specific directories (hub, etc) exist.
+pub fn ensure_project_dirs(project_name: &str) -> Result<()> {
+    let hub = memory_hub_dir(project_name)?;
+    std::fs::create_dir_all(&hub)
+        .with_context(|| format!("create memory hub {}", hub.display()))?;
+    Ok(())
 }
 
 /// Load a project profile by name.

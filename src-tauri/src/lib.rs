@@ -11,17 +11,17 @@ use tracing_subscriber::{fmt, EnvFilter};
 use wrapper::server::SocketServer;
 
 pub fn run() {
-    // Init tracing: VAELKOR_LOG=debug or default info
+    // Init tracing: ALOR_LOG=debug or default info
     fmt()
         .with_env_filter(
-            EnvFilter::try_from_env("VAELKOR_LOG")
+            EnvFilter::try_from_env("ALOR_LOG")
                 .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
     // Ensure runtime directories exist before Tauri starts
     if let Err(e) = daemon::session::ensure_dirs() {
-        eprintln!("vaelkor: failed to create runtime dirs: {e}");
+        eprintln!("alor: failed to create runtime dirs: {e}");
     }
 
     let app_state = match daemon::session::data_dir() {
@@ -31,7 +31,7 @@ pub fn run() {
             daemon::state::AppState::new()
         }
     };
-    // Load agent configs from ~/.config/vaelkor/agents/*.yaml and register them.
+    // Load agent configs from ~/.config/alor/agents/*.yaml and register them.
     let agent_configs = match daemon::config::load_agent_configs() {
         Ok(configs) => {
             daemon::config::register_agents_from_config(&app_state, &configs);
@@ -102,11 +102,11 @@ pub fn run() {
                 notify_task_completed(&title);
             });
 
-            // Create vaelkor-main tmux session.
-            let pm = pane_manager;
+            // Create alor-main tmux session.
+            let pm_main = pane_manager.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = pm.ensure_main_session().await {
-                    tracing::error!("failed to create vaelkor-main: {e:#}");
+                if let Err(e) = pm_main.ensure_main_session().await {
+                    tracing::error!("failed to create alor-main: {e:#}");
                 }
             });
 
@@ -118,18 +118,31 @@ pub fn run() {
                 }
             });
 
-            // Auto-launch wrappers for agents with autolaunch: true.
-            // Small delay so the socket server is ready to accept connections.
+            // Auto-launch wrappers for agents with autolaunch: true OR existing sessions.
             let configs_for_launch = agent_configs;
+            let pm_recovery = pane_manager.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(300));
 
                 // Kill stale wrapper processes from previous daemon runs
-                // using tracked PIDs (not system-wide pkill).
                 daemon::session::kill_stale_wrappers();
                 std::thread::sleep(std::time::Duration::from_millis(200));
 
-                let mut children = daemon::config::launch_wrappers(&configs_for_launch);
+                // Recovery: identify agents that have existing tmux sessions
+                let mut to_launch = Vec::new();
+                for (id, cfg) in configs_for_launch {
+                    let session_name = format!("alor-{}", id);
+                    let exists = tauri::async_runtime::block_on(pm_recovery.session_exists(&session_name));
+                    
+                    if cfg.autolaunch || exists {
+                        if exists {
+                            tracing::info!(agent_id = %id, "reclaiming existing tmux session");
+                        }
+                        to_launch.push((id, cfg));
+                    }
+                }
+
+                let mut children = daemon::config::launch_wrappers(&to_launch);
 
                 // Record child PIDs so next daemon startup can kill them.
                 let pids: Vec<u32> = children.iter().map(|(_, c)| c.id()).collect();
@@ -137,21 +150,18 @@ pub fn run() {
                     tracing::warn!("failed to save wrapper PIDs: {e}");
                 }
 
-                // Keep children alive until the process exits, then clean up.
-                // This thread just waits — when the main process exits, the
-                // children get SIGHUP automatically on Linux.
                 for (_id, ref mut child) in &mut children {
                     let _ = child.wait();
                 }
             });
 
-            // Start PTY relay for vaelkor-main.
+            // Start PTY relay for alor-main.
             // The relay spawns `tmux attach` in a real PTY and reads its output.
-            // We need a short delay to ensure vaelkor-main exists first.
+            // We need a short delay to ensure alor-main exists first.
             let handle = app.handle().clone();
             let bridge = terminal_bridge_clone;
             tauri::async_runtime::spawn(async move {
-                // Wait for vaelkor-main to be created.
+                // Wait for alor-main to be created.
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
                 // Start the PTY relay (blocking call to set up PTY).
@@ -201,7 +211,7 @@ pub fn run() {
 
                     // Force tmux to redraw cleanly after drain.
                     let _ = std::process::Command::new("tmux")
-                        .args(["refresh-client", "-t", "vaelkor-main"])
+                        .args(["refresh-client", "-t", "alor-main"])
                         .output();
 
                     // Phase 2: forward PTY output to frontend.
@@ -229,6 +239,13 @@ pub fn run() {
                 .ok();
             });
 
+            // Force a UI sync on startup so existing agents are visible immediately.
+            let app_state_sync = app_state.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                app_state_sync.emit_event("agents-changed");
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -236,6 +253,10 @@ pub fn run() {
             commands::get_task,
             commands::assign_task,
             commands::cancel_task,
+            commands::approve_task,
+            commands::spawn_agent,
+            commands::kill_agent,
+            commands::kill_all_agents,
             commands::get_agents,
             commands::register_agent,
             commands::get_session_info,
@@ -247,7 +268,7 @@ pub fn run() {
             commands::pane_list,
         ])
         .run(tauri::generate_context!())
-        .expect("error running vaelkor");
+        .expect("error running alor");
 }
 
 /// Send a desktop notification via notify-send.
@@ -260,7 +281,7 @@ fn notify_task_completed(title: &str) {
 
     std::thread::spawn(move || {
         let _ = std::process::Command::new("notify-send")
-            .args(["--app-name=Vaelkor", "Vaelkor", &body])
+            .args(["--app-name=Alor", "Alor", &body])
             .output();
     });
 }

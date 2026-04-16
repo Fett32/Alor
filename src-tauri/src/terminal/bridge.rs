@@ -1,7 +1,7 @@
-/// Terminal bridge — PTY relay connecting xterm.js to vaelkor-main.
+/// Terminal bridge — PTY relay connecting xterm.js to alor-main.
 ///
 /// Architecture:
-///   Spawns `tmux attach -t vaelkor-main` inside a real PTY.
+///   Spawns `tmux attach -t alor-main` inside a real PTY.
 ///   Reads PTY output and emits it as Tauri events (incremental, live).
 ///   Writes xterm.js input to the PTY stdin.
 ///   Handles resize when xterm.js dimensions change.
@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const MAIN_SESSION: &str = "vaelkor-main";
+const MAIN_SESSION: &str = "alor-main";
 
 // ---------------------------------------------------------------------------
 // Types

@@ -1,12 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Read(/home/fett/Projects/vaelkor-rs/**)",
-      "Read(/home/fett/.config/vaelkor/**)",
-      "Read(/home/fett/.local/share/vaelkor/**)",
-      "Edit(/home/fett/Projects/vaelkor-rs/**)",
-      "Glob(/home/fett/Projects/vaelkor-rs/**)",
-      "Grep(/home/fett/Projects/vaelkor-rs/**)",
+      "Read(/home/fett/Projects/Alor/**)",
+      "Read(/home/fett/.config/alor/**)",
+      "Read(/home/fett/.local/share/alor/**)",
+      "Edit(/home/fett/Projects/Alor/**)",
+      "Glob(/home/fett/Projects/Alor/**)",
+      "Grep(/home/fett/Projects/Alor/**)",
       "Bash(cargo build:*)",
       "Bash(cargo check:*)",
       "Bash(cargo test:*)",

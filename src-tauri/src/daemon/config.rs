@@ -1,4 +1,4 @@
-/// Agent configuration loaded from ~/.config/vaelkor/agents/*.yaml.
+/// Agent configuration loaded from ~/.config/alor/agents/*.yaml.
 ///
 /// Each YAML file defines one agent. The filename (minus .yaml) is the agent ID.
 /// On startup, all configs are loaded and agents are auto-registered.
@@ -55,7 +55,7 @@ fn default_role() -> String {
 // Loading
 // ---------------------------------------------------------------------------
 
-/// Load all agent configs from ~/.config/vaelkor/agents/*.yaml.
+/// Load all agent configs from ~/.config/alor/agents/*.yaml.
 /// Returns (agent_id, config) pairs. The agent_id is the filename stem.
 pub fn load_agent_configs() -> Result<Vec<(String, AgentConfig)>> {
     let config_dir = session::config_dir()?;
@@ -128,7 +128,7 @@ pub fn register_agents_from_config(state: &AppState, configs: &[(String, AgentCo
         };
 
         let mut agent = Agent::new(id.clone(), display_name);
-        agent.tmux_session = Some(format!("vaelkor-{id}"));
+        agent.tmux_session = Some(format!("alor-{id}"));
         state.register_agent(agent);
 
         tracing::info!(agent_id = %id, role = %cfg.role, "agent registered from config");
@@ -139,12 +139,12 @@ pub fn register_agents_from_config(state: &AppState, configs: &[(String, AgentCo
 // Wrapper auto-launch
 // ---------------------------------------------------------------------------
 
-/// Find the vaelkor-wrapper binary. Looks next to the current executable first,
+/// Find the alor-wrapper binary. Looks next to the current executable first,
 /// then falls back to PATH.
 pub fn find_wrapper_binary() -> Result<PathBuf> {
     // Try next to the current executable (workspace builds put both in target/debug/).
     if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.parent().unwrap_or(Path::new(".")).join("vaelkor-wrapper");
+        let sibling = exe.parent().unwrap_or(Path::new(".")).join("alor-wrapper");
         if sibling.exists() {
             return Ok(sibling);
         }
@@ -152,7 +152,7 @@ pub fn find_wrapper_binary() -> Result<PathBuf> {
 
     // Fall back to PATH lookup.
     if let Ok(output) = std::process::Command::new("which")
-        .arg("vaelkor-wrapper")
+        .arg("alor-wrapper")
         .output()
     {
         if output.status.success() {
@@ -163,19 +163,77 @@ pub fn find_wrapper_binary() -> Result<PathBuf> {
         }
     }
 
-    anyhow::bail!("vaelkor-wrapper binary not found")
+    anyhow::bail!("alor-wrapper binary not found")
 }
 
-/// Spawn wrapper processes for agents with `autolaunch: true`.
+/// Spawn wrapper processes for agents provided in the list.
 /// Returns the child processes so the caller can track/kill them.
 pub fn launch_wrappers(configs: &[(String, AgentConfig)]) -> Vec<(String, Child)> {
+    launch_wrappers_internal(configs, true) // Force true because we explicitly want these
+}
+
+/// Force spawn a single wrapper regardless of autolaunch setting.
+pub fn force_launch_wrapper(id: String, cfg: AgentConfig) -> Option<Child> {
+    let wrapper_bin = match find_wrapper_binary() {
+        Ok(bin) => bin,
+        Err(e) => {
+            tracing::warn!("cannot force launch wrapper: {e}");
+            return None;
+        }
+    };
+
+    let mut cmd = std::process::Command::new(&wrapper_bin);
+    cmd.arg(&id);
+
+    // Pass the command if specified.
+    if !cfg.command.is_empty() {
+        cmd.arg("--command").arg(cfg.command.join(" "));
+    }
+
+    // Pass working directory with ~ expansion.
+    if let Some(ref wd) = cfg.working_dir {
+        let expanded = if wd.starts_with('~') {
+            dirs_home().join(wd.strip_prefix("~/").unwrap_or(&wd[1..]))
+        } else {
+            PathBuf::from(wd)
+        };
+        cmd.arg("--workdir").arg(expanded);
+    }
+
+    // Pass startup file with ~ expansion.
+    if let Some(ref sf) = cfg.startup_file {
+        let expanded = if sf.starts_with('~') {
+            dirs_home().join(sf.strip_prefix("~/").unwrap_or(&sf[1..]))
+        } else {
+            PathBuf::from(sf)
+        };
+        cmd.arg("--startup-file").arg(expanded);
+    }
+
+    match cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => {
+            tracing::info!(agent_id = %id, pid = child.id(), "wrapper force-launched");
+            Some(child)
+        }
+        Err(e) => {
+            tracing::error!(agent_id = %id, "failed to force launch wrapper: {e}");
+            None
+        }
+    }
+}
+
+fn launch_wrappers_internal(configs: &[(String, AgentConfig)], force: bool) -> Vec<(String, Child)> {
     let wrapper_bin = match find_wrapper_binary() {
         Ok(bin) => {
-            tracing::info!(path = %bin.display(), "found vaelkor-wrapper binary");
+            tracing::info!(path = %bin.display(), "found alor-wrapper binary");
             bin
         }
         Err(e) => {
-            tracing::warn!("cannot auto-launch wrappers: {e}");
+            tracing::warn!("cannot launch wrappers: {e}");
             return vec![];
         }
     };
@@ -183,7 +241,7 @@ pub fn launch_wrappers(configs: &[(String, AgentConfig)]) -> Vec<(String, Child)
     let mut children = Vec::new();
 
     for (id, cfg) in configs {
-        if !cfg.autolaunch {
+        if !force && !cfg.autolaunch {
             tracing::debug!(agent_id = %id, "autolaunch disabled, skipping");
             continue;
         }
@@ -222,7 +280,7 @@ pub fn launch_wrappers(configs: &[(String, AgentConfig)]) -> Vec<(String, Child)
             .spawn()
         {
             Ok(child) => {
-                tracing::info!(agent_id = %id, pid = child.id(), "wrapper auto-launched");
+                tracing::info!(agent_id = %id, pid = child.id(), "wrapper launched (force={force})");
                 children.push((id.clone(), child));
             }
             Err(e) => {

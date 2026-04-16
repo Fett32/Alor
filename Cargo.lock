@@ -33,6 +33,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "alor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "directories",
+ "parking_lot",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-shell",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "alor-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "alor-wrapper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4476,54 +4524,6 @@ dependencies = [
  "js-sys",
  "serde_core",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "vaelkor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "directories",
- "parking_lot",
- "portable-pty",
- "serde",
- "serde_json",
- "serde_yaml",
- "tauri",
- "tauri-build",
- "tauri-plugin-shell",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "vaelkor-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "vaelkor-wrapper"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "regex",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
-/// Wire protocol between the Vaelkor orchestrator and agent wrappers.
+/// Wire protocol between the Alor orchestrator and agent wrappers.
 ///
 /// All messages are newline-delimited JSON on a Unix socket at
-/// /tmp/vaelkor/<agent_id>.sock
+/// /tmp/alor/<agent_id>.sock
 ///
 /// Direction conventions:
 ///   O→W  orchestrator sends to wrapper
@@ -16,12 +16,14 @@ use uuid::Uuid;
 
 pub const MSG_TASK_ASSIGN: &str = "task.assign";
 pub const MSG_TASK_ACCEPT: &str = "task.accept";
+pub const MSG_TASK_PROPOSE: &str = "task.propose";
 pub const MSG_TASK_BLOCKED: &str = "task.blocked";
 pub const MSG_TASK_COMPLETE: &str = "task.complete";
 pub const MSG_STATUS_RESPONSE: &str = "status.response";
 pub const MSG_REGISTER: &str = "wrapper.register";
 pub const MSG_ERROR: &str = "wrapper.error";
 pub const MSG_USER_INTERVENTION: &str = "user.intervention";
+pub const MSG_SHUTDOWN: &str = "daemon.shutdown";
 
 // Phase 9: CLI message types
 pub const MSG_CLI_STATUS: &str = "cli.status";
@@ -37,6 +39,7 @@ pub const MSG_CLI_EVENT_STREAM: &str = "cli.event.stream";
 pub const MSG_CLI_PROJECT_LIST: &str = "cli.project.list";
 pub const MSG_CLI_PROJECT_GET: &str = "cli.project.get";
 pub const MSG_CLI_PROJECT_SAVE: &str = "cli.project.save";
+pub const MSG_CLI_INTEGRATIONS_GET: &str = "cli.integrations.get";
 pub const MSG_CLI_RESPONSE: &str = "cli.response";
 pub const MSG_CLI_ERROR: &str = "cli.error";
 pub const MSG_EVENT: &str = "event";
@@ -95,6 +98,20 @@ pub struct TaskAccept {
 }
 
 // ---------------------------------------------------------------------------
+// W→O  task.propose
+// ---------------------------------------------------------------------------
+
+/// Wrapper proposes a plan or diff for human approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskPropose {
+    pub task_id: Uuid,
+    /// Logic brief explaining what will be done.
+    pub brief: Option<String>,
+    /// Optional diff showing exactly what will change.
+    pub diff: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // W→O  task.blocked
 // ---------------------------------------------------------------------------
 
@@ -150,6 +167,13 @@ pub struct UserIntervention {
 }
 
 // ---------------------------------------------------------------------------
+// daemon.shutdown — daemon tells wrapper to exit
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonShutdown {}
+
+// ---------------------------------------------------------------------------
 // Phase 9: CLI payload structs
 // ---------------------------------------------------------------------------
 
@@ -182,6 +206,7 @@ pub struct CliAssign {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliSpawn {
+    pub name: Option<String>,
     pub agent: String,
     pub role: Option<String>,
 }
@@ -202,5 +227,7 @@ pub struct CliProjectSave {
     pub description: Option<String>,
     pub root_dir: Option<String>,
     pub stack: Option<Vec<String>>,
+    pub key_files: Option<Vec<String>>,
+    pub doc_paths: Option<Vec<String>>,
 }
 

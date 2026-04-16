@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 
 // ---- configuration constants ------------------------------------------------
 
-const DAEMON_SOCK: &str = "/tmp/vaelkor/daemon.sock";
+const DAEMON_SOCK: &str = "/tmp/alor/daemon.sock";
 const CAPTURE_LINES: usize = 50;
 const POLL_INTERVAL_MS: u64 = 500;
 /// Number of trailing lines to check for the idle pattern.
@@ -45,38 +45,42 @@ struct WrapperArgs {
 }
 
 fn parse_args() -> Result<WrapperArgs> {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut workdir: Option<String> = None;
     let mut command: Option<String> = None;
     let mut startup_file: Option<String> = None;
+    let mut agent: Option<String> = None;
 
-    // Extract flags
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--workdir" => {
-                args.remove(i);
-                if i < args.len() {
-                    workdir = Some(args.remove(i));
+                if i + 1 < args.len() {
+                    workdir = Some(args[i + 1].clone());
+                    i += 2;
                 } else {
                     bail!("--workdir requires a value");
                 }
             }
             "--command" => {
-                args.remove(i);
-                if i < args.len() {
-                    command = Some(args.remove(i));
+                if i + 1 < args.len() {
+                    command = Some(args[i + 1].clone());
+                    i += 2;
                 } else {
                     bail!("--command requires a value");
                 }
             }
             "--startup-file" => {
-                args.remove(i);
-                if i < args.len() {
-                    startup_file = Some(args.remove(i));
+                if i + 1 < args.len() {
+                    startup_file = Some(args[i + 1].clone());
+                    i += 2;
                 } else {
                     bail!("--startup-file requires a value");
                 }
+            }
+            s if !s.starts_with('-') && agent.is_none() => {
+                agent = Some(s.to_string());
+                i += 1;
             }
             _ => {
                 i += 1;
@@ -84,13 +88,9 @@ fn parse_args() -> Result<WrapperArgs> {
         }
     }
 
-    let agent = args
-        .first()
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!(
-            "Usage: vaelkor-wrapper <agent-name> [--workdir DIR] [--command CMD] [--startup-file PATH]"
-        ))?;
+    let agent = agent.ok_or_else(|| anyhow::anyhow!(
+        "Usage: alor-wrapper <agent-id> [--workdir DIR] [--command CMD] [--startup-file PATH]"
+    ))?;
 
     Ok(WrapperArgs {
         agent,
@@ -103,7 +103,7 @@ fn parse_args() -> Result<WrapperArgs> {
 // ---- helpers ----------------------------------------------------------------
 
 fn session_name(agent: &str) -> String {
-    format!("vaelkor-{}", agent)
+    format!("alor-{}", agent)
 }
 
 /// Start the tmux session if it doesn't already exist, running the agent CLI.
@@ -116,10 +116,8 @@ fn ensure_session(
 ) -> Result<bool> {
     if tmux::session_exists(session) {
         info!(session, "reusing existing tmux session");
-        // Ensure paste detection is disabled even on existing sessions.
-        let _ = std::process::Command::new("tmux")
-            .args(["set-option", "-t", session, "assume-paste-time", "0"])
-            .output();
+        // Ensure session defaults are applied even on pre-existing sessions.
+        tmux::ensure_session_defaults(session);
         return Ok(false);
     }
     let command = explicit_command.unwrap_or(match kind {
@@ -135,29 +133,95 @@ fn ensure_session(
 
 // ---- connect + register -----------------------------------------------------
 
-/// Connect to daemon and send registration. Returns the client on success.
-async fn connect_and_register(agent: &str) -> Result<client::DaemonClient> {
-    let mut client = client::DaemonClient::connect(DAEMON_SOCK)
-        .await
-        .context("connecting to daemon")?;
-
-    let register_env = Envelope::new(MSG_REGISTER, WrapperRegister { agent_id: agent.to_owned() })?;
-    client.send(&register_env).await?;
-
-    Ok(client)
+/// Outcome of a registration attempt.
+enum RegisterResult {
+    /// Successfully registered — ready for main loop.
+    Ok(client::DaemonClient),
+    /// Daemon rejected us with a collision error — another wrapper with this
+    /// agent_id is already connected. Retrying won't help; exit.
+    Collision(String),
+    /// Transient failure (network, daemon not up yet, etc.) — worth retrying.
+    TransientError(anyhow::Error),
 }
 
-/// Try to connect with exponential backoff. Returns None only on fatal errors.
-async fn connect_with_backoff(agent: &str) -> client::DaemonClient {
+/// Connect to daemon and send registration. Returns the client on success.
+async fn connect_and_register(agent: &str) -> RegisterResult {
+    // Phase 1: connect and send registration.
+    let mut client = match async {
+        info!(agent, socket = DAEMON_SOCK, "connecting to daemon...");
+        let mut client = client::DaemonClient::connect(DAEMON_SOCK)
+            .await
+            .context("connecting to daemon")?;
+
+        info!(agent, "connected, sending registration...");
+        let register_env = Envelope::new(MSG_REGISTER, WrapperRegister { agent_id: agent.to_owned() })?;
+        client.send(&register_env).await?;
+        Ok::<_, anyhow::Error>(client)
+    }
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => return RegisterResult::TransientError(e),
+    };
+
+    info!(agent, "registration sent, waiting for confirmation...");
+
+    // Phase 2: wait briefly for a potential rejection from the daemon.
+    // If the daemon accepts us, it won't send anything immediately —
+    // it just starts the read loop. If it rejects us (collision), it
+    // sends a wrapper.error and closes the connection.
+    match tokio::time::timeout(Duration::from_secs(2), client.recv()).await {
+        Ok(Ok(Some(env))) if env.kind == MSG_ERROR => {
+            let message = env
+                .payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+                .to_string();
+            if message.contains("Collision") || message.contains("already connected") {
+                return RegisterResult::Collision(message);
+            }
+            RegisterResult::TransientError(anyhow::anyhow!("daemon rejected registration: {message}"))
+        }
+        Ok(Ok(Some(_env))) => {
+            // Got a real message (e.g. task.assign) — registration accepted.
+            info!(agent, "registration accepted (got immediate message)");
+            RegisterResult::Ok(client)
+        }
+        Ok(Ok(None)) => {
+            RegisterResult::TransientError(anyhow::anyhow!("daemon closed connection after registration"))
+        }
+        Ok(Err(e)) => {
+            RegisterResult::TransientError(anyhow::anyhow!("error reading after registration: {e:#}"))
+        }
+        Err(_timeout) => {
+            // No error received within timeout — daemon accepted us silently.
+            info!(agent, "registration accepted (no rejection within timeout)");
+            RegisterResult::Ok(client)
+        }
+    }
+}
+
+/// Try to connect with exponential backoff.
+/// Returns Ok(client) on success, or Err if the daemon rejected us with a
+/// collision (fatal — retrying won't help).
+async fn connect_with_backoff(agent: &str) -> Result<client::DaemonClient> {
     let mut delay_ms = RECONNECT_INITIAL_MS;
 
     loop {
         match connect_and_register(agent).await {
-            Ok(client) => {
+            RegisterResult::Ok(client) => {
                 info!("reconnected to daemon");
-                return client;
+                return Ok(client);
             }
-            Err(e) => {
+            RegisterResult::Collision(msg) => {
+                error!(
+                    agent,
+                    "agent ID collision: {msg}. Another wrapper with this ID is already connected. Exiting."
+                );
+                bail!("agent ID collision: {msg}");
+            }
+            RegisterResult::TransientError(e) => {
                 warn!(
                     delay_ms,
                     "daemon connection failed ({e:#}), retrying in {delay_ms}ms"
@@ -184,10 +248,18 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("vaelkor_wrapper=info".parse().unwrap()),
+                .add_directive("alor_wrapper=info".parse().unwrap()),
         )
         .init();
 
+    if let Err(e) = run_main().await {
+        error!("alor-wrapper fatal error: {e:#}");
+        return Err(e);
+    }
+    Ok(())
+}
+
+async fn run_main() -> Result<()> {
     let wargs = parse_args()?;
     let agent = wargs.agent;
     let session = session_name(&agent);
@@ -200,7 +272,7 @@ async fn main() -> Result<()> {
     };
     let detector = IdleDetector::new(&kind);
 
-    info!(agent, "vaelkor-wrapper starting");
+    info!(agent, "alor-wrapper starting");
 
     // Ensure the tmux session exists (once, outside reconnect loop).
     let freshly_created = ensure_session(
@@ -210,11 +282,42 @@ async fn main() -> Result<()> {
         wargs.command.as_deref(),
     )?;
 
-    // If session was freshly created and a startup file is set, inject its contents.
+    // Inject startup file if provided AND session was freshly created.
     if freshly_created {
         if let Some(ref startup_path) = wargs.startup_file {
-            info!(startup_path, "injecting startup file after 3s delay");
-            sleep(Duration::from_secs(3)).await;
+        info!(startup_path, "handling startup briefing...");
+        
+        // 1. Give it a few seconds to boot the process
+        sleep(Duration::from_secs(3)).await;
+
+        // 2. Check for "Trust this folder" prompt
+        match tmux::capture_pane(&session, 10) {
+            Ok(lines) => {
+                if lines.iter().any(|l| l.contains("trust this folder")) {
+                    info!("detected trust prompt, sending '1'");
+                    let _ = tmux::send_keys(&session, "1");
+                    sleep(Duration::from_millis(500)).await;
+                }
+            }
+            Err(e) => warn!("initial capture failed: {e:#}"),
+        }
+
+        // 3. Wait for actual prompt (up to 15s)
+        let mut ready = false;
+        for i in 0..30 {
+            if let Ok(lines) = tmux::capture_pane(&session, 20) {
+                let text = lines.join("\n");
+                // Look for common prompts: " > ", "❯", "$ ", or "% "
+                if text.contains(" > ") || text.contains("❯") || text.contains("$ ") || text.contains("% ") {
+                    info!("detected prompt after {}ms, sending briefing", i * 500);
+                    ready = true;
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        if ready {
             match std::fs::read_to_string(startup_path) {
                 Ok(contents) => {
                     if let Err(e) = tmux::send_keys(&session, &contents) {
@@ -225,13 +328,18 @@ async fn main() -> Result<()> {
                     error!(startup_path, "failed to read startup file: {e:#}");
                 }
             }
+        } else {
+            warn!("timed out waiting for prompt, skipping briefing");
         }
+    }
     }
 
     // Initial connection.
-    let mut client = connect_and_register(&agent)
-        .await
-        .context("initial daemon connection")?;
+    // Use connect_with_backoff to handle initial connection failures.
+    // If the daemon rejects us with a collision, exit immediately.
+    let mut client = connect_with_backoff(&agent).await?;
+
+    info!(agent, "alor-wrapper entered main loop");
 
     // Give the agent a moment to render its first prompt before polling.
     sleep(Duration::from_millis(1500)).await;
@@ -249,7 +357,7 @@ async fn main() -> Result<()> {
             }
             ExitReason::Disconnected => {
                 warn!("lost daemon connection, reconnecting...");
-                client = connect_with_backoff(&agent).await;
+                client = connect_with_backoff(&agent).await?;
 
                 // Re-report active task to daemon after reconnect.
                 if let AgentState::Running { task_id } = &state {
@@ -273,7 +381,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("vaelkor-wrapper exiting");
+    info!("alor-wrapper exiting");
     Ok(())
 }
 
@@ -291,8 +399,32 @@ async fn run_loop(
     let mut last_injection: Option<Instant> = None;
     let mut last_intervention_sent: Option<Instant> = None;
     let mut prev_fingerprint: Option<String> = None;
+    let mut last_heartbeat = Instant::now();
 
     loop {
+        // ---- Heartbeat: stay alive in the UI every 3s ----
+        if last_heartbeat.elapsed().as_secs() >= 3 {
+            let (task_id, details) = match state {
+                AgentState::Idle => (None, Some("idle".to_owned())),
+                AgentState::Running { task_id } => (Some(*task_id), Some("running".to_owned())),
+            };
+            let hb_env = Envelope::new(
+                MSG_STATUS_RESPONSE,
+                StatusResponse {
+                    agent_id: agent.to_owned(),
+                    task_id,
+                    alive: true,
+                    details,
+                },
+            )?;
+
+            if let Err(e) = client.send(&hb_env).await {
+                warn!("heartbeat failed: {e:#}");
+                return Ok(ExitReason::Disconnected);
+            }
+            last_heartbeat = Instant::now();
+        }
+
         // ---- race: daemon message OR poll interval ----
         tokio::select! {
             result = client.recv() => {
@@ -361,7 +493,12 @@ async fn run_loop(
                     }
 
                     // -- idle detection --
-                    if detector.is_idle_tail(&lines, IDLE_TAIL) {
+                    // Skip idle detection during injection grace period to avoid
+                    // false positives while the agent processes injected text.
+                    let past_idle_grace = last_injection
+                        .map(|t| Instant::now().duration_since(t).as_secs_f64() >= INJECTION_GRACE_SECS)
+                        .unwrap_or(true);
+                    if past_idle_grace && detector.is_idle_tail(&lines, IDLE_TAIL) {
                         let now = Instant::now();
                         let first_seen = *idle_since.get_or_insert(now);
                         let elapsed = now.duration_since(first_seen).as_secs_f64();

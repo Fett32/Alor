@@ -4,7 +4,7 @@
 /// so the daemon (Tauri side) and this wrapper speak the same JSON schema.
 ///
 /// All messages are newline-delimited JSON on Unix sockets:
-///   Daemon → Wrapper: /tmp/vaelkor/daemon.sock   (wrapper connects to this)
+///   Daemon → Wrapper: /tmp/alor/daemon.sock   (wrapper connects to this)
 ///   Wrapper → Daemon: same connection, other direction
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

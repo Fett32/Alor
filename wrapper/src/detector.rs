@@ -5,6 +5,7 @@ use regex::Regex;
 pub enum AgentKind {
     ClaudeCode,
     Codex,
+    Gemini,
     /// Generic shell or unknown agent.
     Default,
 }
@@ -17,6 +18,8 @@ impl AgentKind {
             AgentKind::ClaudeCode
         } else if lower.contains("codex") {
             AgentKind::Codex
+        } else if lower.contains("gemini") {
+            AgentKind::Gemini
         } else {
             AgentKind::Default
         }
@@ -24,9 +27,11 @@ impl AgentKind {
 
     fn pattern(&self) -> &str {
         match self {
-            AgentKind::ClaudeCode => r"^❯\s*$",
+            AgentKind::ClaudeCode => r"^[❯\$]\s*$",
             AgentKind::Codex => r"^codex>",
-            AgentKind::Default => r"^[\$>]\s*$",
+            // Gemini CLI shows " >   Type your message" as its idle prompt.
+            AgentKind::Gemini => r"^\s*>\s+(Type your message|$)",
+            AgentKind::Default => r"^[\$>\+]\s*$",
         }
     }
 }
@@ -68,13 +73,25 @@ mod tests {
         let d = IdleDetector::new(&AgentKind::ClaudeCode);
         assert!(d.is_idle(&lines(&["❯ "])));
         assert!(d.is_idle(&lines(&["❯"])));
+        assert!(d.is_idle(&lines(&["$ "])));
+        assert!(d.is_idle(&lines(&["$"])));
         assert!(!d.is_idle(&lines(&["❯ some output"])));
+        assert!(!d.is_idle(&lines(&["$ running something"])));
     }
 
     #[test]
     fn codex_idle() {
         let d = IdleDetector::new(&AgentKind::Codex);
         assert!(d.is_idle(&lines(&["codex> "])));
+        assert!(!d.is_idle(&lines(&["$ "])));
+    }
+
+    #[test]
+    fn gemini_idle() {
+        let d = IdleDetector::new(&AgentKind::Gemini);
+        assert!(d.is_idle(&lines(&[" >   Type your message or @path/to/file"])));
+        assert!(d.is_idle(&lines(&[" >   Type your message"])));
+        assert!(!d.is_idle(&lines(&["generating response..."])));
         assert!(!d.is_idle(&lines(&["$ "])));
     }
 

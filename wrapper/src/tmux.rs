@@ -33,63 +33,47 @@ pub fn create_session_with_dir(name: &str, command: &str, workdir: Option<&str>)
         );
     }
 
-    // Disable paste detection so injected text is not throttled.
-    let out = Command::new("tmux")
-        .args(["set-option", "-t", name, "assume-paste-time", "0"])
-        .output()
-        .context("failed to set assume-paste-time")?;
-    if !out.status.success() {
-        bail!(
-            "tmux set-option assume-paste-time failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    apply_session_defaults(name);
+    ensure_session_defaults(name);
 
     Ok(())
 }
 
-/// Inject `text` into the tmux session as if the user typed it, followed by Enter.
+/// Inject `text` into the tmux session as a single block, followed by Enter.
 pub fn send_keys(name: &str, text: &str) -> Result<()> {
-    // Use -l (literal) so tmux doesn't interpret special sequences in the text.
-    // Send text first, then Enter separately (Enter is a key name, not literal).
+    // Use -l (literal) so tmux doesn't interpret special sequences.
     let out = Command::new("tmux")
         .args(["send-keys", "-t", name, "-l", text])
         .output()
         .context("failed to spawn tmux send-keys (text)")?;
     if !out.status.success() {
-        bail!(
-            "tmux send-keys (text) failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        bail!("tmux send-keys failed: {}", String::from_utf8_lossy(&out.stderr));
     }
 
-    // Wait for the agent to process the pasted text before pressing Enter.
-    thread::sleep(Duration::from_millis(500));
+    // Small delay to let CLI buffer the text
+    thread::sleep(Duration::from_millis(200));
 
-    // Now send Enter as a key name (not literal).
+    // Send a final Enter to submit
     let out = Command::new("tmux")
         .args(["send-keys", "-t", name, "Enter"])
         .output()
         .context("failed to spawn tmux send-keys (Enter)")?;
     if !out.status.success() {
-        bail!(
-            "tmux send-keys (Enter) failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        bail!("tmux send-keys Enter failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(())
 }
 
-/// Apply Vaelkor's default session options (mouse, scrollback).
-/// Called right after session creation so the initial pane inherits the limits.
-fn apply_session_defaults(name: &str) {
+/// Apply Alor's default session options (mouse, scrollback, paste detection).
+/// Called on session creation and also when reusing a pre-existing session.
+pub fn ensure_session_defaults(name: &str) {
     let _ = Command::new("tmux")
         .args(["set-option", "-t", name, "mouse", "on"])
         .output();
     let _ = Command::new("tmux")
         .args(["set-option", "-t", name, "history-limit", "50000"])
+        .output();
+    let _ = Command::new("tmux")
+        .args(["set-option", "-t", name, "assume-paste-time", "0"])
         .output();
 }
 

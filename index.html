@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vaelkor</title>
+    <title>Alor</title>
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
@@ -11,8 +11,9 @@
 
       <!-- ── Header ───────────────────────────────────────────────────── -->
       <header id="header">
-        <span class="logo">VAELKOR</span>
+        <span class="logo">ALOR</span>
         <span class="session-meta" id="session-meta">—</span>
+        <button id="btn-kill-all" class="btn-header-danger" title="Kill all background sessions">Kill All Sessions</button>
       </header>
 
       <!-- ── Sidebar: agents + tasks ─────────────────────────────────── -->
@@ -26,10 +27,9 @@
           <p class="agent-empty">No agents registered.</p>
         </div>
         <form id="register-form" class="hidden" autocomplete="off">
-          <input id="reg-id"      type="text" placeholder="Agent ID"       required />
-          <input id="reg-name"    type="text" placeholder="Display name"   required />
-          <input id="reg-tmux"    type="text" placeholder="tmux session (optional)" />
-          <button type="submit">Register</button>
+          <input id="reg-id"      type="text" placeholder="Agent (claude, gemini...)" required />
+          <input id="reg-name"    type="text" placeholder="Role (impl, review...)"   required />
+          <button type="submit">Spawn Session</button>
         </form>
 
         <!-- Tasks section -->
@@ -54,7 +54,7 @@
         </div>
       </aside>
 
-      <!-- ── Terminal: single xterm.js showing vaelkor-main ──────────── -->
+      <!-- ── Terminal: single xterm.js showing alor-main ──────────── -->
       <section id="terminal-panel">
         <div id="terminal-container">
           <!-- single xterm.js instance -->
@@ -84,6 +84,28 @@
         <div class="modal-actions">
           <button type="button" class="btn-cancel-modal" id="btn-close-modal">Cancel</button>
           <button type="button" class="btn-submit"       id="btn-submit-task">Create</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Proposal Review modal ────────────────────────────────────── -->
+    <div id="proposal-overlay" class="modal-overlay" role="dialog" aria-modal="true">
+      <div id="proposal-modal">
+        <h2 id="proposal-title">Review Proposal</h2>
+        
+        <div class="proposal-section">
+          <h3>Logic Brief</h3>
+          <div id="proposal-brief" class="code-font"></div>
+        </div>
+
+        <div class="proposal-section">
+          <h3>Proposed Diff</h3>
+          <pre id="proposal-diff" class="code-font"></pre>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn-cancel-modal" id="btn-close-proposal">Close</button>
+          <button type="button" class="btn-submit"       id="btn-approve-task">Approve & Apply</button>
         </div>
       </div>
     </div>

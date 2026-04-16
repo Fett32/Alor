@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Vaelkor",
+  "productName": "Alor",
   "version": "0.1.0",
-  "identifier": "dev.vaelkor.app",
+  "identifier": "dev.alor.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Vaelkor",
+        "title": "Alor",
         "width": 1280,
         "height": 800,
         "minWidth": 800,

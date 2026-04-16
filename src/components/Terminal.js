@@ -1,8 +1,8 @@
 /**
- * Terminal — single xterm.js instance with PTY relay to vaelkor-main.
+ * Terminal — single xterm.js instance with PTY relay to alor-main.
  *
  * Architecture:
- *   The Rust backend spawns `tmux attach -t vaelkor-main` inside a real PTY.
+ *   The Rust backend spawns `tmux attach -t alor-main` inside a real PTY.
  *   PTY output streams to xterm.js as incremental data (no polling, no
  *   clear+rewrite). User input goes back through the PTY to tmux.
  *   tmux handles tiling and input routing to the active pane.
@@ -65,7 +65,7 @@ function createTerminal() {
   if (!XTerm) {
     $container.innerHTML =
       `<div id="terminal-fallback">` +
-      `<span style="color:#7c6ff7">Vaelkor</span> — xterm.js not installed.\n` +
+      `<span style="color:#7c6ff7">Alor</span> — xterm.js not installed.\n` +
       `<span style="color:#55556a">Run: npm install @xterm/xterm @xterm/addon-fit</span>` +
       `</div>`;
     return;
@@ -109,6 +109,25 @@ function createTerminal() {
     if (fitAddon) fitAddon.fit();
     reportSize();
   }
+
+  // -----------------------------------------------------------------------
+  // Suppress PTY resizes while the mouse is held down.
+  // Dragging tmux pane borders triggers ResizeObserver → PTY resize → tmux
+  // redraw, which kills the drag. Instead: do nothing until mouseup, then
+  // fit once. Listeners are on window (bubble phase) so they don't
+  // interfere with xterm.js mouse event forwarding to tmux.
+  // -----------------------------------------------------------------------
+  let mouseHeld = false;
+  let resizePending = false;
+
+  window.addEventListener("mousedown", () => { mouseHeld = true; });
+  window.addEventListener("mouseup", () => {
+    mouseHeld = false;
+    if (resizePending) {
+      resizePending = false;
+      fitAndReport();
+    }
+  });
 
   term.open($container);
   // First layout pass: flex/grid may not have final sizes yet; fit twice on rAF.
@@ -168,12 +187,19 @@ function createTerminal() {
     });
   });
 
-  // Resize on container resize.
-  const ro = new ResizeObserver(() => fitAndReport());
+  // Resize on container resize — suppressed during mouse drag.
+  const ro = new ResizeObserver(() => {
+    if (mouseHeld) { resizePending = true; console.log("[Terminal] resize suppressed (mouse held)"); return; }
+    console.log("[Terminal] ResizeObserver → fitAndReport");
+    fitAndReport();
+  });
   ro.observe($container);
 
-  // Also report on xterm resize event.
-  term.onResize(() => reportSize());
+  // Also report on xterm resize event — same guard.
+  term.onResize(() => {
+    if (mouseHeld) { resizePending = true; return; }
+    reportSize();
+  });
 }
 
 // ---------------------------------------------------------------------------

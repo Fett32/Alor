@@ -1,10 +1,10 @@
 [package]
-name = "vaelkor-cli"
+name = "alor-cli"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "vaelkor-cli"
+name = "alor-cli"
 path = "src/main.rs"
 
 [dependencies]

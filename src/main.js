@@ -1,5 +1,5 @@
 /**
- * Vaelkor — frontend entry point.
+ * Alor — frontend entry point.
  *
  * Boot order:
  *   1. Load session metadata from Rust backend (header bar).
@@ -44,6 +44,22 @@ async function init() {
   initAgentPanel();
   initTaskList();
   await initTerminal();
+
+  // Kill all sessions button
+  const $btnKillAll = document.getElementById("btn-kill-all");
+  if ($btnKillAll) {
+    $btnKillAll.addEventListener("click", async () => {
+      if (confirm("Kill all background agent sessions and wrappers?")) {
+        try {
+          await invoke("kill_all_agents");
+          console.log("[main] kill_all_agents successful");
+        } catch (err) {
+          console.error("[main] kill_all_agents failed:", err);
+          alert(`Failed to kill sessions: ${err}`);
+        }
+      }
+    });
+  }
 }
 
 if (document.readyState === "loading") {

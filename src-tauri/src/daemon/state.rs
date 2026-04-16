@@ -37,6 +37,10 @@ pub enum TaskState {
     Recovering,
     /// Task was assigned but no acknowledgement received within the grace window.
     Stale,
+    /// Agent has proposed a plan or diff and is waiting for human approval.
+    Proposed,
+    /// Human has approved the proposal; agent is now applying the changes.
+    Staged,
 }
 
 impl TaskState {
@@ -65,11 +69,18 @@ impl TaskState {
                 | (Assigned, Rejected)
                 | (Assigned, Cancelled)
                 | (Assigned, Stale)
+                | (Accepted, Proposed)
                 | (Accepted, Completed)
                 | (Accepted, Blocked)
                 | (Accepted, Cancelled)
                 | (Accepted, Interrupted)
                 | (Accepted, TimedOut)
+                | (Proposed, Staged)
+                | (Proposed, Accepted)
+                | (Proposed, Cancelled)
+                | (Staged, Completed)
+                | (Staged, Blocked)
+                | (Staged, Cancelled)
                 | (Blocked, Accepted)
                 | (Blocked, Cancelled)
                 | (Blocked, TimedOut)
@@ -106,6 +117,12 @@ pub struct Task {
     pub user_intervened: bool,
     #[serde(default)]
     pub user_intervened_at: Option<DateTime<Utc>>,
+    /// Short logic brief for the proposed change (for HITL approval).
+    #[serde(default)]
+    pub proposal_brief: Option<String>,
+    /// Unified diff or JSON representation of proposed changes.
+    #[serde(default)]
+    pub proposal_diff: Option<String>,
 }
 
 impl Task {
@@ -123,6 +140,8 @@ impl Task {
             subtask_order: 0,
             user_intervened: false,
             user_intervened_at: None,
+            proposal_brief: None,
+            proposal_diff: None,
         }
     }
 
@@ -219,7 +238,7 @@ impl AppState {
     }
 
     /// Emit an event to the frontend (non-blocking, best-effort).
-    fn emit_event(&self, event: &str) {
+    pub fn emit_event(&self, event: &str) {
         let guard = self.app_handle.lock();
         if let Some(ref handle) = *guard {
             use tauri::Emitter;
@@ -230,7 +249,7 @@ impl AppState {
     }
 
     /// Emit an event with a serializable payload.
-    fn emit_event_with<S: serde::Serialize + Clone>(&self, event: &str, payload: S) {
+    pub fn emit_event_with<S: serde::Serialize + Clone>(&self, event: &str, payload: S) {
         let guard = self.app_handle.lock();
         if let Some(ref handle) = *guard {
             use tauri::Emitter;
@@ -283,7 +302,7 @@ impl AppState {
     /// Persist current state to disk. Called automatically after mutations.
     /// Clones data under the lock, then writes outside the lock using
     /// atomic rename to prevent corruption.
-    fn save(&self) {
+    pub fn save(&self) {
         if let Some(path) = self.save_path.as_ref() {
             // Clone data under lock, then release immediately.
             let json = {
@@ -342,6 +361,30 @@ impl AppState {
         if is_completing {
             self.emit_event_with("task-completed", result.title.clone());
         }
+        Ok(result)
+    }
+
+    /// Transition a task to PROPOSED state with a brief and/or diff.
+    pub fn propose_task(
+        &self,
+        id: Uuid,
+        brief: Option<String>,
+        diff: Option<String>,
+    ) -> anyhow::Result<Task> {
+        let mut s = self.inner.lock();
+        let task = s
+            .tasks
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("task {} not found", id))?;
+
+        task.transition(TaskState::Proposed)?;
+        task.proposal_brief = brief;
+        task.proposal_diff = diff;
+
+        let result = task.clone();
+        drop(s);
+        self.save();
+        self.emit_event("tasks-changed");
         Ok(result)
     }
 
@@ -422,21 +465,41 @@ impl AppState {
             .collect()
     }
 
+    pub fn get_agent(&self, id: &str) -> Option<Agent> {
+        self.inner.lock().agents.get(id).cloned()
+    }
+
+    pub fn clear_all_agents(&self) {
+        let mut s = self.inner.lock();
+        for agent in s.agents.values_mut() {
+            agent.connected = false;
+        }
+        drop(s);
+        self.save();
+        self.emit_event("agents-changed");
+    }
+
     /// Update the connected status of an agent.
-    pub fn set_agent_connected(&self, id: &str, connected: bool) {
+    /// Returns Err if the agent is already connected (prevents collisions).
+    pub fn set_agent_connected(&self, id: &str, connected: bool) -> anyhow::Result<()> {
         let mut s = self.inner.lock();
         if let Some(agent) = s.agents.get_mut(id) {
+            if connected && agent.connected {
+                anyhow::bail!("agent {} already connected", id);
+            }
             agent.connected = connected;
             tracing::info!(agent_id = id, connected, "agent connection status updated");
         } else {
             // Auto-register agent on first connection
             let mut agent = Agent::new(id, id);
             agent.connected = connected;
+            agent.tmux_session = Some(format!("alor-{}", id));
             tracing::info!(agent_id = id, "agent auto-registered on connection");
             s.agents.insert(id.to_string(), agent);
         }
         drop(s);
         self.save();
         self.emit_event("agents-changed");
+        Ok(())
     }
 }

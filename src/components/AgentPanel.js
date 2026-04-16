@@ -58,29 +58,49 @@ let $panel;
  * Initialise the agent panel.  Must be called after the DOM is ready.
  */
 export function initAgentPanel() {
-  $panel          = document.getElementById("sidebar");
-  $list           = document.getElementById("agent-list");
-  $form           = document.getElementById("register-form");
-  $btnShowRegister = document.getElementById("btn-show-register");
-  $regId          = document.getElementById("reg-id");
-  $regName        = document.getElementById("reg-name");
-  $regTmux        = document.getElementById("reg-tmux");
+  try {
+    $panel          = document.getElementById("sidebar");
+    $list           = document.getElementById("agent-list");
+    $form           = document.getElementById("register-form");
+    $btnShowRegister = document.getElementById("btn-show-register");
+    $regId          = document.getElementById("reg-id");
+    $regName        = document.getElementById("reg-name");
 
-  $btnShowRegister.addEventListener("click", () => {
-    $form.classList.toggle("hidden");
-    if (!$form.classList.contains("hidden")) $regId.focus();
-  });
+    if (!$btnShowRegister) console.error("[AgentPanel] btn-show-register not found");
+    if (!$form) console.error("[AgentPanel] register-form not found");
 
-  $form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    await handleRegister();
-  });
+    $btnShowRegister.addEventListener("click", () => {
+      console.log("[AgentPanel] toggle spawn form clicked");
+      $form.classList.toggle("hidden");
+      if (!$form.classList.contains("hidden")) $regId.focus();
+    });
 
-  // Initial fetch + listen for push updates from backend.
-  fetchAgents();
-  listen("agents-changed", () => fetchAgents()).then((fn) => {
-    unlistenAgents = fn;
-  });
+    $form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const kind = $regId.value.trim();
+      const role = $regName.value.trim();
+      
+      console.log(`[AgentPanel] spawning ${kind} as ${role}`);
+      try {
+        await invoke("spawn_agent", { agent: kind, role: role });
+        $form.reset();
+        $form.classList.add("hidden");
+      } catch (err) {
+        console.error("[AgentPanel] spawn_agent failed:", err);
+        alert(`Failed to spawn agent: ${err}`);
+      }
+    });
+
+    // Initial fetch + listen for push updates from backend.
+    fetchAgents();
+    listen("agents-changed", () => fetchAgents()).then((fn) => {
+      unlistenAgents = fn;
+    });
+    listen("agent.connected", () => fetchAgents());
+    listen("agent.disconnected", () => fetchAgents());
+  } catch (err) {
+    console.error("[AgentPanel] init failed:", err);
+  }
 }
 
 /**
@@ -104,7 +124,9 @@ export function getAgents() {
 
 async function fetchAgents() {
   try {
-    agents = await invoke("get_agents");
+    const raw = await invoke("get_agents");
+    console.log("[AgentPanel] fetched agents:", raw);
+    agents = raw;
     renderList();
     syncModalAgentSelect();
   } catch (err) {
@@ -199,6 +221,43 @@ function buildAgentItem(agent) {
 
   info.append(nameEl, metaEl);
   item.append(dot, info);
+
+  // Add "Start Brain" CTA for disconnected orchestrator
+  if (agent.id === "orchestrator" && !agent.connected) {
+    const btnStart = document.createElement("button");
+    btnStart.className = "agent-start-cta";
+    btnStart.textContent = "Start Brain";
+    btnStart.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (btnStart.disabled) return;
+      btnStart.disabled = true;
+      btnStart.textContent = "Starting...";
+      console.log("[AgentPanel] starting orchestrator brain...");
+      invoke("spawn_agent", { agent: "orchestrator", role: "orchestrator" })
+        .catch(err => {
+          alert(`Failed to start orchestrator: ${err}`);
+          btnStart.disabled = false;
+          btnStart.textContent = "Start Brain";
+        });
+    });
+    item.appendChild(btnStart);
+  }
+
+  // Add "Kill" button for connected agents
+  if (agent.connected) {
+    const btnKill = document.createElement("button");
+    btnKill.className = "agent-kill-cta";
+    btnKill.textContent = "Kill";
+    btnKill.title = `Stop ${agent.id} session`;
+    btnKill.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (confirm(`Kill ${agent.id} session?`)) {
+        invoke("kill_agent", { id: agent.id })
+          .catch(err => alert(`Failed to kill agent: ${err}`));
+      }
+    });
+    item.appendChild(btnKill);
+  }
 
   item.addEventListener("click", () => selectAgent(agent.id));
 

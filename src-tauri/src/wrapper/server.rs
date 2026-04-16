@@ -1,6 +1,6 @@
 /// Socket server for wrapper connections.
 ///
-/// Listens on /tmp/vaelkor/daemon.sock and handles:
+/// Listens on /tmp/alor/daemon.sock and handles:
 /// - wrapper.register — wrapper announces its agent_id
 /// - task.accept/complete/blocked — task state updates
 /// - status.response — heartbeat replies
@@ -16,13 +16,13 @@ use crate::terminal::pane_manager::PaneManager;
 use crate::wrapper::protocol::{
     CliAssign, CliKill, CliProjectGet, CliProjectSave, CliSpawn, CliTaskCancel, CliTaskCreate,
     CliTaskComplete as CliTaskCompletePayload, CliTaskGet, Envelope, TaskAccept, TaskAssign,
-    TaskBlocked, TaskComplete, UserIntervention, WrapperError, WrapperRegister,
+    TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WrapperError, WrapperRegister,
     MSG_CLI_ASSIGN, MSG_CLI_ERROR, MSG_CLI_EVENT_STREAM, MSG_CLI_KILL, MSG_CLI_PROJECT_GET,
     MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE, MSG_CLI_RESPONSE, MSG_CLI_SPAWN, MSG_CLI_STATUS,
     MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE, MSG_CLI_TASK_CREATE, MSG_CLI_TASK_GET,
-    MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER,
+    MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER, MSG_CLI_INTEGRATIONS_GET,
     MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN, MSG_TASK_BLOCKED,
-    MSG_TASK_COMPLETE, MSG_USER_INTERVENTION,
+    MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -32,10 +32,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-pub const DAEMON_SOCKET: &str = "/tmp/vaelkor/daemon.sock";
+pub const DAEMON_SOCKET: &str = "/tmp/alor/daemon.sock";
 
 /// A connected wrapper's write half, keyed by agent_id.
 type WriterMap = Arc<Mutex<HashMap<String, tokio::net::unix::OwnedWriteHalf>>>;
@@ -175,25 +175,32 @@ impl SocketServer {
 
         info!(agent_id = %agent_id, "wrapper registered");
 
-        // Store the write half, replacing any existing connection
-        {
-            let mut writers = self.writers.lock().await;
-            if writers.contains_key(&agent_id) {
-                warn!(agent_id = %agent_id, "replacing existing wrapper connection");
-                writers.remove(&agent_id);
-                drop(writers);
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let mut writers = self.writers.lock().await;
-                writers.insert(agent_id.clone(), write_half);
-            } else {
-                writers.insert(agent_id.clone(), write_half);
-            }
+        // Update agent status in app state FIRST to check for collisions.
+        // This is the source of truth for "connected".
+        if let Err(e) = self.app_state.set_agent_connected(&agent_id, true) {
+            warn!(agent_id = %agent_id, "registration rejected: {e:#}");
+            let err_env = Envelope::new(
+                MSG_ERROR,
+                WrapperError { 
+                    agent_id: agent_id.clone(),
+                    message: format!("Collision: {e:#}") 
+                }
+            )?;
+            let mut line = serde_json::to_string(&err_env)?;
+            line.push('\n');
+            let mut writer = write_half;
+            writer.write_all(line.as_bytes()).await?;
+            writer.flush().await?;
+            return Ok(());
         }
 
-        // Update agent status in app state
-        self.app_state.set_agent_connected(&agent_id, true);
+        // Store the write half
+        {
+            let mut writers = self.writers.lock().await;
+            writers.insert(agent_id.clone(), write_half);
+        }
 
-        // Add agent pane to vaelkor-main
+        // Add agent pane to alor-main
         if let Err(e) = self.pane_manager.add_agent_pane(&agent_id).await {
             warn!(agent_id = %agent_id, "failed to add pane: {e:#}");
         }
@@ -230,7 +237,7 @@ impl SocketServer {
             let mut writers = self.writers.lock().await;
             writers.remove(&agent_id);
         }
-        self.app_state.set_agent_connected(&agent_id, false);
+        let _ = self.app_state.set_agent_connected(&agent_id, false);
 
         // Broadcast disconnection event
         self.broadcast_event(
@@ -259,6 +266,24 @@ impl SocketServer {
                 }
             }
 
+            MSG_TASK_PROPOSE => {
+                if let Ok(payload) = env.decode_payload::<TaskPropose>() {
+                    info!(agent_id, task_id = %payload.task_id, "task proposal received");
+                    if let Err(e) = self.app_state.propose_task(
+                        payload.task_id,
+                        payload.brief,
+                        payload.diff,
+                    ) {
+                        warn!("propose_task failed: {e}");
+                    }
+                    self.broadcast_event(
+                        "task.proposed",
+                        json!({"task_id": payload.task_id.to_string(), "agent_id": agent_id}),
+                    )
+                    .await;
+                }
+            }
+
             MSG_TASK_COMPLETE => {
                 if let Ok(payload) = env.decode_payload::<TaskComplete>() {
                     info!(agent_id, task_id = %payload.task_id, "task complete");
@@ -278,37 +303,47 @@ impl SocketServer {
                     // but only if the session appears idle (at a prompt).
                     let agent_id_owned = agent_id.to_string();
                     let notify_msg = format!(
-                        "[Vaelkor] Task completed by {}: \"{}\" ({})",
+                        "[Alor] Task completed by {}: \"{}\" ({})",
                         agent_id_owned, task_title, &payload.task_id.to_string()[..8]
                     );
                     tokio::spawn(async move {
                         // Check if orchestrator is at a prompt before injecting.
                         let capture = tokio::process::Command::new("tmux")
-                            .args(["capture-pane", "-p", "-t", "vaelkor-orchestrator", "-S", "-3"])
+                            .args(["capture-pane", "-p", "-t", "alor-orchestrator", "-S", "-3"])
                             .output()
                             .await;
                         let is_idle = match capture {
                             Ok(out) if out.status.success() => {
                                 let text = String::from_utf8_lossy(&out.stdout);
-                                let last_line = text.lines()
+                                // Scan the last few lines for any prompt character.
+                                // Gemini's TUI puts the prompt mid-screen with a
+                                // status bar below, so checking only the last line
+                                // misses it. Also handles Claude (❯), bash ($/%),
+                                // and generic (>) prompts.
+                                text.lines()
                                     .rev()
-                                    .find(|l| !l.trim().is_empty())
-                                    .unwrap_or("");
-                                // Claude Code shows ">" or "$" when idle at prompt.
-                                last_line.trim().ends_with('>')
-                                    || last_line.trim().ends_with('$')
-                                    || last_line.trim().ends_with('%')
+                                    .take(5)
+                                    .any(|line| {
+                                        let t = line.trim();
+                                        t == "❯" || t == "$" || t == "%" || t == ">"
+                                            || t.starts_with("> ")
+                                            || t.starts_with("❯ ")
+                                            || t.ends_with('❯')
+                                            || t.ends_with('>')
+                                            || t.ends_with('$')
+                                            || t.ends_with('%')
+                                    })
                             }
                             _ => false,
                         };
 
                         if is_idle {
                             let _ = tokio::process::Command::new("tmux")
-                                .args(["send-keys", "-t", "vaelkor-orchestrator", "-l", &notify_msg])
+                                .args(["send-keys", "-t", "alor-orchestrator", "-l", &notify_msg])
                                 .output()
                                 .await;
                             let _ = tokio::process::Command::new("tmux")
-                                .args(["send-keys", "-t", "vaelkor-orchestrator", "Enter"])
+                                .args(["send-keys", "-t", "alor-orchestrator", "Enter"])
                                 .output()
                                 .await;
                         } else {
@@ -352,7 +387,7 @@ impl SocketServer {
 
             MSG_STATUS_RESPONSE => {
                 // Could update heartbeat timestamp here
-                info!(agent_id, "status response received");
+                debug!(agent_id, "status response received");
             }
 
             MSG_ERROR => {
@@ -645,7 +680,7 @@ impl SocketServer {
                         };
 
                         // Also kill the tmux session
-                        let tmux_session = format!("vaelkor-{}", payload.instance);
+                        let tmux_session = format!("alor-{}", payload.instance);
                         let _ = std::process::Command::new("tmux")
                             .args(["kill-session", "-t", &tmux_session])
                             .output();
@@ -724,6 +759,12 @@ impl SocketServer {
                         if let Some(stack) = payload.stack {
                             profile.stack = stack;
                         }
+                        if let Some(kf) = payload.key_files {
+                            profile.key_files = kf;
+                        }
+                        if let Some(dp) = payload.doc_paths {
+                            profile.doc_paths = dp;
+                        }
                         match project::save_profile(&profile) {
                             Ok(_path) => {
                                 match Envelope::new(
@@ -749,8 +790,57 @@ impl SocketServer {
                 }
             }
 
+            MSG_CLI_INTEGRATIONS_GET => {
+                let config_dir = match crate::daemon::session::config_dir() {
+                    Ok(d) => d,
+                    Err(e) => return cli_error(correlation_id, &format!("config dir error: {e}")),
+                };
+                let path = config_dir.join("integrations.yaml");
+
+                let integrations = if path.exists() {
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => match serde_yaml::from_str::<serde_json::Value>(&content) {
+                            Ok(v) => v,
+                            Err(e) => json!({"error": format!("invalid yaml: {e}")}),
+                        },
+                        Err(e) => json!({"error": format!("read error: {e}")}),
+                    }
+                } else {
+                    json!({"sources": []})
+                };
+
+                match Envelope::new(MSG_CLI_RESPONSE, integrations) {
+                    Ok(mut e) => {
+                        e.correlation_id = correlation_id;
+                        e
+                    }
+                    Err(_) => cli_error(correlation_id, "failed to build response"),
+                }
+            }
+
             other => cli_error(correlation_id, &format!("unknown CLI command: {other}")),
         }
+    }
+
+    /// Generate a unique instance ID for an agent kind.
+    /// If `base` is not already taken, returns it as-is.
+    /// Otherwise appends `-2`, `-3`, etc. until a free ID is found.
+    fn unique_instance_id(&self, base: &str) -> String {
+        let agents = self.app_state.all_agents();
+        let taken: std::collections::HashSet<&str> =
+            agents.iter().map(|a| a.id.as_str()).collect();
+
+        if !taken.contains(base) {
+            return base.to_string();
+        }
+
+        for n in 2u32.. {
+            let candidate = format!("{base}-{n}");
+            if !taken.contains(candidate.as_str()) {
+                return candidate;
+            }
+        }
+        unreachable!()
     }
 
     /// Handle a cli.spawn request.
@@ -772,6 +862,12 @@ impl SocketServer {
             }
         };
 
+        // Determine instance ID: explicit --name, or auto-generate a unique one.
+        let instance_id = match payload.name {
+            Some(ref name) => name.clone(),
+            None => self.unique_instance_id(&payload.agent),
+        };
+
         // Find wrapper binary
         let wrapper_bin = match crate::daemon::config::find_wrapper_binary() {
             Ok(bin) => bin,
@@ -784,7 +880,7 @@ impl SocketServer {
         };
 
         let mut cmd = std::process::Command::new(&wrapper_bin);
-        cmd.arg(&payload.agent);
+        cmd.arg(&instance_id);
 
         if !config.command.is_empty() {
             cmd.arg("--command").arg(config.command.join(" "));
@@ -819,19 +915,19 @@ impl SocketServer {
         {
             Ok(child) => {
                 let pid = child.id();
-                info!(agent = %payload.agent, pid, "agent spawned via CLI");
+                info!(agent = %payload.agent, instance_id = %instance_id, pid, "agent spawned via CLI");
                 {
                     let mut spawned = self.spawned.lock().await;
-                    spawned.insert(payload.agent.clone(), child);
+                    spawned.insert(instance_id.clone(), child);
                 }
                 self.broadcast_event(
                     "agent.spawned",
-                    json!({"agent": &payload.agent, "pid": pid}),
+                    json!({"agent": &payload.agent, "instance_id": &instance_id, "pid": pid}),
                 )
                 .await;
                 match Envelope::new(
                     MSG_CLI_RESPONSE,
-                    json!({"spawned": &payload.agent, "pid": pid}),
+                    json!({"spawned": &instance_id, "pid": pid}),
                 ) {
                     Ok(mut e) => {
                         e.correlation_id = correlation_id;

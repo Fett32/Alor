@@ -1,4 +1,4 @@
-/// System tray integration for Vaelkor.
+/// System tray integration for Alor.
 ///
 /// Provides a tray icon with:
 ///   - Left-click to toggle window visibility
@@ -14,7 +14,7 @@ use tauri::{
 
 use crate::daemon::state::AppState;
 
-const TRAY_ID: &str = "vaelkor-tray";
+const TRAY_ID: &str = "alor-tray";
 
 /// Build and register the system tray. Call once during app setup.
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
@@ -22,7 +22,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(load_icon()?)
-        .tooltip("Vaelkor")
+        .tooltip("Alor")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
@@ -88,7 +88,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let status_item = MenuItem::new(app, &status_text, false, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let show_hide = MenuItem::with_id(app, "show_hide", "Show / Hide", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit Vaelkor", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Alor", true, None::<&str>)?;
 
     let separator2 = PredefinedMenuItem::separator(app)?;
 

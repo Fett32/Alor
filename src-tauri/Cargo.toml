@@ -1,16 +1,16 @@
 [package]
-name = "vaelkor"
+name = "alor"
 version = "0.1.0"
-description = "Vaelkor — multi-agent orchestrator backend"
+description = "Alor — multi-agent orchestrator backend"
 authors = ["Fett"]
 edition = "2021"
 
 [lib]
-name = "vaelkor_lib"
+name = "alor_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
-name = "vaelkor"
+name = "alor"
 path = "src/main.rs"
 
 [build-dependencies]

@@ -1,9 +1,9 @@
 /// Session persistence helpers.
 ///
-/// Vaelkor uses three directories:
-///   config  → ~/.config/vaelkor/
-///   data    → ~/.local/share/vaelkor/
-///   sockets → /tmp/vaelkor/
+/// Alor uses three directories:
+///   config  → ~/.config/alor/
+///   data    → ~/.local/share/alor/
+///   sockets → /tmp/alor/
 ///
 /// `ensure_dirs()` must be called at startup before any path is used.
 
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 // ---------------------------------------------------------------------------
 
 fn project_dirs() -> anyhow::Result<ProjectDirs> {
-    ProjectDirs::from("", "", "vaelkor")
+    ProjectDirs::from("", "", "alor")
         .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
 }
 
@@ -29,7 +29,7 @@ pub fn data_dir() -> anyhow::Result<PathBuf> {
 }
 
 pub fn socket_dir() -> PathBuf {
-    PathBuf::from("/tmp/vaelkor")
+    PathBuf::from("/tmp/alor")
 }
 
 // ---------------------------------------------------------------------------
@@ -103,9 +103,21 @@ pub fn wrapper_pids_file() -> anyhow::Result<PathBuf> {
 }
 
 /// Save wrapper PIDs to disk so we can kill exactly these on restart.
-pub fn save_wrapper_pids(pids: &[u32]) -> anyhow::Result<()> {
+/// Appends to the existing file if it exists.
+pub fn save_wrapper_pids(new_pids: &[u32]) -> anyhow::Result<()> {
     let path = wrapper_pids_file()?;
-    let json = serde_json::to_string(pids)?;
+    let mut pids = if path.exists() {
+        let json = std::fs::read_to_string(&path)?;
+        serde_json::from_str::<Vec<u32>>(&json).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    pids.extend_from_slice(new_pids);
+    pids.sort_unstable();
+    pids.dedup();
+
+    let json = serde_json::to_string(&pids)?;
     std::fs::write(&path, json)
         .with_context(|| format!("write wrapper pids {}", path.display()))?;
     Ok(())
@@ -126,11 +138,11 @@ pub fn kill_stale_wrappers() {
         Ok(json) => {
             if let Ok(pids) = serde_json::from_str::<Vec<u32>>(&json) {
                 for pid in &pids {
-                    // Only kill if the process is actually a vaelkor-wrapper.
+                    // Only kill if the process is actually a alor-wrapper.
                     // SIGTERM (15) gives it a chance to clean up.
                     let cmdline_path = format!("/proc/{pid}/cmdline");
                     if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
-                        if cmdline.contains("vaelkor-wrapper") {
+                        if cmdline.contains("alor-wrapper") {
                             tracing::info!(pid, "killing stale wrapper");
                             let _ = std::process::Command::new("kill")
                                 .args(["-TERM", &pid.to_string()])

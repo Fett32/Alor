@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Alor
+Comment=Multi-agent AI Orchestrator
+Exec=/home/fett/Projects/Alor/target/debug/alor
+Icon=/home/fett/Projects/Alor/src-tauri/icons/icon.png
+Terminal=false
+Type=Application
+Categories=Development;
+Keywords=AI;Agent;Orchestrator;Claude;
