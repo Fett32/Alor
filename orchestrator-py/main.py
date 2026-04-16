@@ -29,7 +29,7 @@ from claude_agent_sdk import (
 import daemon
 import tools
 
-DEFAULT_MODEL = os.environ.get("ALOR_ORCHESTRATOR_MODEL", "claude-opus-4-5")
+DEFAULT_MODEL = os.environ.get("ALOR_ORCHESTRATOR_MODEL", "claude-opus-4-7")
 PROMPT_PATH = Path(os.environ["HOME"]) / ".config" / "alor" / "orchestrator_prompt.md"
 
 # ANSI colors
@@ -170,6 +170,16 @@ async def main() -> int:
 
     try:
         async with ClaudeSDKClient(options=options) as client:
+            try:
+                await client.query(
+                    "Introduce yourself in one short line so Fett knows you're online and ready. "
+                    "Do not list your tools."
+                )
+                await process_response(client, totals, cost_accumulator)
+                print_footer(session_start, cost_accumulator[0], totals)
+            except Exception as e:
+                print(f"{C_RED}[greet error] {e}{C_RESET}")
+
             while True:
                 print(f"{C_CYAN}orch>{C_RESET} ", end="", flush=True)
                 line = await read_line()

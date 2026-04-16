@@ -45,10 +45,32 @@ pub struct AgentConfig {
     /// Startup file to inject into the agent session.
     #[serde(default)]
     pub startup_file: Option<String>,
+    /// Project this slot is bound to; null for generic/unscoped agents.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Task kinds this slot is good at (e.g. "implementation", "review").
+    /// Orchestrator uses this as a routing hint.
+    #[serde(default)]
+    pub use_for: Vec<String>,
+    /// Tier classification: heavy | mid | light.
+    #[serde(default = "default_tier")]
+    pub tier: String,
+    /// Max simultaneous non-terminal tasks before the daemon rejects new
+    /// assignments on this slot.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: u8,
 }
 
 fn default_role() -> String {
     "coder".to_string()
+}
+
+fn default_tier() -> String {
+    "mid".to_string()
+}
+
+fn default_max_concurrent() -> u8 {
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -129,9 +151,19 @@ pub fn register_agents_from_config(state: &AppState, configs: &[(String, AgentCo
 
         let mut agent = Agent::new(id.clone(), display_name);
         agent.tmux_session = Some(format!("alor-{id}"));
+        agent.project = cfg.project.clone();
+        agent.tier = cfg.tier.clone();
+        agent.max_concurrent = cfg.max_concurrent;
         state.register_agent(agent);
 
-        tracing::info!(agent_id = %id, role = %cfg.role, "agent registered from config");
+        tracing::info!(
+            agent_id = %id,
+            role = %cfg.role,
+            project = ?cfg.project,
+            tier = %cfg.tier,
+            max = cfg.max_concurrent,
+            "agent registered from config"
+        );
     }
 }
 

@@ -208,6 +208,20 @@ html, body {
   text-overflow: ellipsis;
 }
 
+.agent-project-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: rgba(127, 90, 240, 0.18);
+  color: var(--accent);
+  border-radius: 3px;
+  vertical-align: middle;
+}
+
 .agent-meta {
   font-size: 10px;
   color: var(--text-dim);

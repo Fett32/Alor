@@ -14,16 +14,17 @@ use crate::daemon::project;
 use crate::daemon::state::{AppState, Task, TaskState};
 use crate::terminal::pane_manager::PaneManager;
 use crate::wrapper::protocol::{
-    CliAgentSendMessage, CliAssign, CliKill, CliMemoryGet, CliProjectGet, CliProjectSave,
-    CliSpawn, CliTaskCancel, CliTaskCreate,
+    CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliKill, CliMemoryGet, CliProjectGet,
+    CliProjectSave, CliSpawn, CliTaskCancel, CliTaskCreate,
     CliTaskComplete as CliTaskCompletePayload, CliTaskGet, Envelope, TaskAccept, TaskAssign,
     TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WrapperError, WrapperRegister,
-    MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_ERROR, MSG_CLI_EVENT_STREAM, MSG_CLI_KILL,
-    MSG_CLI_MEMORY_GET, MSG_CLI_PROJECT_GET, MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE,
-    MSG_CLI_RESPONSE, MSG_CLI_SPAWN, MSG_CLI_STATUS, MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE,
-    MSG_CLI_TASK_CREATE, MSG_CLI_TASK_GET, MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER,
-    MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
-    MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
+    MSG_CLI_AGENT_ENSURE_RUNNING, MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_ERROR,
+    MSG_CLI_EVENT_STREAM, MSG_CLI_KILL, MSG_CLI_MEMORY_GET, MSG_CLI_PROJECT_GET,
+    MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE, MSG_CLI_RESPONSE, MSG_CLI_SPAWN, MSG_CLI_STATUS,
+    MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE, MSG_CLI_TASK_CREATE, MSG_CLI_TASK_GET,
+    MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER, MSG_CLI_INTEGRATIONS_GET,
+    MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN, MSG_TASK_BLOCKED, MSG_TASK_COMPLETE,
+    MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -573,7 +574,27 @@ impl SocketServer {
             MSG_CLI_ASSIGN => {
                 match env.decode_payload::<CliAssign>() {
                     Ok(payload) => {
-                        // Look up task first (no lock contention).
+                        // Enforce max_concurrent BEFORE doing any work. Counts
+                        // non-terminal, non-pending tasks already assigned to
+                        // this agent. If over capacity, reject cleanly so the
+                        // caller can queue or spawn a sibling slot.
+                        let active = self.app_state.agent_active_task_count(&payload.agent_id);
+                        let max = self
+                            .app_state
+                            .get_agent(&payload.agent_id)
+                            .map(|a| a.max_concurrent as usize)
+                            .unwrap_or(1);
+                        if active >= max {
+                            return cli_error(
+                                correlation_id,
+                                &format!(
+                                    "agent {} at capacity ({}/{}); spawn a sibling slot or wait",
+                                    payload.agent_id, active, max
+                                ),
+                            );
+                        }
+
+                        // Look up task (no lock contention).
                         let task = match self.app_state.get_task(payload.task_id) {
                             Some(t) => t,
                             None => {
@@ -857,6 +878,89 @@ impl SocketServer {
                 }
             }
 
+            MSG_CLI_AGENT_ENSURE_RUNNING => {
+                match env.decode_payload::<CliAgentEnsureRunning>() {
+                    Ok(payload) => {
+                        if payload.agent_id.is_empty()
+                            || payload.agent_id.len() > 64
+                            || !payload
+                                .agent_id
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                        {
+                            return cli_error(
+                                correlation_id,
+                                &format!("invalid agent_id: {:?}", payload.agent_id),
+                            );
+                        }
+
+                        // Already connected? No-op.
+                        if self.writers.lock().await.contains_key(&payload.agent_id) {
+                            match Envelope::new(
+                                MSG_CLI_RESPONSE,
+                                json!({
+                                    "agent_id": &payload.agent_id,
+                                    "spawned": false,
+                                    "reason": "already connected",
+                                }),
+                            ) {
+                                Ok(mut e) => {
+                                    e.correlation_id = correlation_id;
+                                    return e;
+                                }
+                                Err(_) => {
+                                    return cli_error(correlation_id, "failed to build response")
+                                }
+                            }
+                        }
+
+                        // Only yaml-declared slots are idempotently spawnable.
+                        let has_config = self
+                            .agent_configs
+                            .iter()
+                            .any(|(id, _)| id == &payload.agent_id);
+                        if !has_config {
+                            return cli_error(
+                                correlation_id,
+                                &format!(
+                                    "no yaml config for agent '{}'; use agent_spawn with an explicit base instead",
+                                    payload.agent_id
+                                ),
+                            );
+                        }
+
+                        // Delegate to the existing spawn path. name = agent_id so
+                        // we get the yaml-declared slot, not an auto-numbered dup.
+                        let spawn_payload = CliSpawn {
+                            name: Some(payload.agent_id.clone()),
+                            agent: payload.agent_id.clone(),
+                            role: None,
+                        };
+                        let resp = self.handle_spawn(correlation_id, spawn_payload).await;
+                        // Re-label the success envelope to expose `spawned: true`.
+                        if resp.kind == MSG_CLI_RESPONSE {
+                            match Envelope::new(
+                                MSG_CLI_RESPONSE,
+                                json!({
+                                    "agent_id": &payload.agent_id,
+                                    "spawned": true,
+                                }),
+                            ) {
+                                Ok(mut e) => {
+                                    e.correlation_id = correlation_id;
+                                    return e;
+                                }
+                                Err(_) => {
+                                    return cli_error(correlation_id, "failed to build response")
+                                }
+                            }
+                        }
+                        resp
+                    }
+                    Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),
+                }
+            }
+
             MSG_CLI_AGENT_SEND_MESSAGE => {
                 match env.decode_payload::<CliAgentSendMessage>() {
                     Ok(payload) => {
@@ -1087,6 +1191,34 @@ impl SocketServer {
             Some(ref name) => name.clone(),
             None => self.unique_instance_id(&payload.agent),
         };
+
+        // Register the instance in state with the base config's metadata.
+        // If yaml-declared (instance_id == payload.agent or already registered),
+        // update in place so project/tier/max_concurrent stay in sync with the
+        // current yaml.
+        {
+            let existing = self.app_state.get_agent(&instance_id);
+            if existing.is_none() {
+                let display_name = config
+                    .identity
+                    .as_ref()
+                    .map(|id| format!("{} {}", id, instance_id))
+                    .unwrap_or_else(|| instance_id.clone());
+                let mut agent = crate::daemon::state::Agent::new(&instance_id, &display_name);
+                agent.tmux_session = Some(format!("alor-{instance_id}"));
+                agent.project = config.project.clone();
+                agent.tier = config.tier.clone();
+                agent.max_concurrent = config.max_concurrent;
+                self.app_state.register_agent(agent);
+            } else {
+                self.app_state.set_agent_metadata(
+                    &instance_id,
+                    config.project.clone(),
+                    Some(config.tier.clone()),
+                    Some(config.max_concurrent),
+                );
+            }
+        }
 
         // Find wrapper binary
         let wrapper_bin = match crate::daemon::config::find_wrapper_binary() {

@@ -112,6 +112,25 @@ async def memory_get(project: str) -> dict[str, Any]:
     return await _one_shot("cli.memory.get", {"project": project})
 
 
+async def agent_spawn(
+    agent: str, name: str | None = None, role: str | None = None
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"agent": agent}
+    if name:
+        payload["name"] = name
+    if role:
+        payload["role"] = role
+    return await _one_shot("cli.spawn", payload)
+
+
+async def agent_kill(instance: str) -> dict[str, Any]:
+    return await _one_shot("cli.kill", {"instance": instance})
+
+
+async def agent_ensure_running(agent_id: str) -> dict[str, Any]:
+    return await _one_shot("cli.agent.ensure_running", {"agent_id": agent_id})
+
+
 # ---- Event stream ----
 
 @dataclass

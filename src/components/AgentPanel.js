@@ -213,9 +213,21 @@ function buildAgentItem(agent) {
   nameEl.className = "agent-name";
   nameEl.textContent = agent.name;
 
+  if (agent.project) {
+    const projectTag = document.createElement("span");
+    projectTag.className = "agent-project-tag";
+    projectTag.textContent = agent.project;
+    projectTag.title = `Slot bound to project: ${agent.project}`;
+    nameEl.appendChild(projectTag);
+  }
+
   const metaEl = document.createElement("div");
   metaEl.className = "agent-meta";
   const parts = [agent.id];
+  if (agent.tier && agent.tier !== "mid") parts.push(agent.tier);
+  if (typeof agent.max_concurrent === "number" && agent.max_concurrent > 1) {
+    parts.push(`x${agent.max_concurrent}`);
+  }
   if (agent.tmux_session) parts.push(agent.tmux_session);
   metaEl.textContent = parts.join(" · ");
 

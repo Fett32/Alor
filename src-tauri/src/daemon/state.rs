@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use parking_lot::Mutex;
 use tauri::AppHandle;
@@ -188,7 +188,29 @@ pub struct Agent {
     pub socket_path: Option<String>,
     pub connected: bool,
     pub registered_at: DateTime<Utc>,
+    /// Project this slot is bound to (null for generic/unscoped).
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Tier classification: heavy | mid | light.
+    #[serde(default = "default_tier")]
+    pub tier: String,
+    /// Max simultaneous non-terminal tasks before the daemon rejects new assignments.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: u8,
+    /// Bounded deque of recent task ids this agent handled (most recent first).
+    #[serde(default)]
+    pub task_history: VecDeque<Uuid>,
 }
+
+fn default_tier() -> String {
+    "mid".to_string()
+}
+
+fn default_max_concurrent() -> u8 {
+    1
+}
+
+const AGENT_TASK_HISTORY_MAX: usize = 20;
 
 impl Agent {
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
@@ -199,6 +221,20 @@ impl Agent {
             socket_path: None,
             connected: false,
             registered_at: Utc::now(),
+            project: None,
+            tier: default_tier(),
+            max_concurrent: default_max_concurrent(),
+            task_history: VecDeque::new(),
+        }
+    }
+
+    /// Push a task_id onto the front of the history deque and trim to the
+    /// bounded maximum.
+    pub fn push_task_history(&mut self, task_id: Uuid) {
+        self.task_history.retain(|&existing| existing != task_id);
+        self.task_history.push_front(task_id);
+        while self.task_history.len() > AGENT_TASK_HISTORY_MAX {
+            self.task_history.pop_back();
         }
     }
 }
@@ -409,6 +445,7 @@ impl AppState {
     }
 
     /// Assign a task to an agent (sets `assigned_to` and transitions to Assigned).
+    /// Also records the task in the agent's task_history.
     pub fn assign_task_to_agent(
         &self,
         task_id: Uuid,
@@ -433,10 +470,58 @@ impl AppState {
         task.assigned_to = Some(agent_id.to_string());
         task.updated_at = Utc::now();
         let result = task.clone();
+
+        // Record on the agent's history (same lock for atomicity).
+        if let Some(agent) = s.agents.get_mut(agent_id) {
+            agent.push_task_history(task_id);
+        }
+
         drop(s);
         self.save();
         self.emit_event("tasks-changed");
+        self.emit_event("agents-changed");
         Ok(result)
+    }
+
+    /// Count non-terminal, non-pending tasks assigned to an agent.
+    /// Used to enforce `max_concurrent` before dispatching.
+    pub fn agent_active_task_count(&self, agent_id: &str) -> usize {
+        self.inner
+            .lock()
+            .tasks
+            .values()
+            .filter(|t| {
+                t.assigned_to.as_deref() == Some(agent_id)
+                    && !t.state.is_terminal()
+                    && t.state != TaskState::Pending
+            })
+            .count()
+    }
+
+    /// Update metadata fields on an existing agent (project, tier, max_concurrent).
+    /// Used to propagate AgentConfig values to spawned instances.
+    pub fn set_agent_metadata(
+        &self,
+        agent_id: &str,
+        project: Option<String>,
+        tier: Option<String>,
+        max_concurrent: Option<u8>,
+    ) {
+        let mut s = self.inner.lock();
+        if let Some(agent) = s.agents.get_mut(agent_id) {
+            if let Some(p) = project {
+                agent.project = Some(p);
+            }
+            if let Some(t) = tier {
+                agent.tier = t;
+            }
+            if let Some(m) = max_concurrent {
+                agent.max_concurrent = m;
+            }
+        }
+        drop(s);
+        self.save();
+        self.emit_event("agents-changed");
     }
 
     /// Mark any Running/Accepted task assigned to `agent_id` as user-intervened.

@@ -41,6 +41,7 @@ pub const MSG_CLI_PROJECT_GET: &str = "cli.project.get";
 pub const MSG_CLI_PROJECT_SAVE: &str = "cli.project.save";
 pub const MSG_CLI_INTEGRATIONS_GET: &str = "cli.integrations.get";
 pub const MSG_CLI_AGENT_SEND_MESSAGE: &str = "cli.agent.send_message";
+pub const MSG_CLI_AGENT_ENSURE_RUNNING: &str = "cli.agent.ensure_running";
 pub const MSG_CLI_MEMORY_GET: &str = "cli.memory.get";
 pub const MSG_CLI_RESPONSE: &str = "cli.response";
 pub const MSG_CLI_ERROR: &str = "cli.error";
@@ -240,6 +241,12 @@ pub struct CliAgentSendMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliMemoryGet {
     pub project: String,
+}
+
+/// Idempotent spawn — if the agent is already running, this is a no-op.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliAgentEnsureRunning {
+    pub agent_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

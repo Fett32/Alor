@@ -97,13 +97,64 @@ async def task_cancel(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "agent_list",
-    "List worker agents (id, name, connected, tmux_session) and current "
-    "tasks. Call before task_assign if unsure who's online.",
+    "List worker agents with full state (id, name, connected, project, tier, "
+    "max_concurrent, tmux_session, task_history) plus all tasks. Call before "
+    "task_assign or agent_ensure_running so you know who's online and what "
+    "each slot is scoped to.",
     {},
 )
 async def agent_list(args: dict[str, Any]) -> dict[str, Any]:
     try:
         return _ok(await daemon.status())
+    except Exception as e:
+        return _err(str(e))
+
+
+@tool(
+    "agent_ensure_running",
+    "Idempotently bring a yaml-declared agent slot online. If already "
+    "connected, no-op. Prefer this over agent_spawn when you just need a "
+    "known slot (e.g. 'claude-alor') available.",
+    {"agent_id": str},
+)
+async def agent_ensure_running(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _ok(await daemon.agent_ensure_running(args["agent_id"]))
+    except Exception as e:
+        return _err(str(e))
+
+
+@tool(
+    "agent_spawn",
+    "Spawn a new agent instance from a base config. Use `agent` = base "
+    "config name (e.g. 'claude-alor'), `name` = unique instance id (e.g. "
+    "'claude-alor-2') when you need a sibling slot for parallel work. "
+    "Fails if the instance name is already registered and running.",
+    {"agent": str, "name": str, "role": str},
+)
+async def agent_spawn(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _ok(
+            await daemon.agent_spawn(
+                agent=args["agent"],
+                name=args.get("name") or None,
+                role=args.get("role") or None,
+            )
+        )
+    except Exception as e:
+        return _err(str(e))
+
+
+@tool(
+    "agent_kill",
+    "Stop a running agent instance by its id. Use when a slot has stale "
+    "context you'd rather not reuse and you've confirmed with Fett that "
+    "killing it is fine, OR when a slot is definitely finished.",
+    {"instance": str},
+)
+async def agent_kill(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _ok(await daemon.agent_kill(args["instance"]))
     except Exception as e:
         return _err(str(e))
 
@@ -172,6 +223,9 @@ ALL_TOOLS = [
     task_list,
     task_cancel,
     agent_list,
+    agent_ensure_running,
+    agent_spawn,
+    agent_kill,
     agent_send_message,
     project_get,
     project_list,
