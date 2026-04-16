@@ -76,10 +76,14 @@ async def run_task(
 
     prompt = f"{title}\n\n{description}" if title else description
 
-    collected: list[str] = []
+    # Keep only the last text block from the last assistant message as the
+    # post-task summary.  Intermediate thinking-out-loud text (e.g. "let me
+    # check X…", "reading Y…") is still printed to the pane, but what the
+    # orch sees is just the final wrap-up.
+    latest: dict[str, str] = {"text": ""}
 
     def capture(text: str) -> None:
-        collected.append(text)
+        latest["text"] = text
         print(text)
 
     try:
@@ -97,7 +101,7 @@ async def run_task(
 
     print_footer(session_start, cost[0], totals)
 
-    summary = "\n".join(s.strip() for s in collected if s.strip()) or None
+    summary = latest["text"].strip() or None
     # Cap summary client-side too so we don't blow through the daemon's
     # 1 MiB hard cap and get silently truncated; 64 KiB is plenty for a
     # post-task report.

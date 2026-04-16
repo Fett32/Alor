@@ -102,6 +102,35 @@ impl SocketServer {
 
         info!(path = DAEMON_SOCKET, "socket server listening");
 
+        // Periodically reap exited children so `spawned` doesn't grow
+        // forever.  Wrappers/workers that exit on their own (crash, /quit,
+        // normal shutdown) aren't removed through the kill/delete path, and
+        // without try_wait the kernel keeps zombie entries and we keep a
+        // stale Child handle indefinitely.
+        {
+            let reaper = self.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.tick().await; // skip the immediate first tick
+                loop {
+                    interval.tick().await;
+                    let mut spawned = reaper.spawned.lock().await;
+                    spawned.retain(|id, child| match child.try_wait() {
+                        Ok(Some(status)) => {
+                            info!(instance = %id, exit = ?status, "reaped exited child");
+                            false
+                        }
+                        Ok(None) => true,
+                        Err(e) => {
+                            warn!(instance = %id, error = %e, "try_wait failed");
+                            true
+                        }
+                    });
+                }
+            });
+        }
+
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
