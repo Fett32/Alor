@@ -27,7 +27,9 @@ use crate::wrapper::protocol::{
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -40,7 +42,7 @@ pub const DAEMON_SOCKET: &str = "/tmp/alor/daemon.sock";
 /// A connected wrapper's write half, keyed by agent_id.
 type WriterMap = Arc<Mutex<HashMap<String, tokio::net::unix::OwnedWriteHalf>>>;
 type ChildMap = Arc<Mutex<HashMap<String, std::process::Child>>>;
-type EventSubscribers = Arc<Mutex<Vec<tokio::net::unix::OwnedWriteHalf>>>;
+type EventSubscribers = Arc<Mutex<HashMap<u64, tokio::net::unix::OwnedWriteHalf>>>;
 
 /// Shared state for the socket server.
 #[derive(Clone)]
@@ -51,6 +53,7 @@ pub struct SocketServer {
     agent_configs: Arc<Vec<(String, AgentConfig)>>,
     spawned: ChildMap,
     event_subscribers: EventSubscribers,
+    next_sub_id: Arc<AtomicU64>,
 }
 
 impl SocketServer {
@@ -65,7 +68,8 @@ impl SocketServer {
             pane_manager,
             agent_configs: Arc::new(configs),
             spawned: Arc::new(Mutex::new(HashMap::new())),
-            event_subscribers: Arc::new(Mutex::new(Vec::new())),
+            event_subscribers: Arc::new(Mutex::new(HashMap::new())),
+            next_sub_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -84,6 +88,12 @@ impl SocketServer {
 
         let listener = UnixListener::bind(sock_path)
             .context("bind daemon socket")?;
+
+        // Restrict socket to owner only (0600) so unprivileged users can't
+        // connect and issue CLI commands.
+        std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600))
+            .context("set daemon socket permissions")?;
+
         info!(path = DAEMON_SOCKET, "socket server listening");
 
         loop {
@@ -122,11 +132,12 @@ impl SocketServer {
         if env.kind.starts_with("cli.") {
             if env.kind == MSG_CLI_EVENT_STREAM {
                 // Event stream subscriber: hold connection open
+                let sub_id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
                 {
                     let mut subs = self.event_subscribers.lock().await;
-                    subs.push(write_half);
+                    subs.insert(sub_id, write_half);
                 }
-                info!("cli event stream subscriber connected");
+                info!(sub_id, "cli event stream subscriber connected");
 
                 // Keep reading until disconnect
                 loop {
@@ -137,10 +148,13 @@ impl SocketServer {
                     }
                 }
 
-                // Remove from subscribers (find by checking write errors later,
-                // but we can't easily identify which one we are — the broadcast
-                // cleanup will handle dead writers)
-                info!("cli event stream subscriber disconnected");
+                // Explicitly remove on disconnect so dead subscribers don't
+                // accumulate in the map.
+                {
+                    let mut subs = self.event_subscribers.lock().await;
+                    subs.remove(&sub_id);
+                }
+                info!(sub_id, "cli event stream subscriber disconnected");
                 return Ok(());
             }
 
@@ -965,14 +979,13 @@ impl SocketServer {
 
         let mut subs = self.event_subscribers.lock().await;
         let mut dead = Vec::new();
-        for (i, writer) in subs.iter_mut().enumerate() {
-            if writer.write_all(bytes).await.is_err() {
-                dead.push(i);
+        for (id, writer) in subs.iter_mut() {
+            if writer.write_all(bytes).await.is_err() || writer.flush().await.is_err() {
+                dead.push(*id);
             }
         }
-        // Remove dead subscribers in reverse order
-        for i in dead.into_iter().rev() {
-            subs.swap_remove(i);
+        for id in dead {
+            subs.remove(&id);
         }
     }
 

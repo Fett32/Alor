@@ -81,6 +81,7 @@ impl TaskState {
                 | (Staged, Completed)
                 | (Staged, Blocked)
                 | (Staged, Cancelled)
+                | (Staged, Interrupted)
                 | (Blocked, Accepted)
                 | (Blocked, Cancelled)
                 | (Blocked, TimedOut)

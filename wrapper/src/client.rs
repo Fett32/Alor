@@ -31,6 +31,10 @@ impl DaemonClient {
             .write_all(line.as_bytes())
             .await
             .context("write to daemon socket")?;
+        self.writer
+            .flush()
+            .await
+            .context("flush daemon socket")?;
         Ok(())
     }
 
