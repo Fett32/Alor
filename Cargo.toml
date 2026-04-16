@@ -3,6 +3,5 @@ members = [
     "src-tauri",
     "wrapper",
     "cli",
-    "orchestrator",
 ]
 resolver = "2"
