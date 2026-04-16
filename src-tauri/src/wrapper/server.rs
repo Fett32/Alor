@@ -306,12 +306,19 @@ impl SocketServer {
                     let task_title = self.app_state.get_task(payload.task_id)
                         .map(|t| t.title.clone())
                         .unwrap_or_default();
+                    if let Some(ref s) = payload.summary {
+                        self.app_state.set_task_summary(payload.task_id, s.clone());
+                    }
                     if let Err(e) = self.app_state.transition_task(payload.task_id, TaskState::Completed) {
                         warn!("transition to Completed failed: {e}");
                     }
                     self.broadcast_event(
                         "task.completed",
-                        json!({"task_id": payload.task_id.to_string(), "agent_id": agent_id}),
+                        json!({
+                            "task_id": payload.task_id.to_string(),
+                            "agent_id": agent_id,
+                            "summary": payload.summary,
+                        }),
                     )
                     .await;
 
@@ -1220,45 +1227,75 @@ impl SocketServer {
             }
         }
 
-        // Find wrapper binary
-        let wrapper_bin = match crate::daemon::config::find_wrapper_binary() {
-            Ok(bin) => bin,
-            Err(e) => {
+        // Resolve workdir once; both runtime branches use it.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let expanded_workdir: Option<std::path::PathBuf> =
+            config.working_dir.as_ref().map(|wd| {
+                if wd.starts_with('~') {
+                    std::path::PathBuf::from(&home)
+                        .join(wd.strip_prefix("~/").unwrap_or(&wd[1..]))
+                } else {
+                    std::path::PathBuf::from(wd)
+                }
+            });
+
+        let mut cmd = if config.runtime == "claude-sdk" {
+            // SDK worker path: run-worker.sh inside a tmux session.
+            // The worker talks wrapper protocol directly to the daemon and
+            // hosts its own ClaudeSDKClient. No alor-wrapper in the loop.
+            if config.command.is_empty() {
                 return cli_error(
                     correlation_id,
-                    &format!("wrapper binary not found: {e}"),
-                )
+                    "claude-sdk runtime requires `command:` in yaml to point at run-worker.sh",
+                );
             }
+            let session_name = format!("alor-{instance_id}");
+            let mut c = std::process::Command::new("tmux");
+            c.args(["new-session", "-d", "-s", &session_name]);
+            if let Some(ref wd) = expanded_workdir {
+                c.arg("-c").arg(wd);
+            }
+            // Everything after `--` is the command line tmux runs inside.
+            c.arg("--");
+            c.arg(&config.command[0]);
+            c.arg(&instance_id);
+            if let Some(ref wd) = expanded_workdir {
+                c.arg("--workdir").arg(wd);
+            }
+            if let Some(ref proj) = config.project {
+                c.arg("--project").arg(proj);
+            }
+            c
+        } else {
+            // Classic wrapper path.
+            let wrapper_bin = match crate::daemon::config::find_wrapper_binary() {
+                Ok(bin) => bin,
+                Err(e) => {
+                    return cli_error(
+                        correlation_id,
+                        &format!("wrapper binary not found: {e}"),
+                    )
+                }
+            };
+            let mut c = std::process::Command::new(&wrapper_bin);
+            c.arg(&instance_id);
+            if !config.command.is_empty() {
+                c.arg("--command").arg(config.command.join(" "));
+            }
+            if let Some(ref wd) = expanded_workdir {
+                c.arg("--workdir").arg(wd);
+            }
+            if let Some(ref sf) = config.startup_file {
+                let expanded = if sf.starts_with('~') {
+                    std::path::PathBuf::from(&home)
+                        .join(sf.strip_prefix("~/").unwrap_or(&sf[1..]))
+                } else {
+                    std::path::PathBuf::from(sf)
+                };
+                c.arg("--startup-file").arg(expanded);
+            }
+            c
         };
-
-        let mut cmd = std::process::Command::new(&wrapper_bin);
-        cmd.arg(&instance_id);
-
-        if !config.command.is_empty() {
-            cmd.arg("--command").arg(config.command.join(" "));
-        }
-
-        if let Some(ref wd) = config.working_dir {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            let expanded = if wd.starts_with('~') {
-                std::path::PathBuf::from(&home)
-                    .join(wd.strip_prefix("~/").unwrap_or(&wd[1..]))
-            } else {
-                std::path::PathBuf::from(wd)
-            };
-            cmd.arg("--workdir").arg(expanded);
-        }
-
-        if let Some(ref sf) = config.startup_file {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            let expanded = if sf.starts_with('~') {
-                std::path::PathBuf::from(&home)
-                    .join(sf.strip_prefix("~/").unwrap_or(&sf[1..]))
-            } else {
-                std::path::PathBuf::from(sf)
-            };
-            cmd.arg("--startup-file").arg(expanded);
-        }
 
         match cmd
             .stdout(std::process::Stdio::null())

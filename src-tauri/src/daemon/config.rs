@@ -59,6 +59,14 @@ pub struct AgentConfig {
     /// assignments on this slot.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u8,
+    /// Runtime layer used to spawn this agent:
+    ///   - "wrapper" (default): launches via alor-wrapper, which runs the
+    ///     `command` inside a tmux session and scrapes its output.
+    ///   - "claude-sdk": launches run-worker.sh inside a tmux session; the
+    ///     Python worker talks the wrapper wire protocol directly to the
+    ///     daemon and hosts a ClaudeSDKClient internally.
+    #[serde(default = "default_runtime")]
+    pub runtime: String,
 }
 
 fn default_role() -> String {
@@ -71,6 +79,10 @@ fn default_tier() -> String {
 
 fn default_max_concurrent() -> u8 {
     1
+}
+
+fn default_runtime() -> String {
+    "wrapper".to_string()
 }
 
 // ---------------------------------------------------------------------------

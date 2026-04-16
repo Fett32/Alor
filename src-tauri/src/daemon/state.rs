@@ -124,6 +124,9 @@ pub struct Task {
     /// Unified diff or JSON representation of proposed changes.
     #[serde(default)]
     pub proposal_diff: Option<String>,
+    /// Final free-form answer/report from the worker (set on completion).
+    #[serde(default)]
+    pub summary: Option<String>,
     /// Name of the project profile this task relates to; used to build a
     /// TASK BRIEF (key files, docs) that is prepended when dispatching.
     #[serde(default)]
@@ -147,6 +150,7 @@ impl Task {
             user_intervened_at: None,
             proposal_brief: None,
             proposal_diff: None,
+            summary: None,
             project: None,
         }
     }
@@ -442,6 +446,25 @@ impl AppState {
         self.save();
         self.emit_event("tasks-changed");
         Ok(result)
+    }
+
+    /// Record a worker-provided summary on the task.  Capped at 1 MiB to
+    /// prevent a runaway worker from ballooning the session state file.
+    pub fn set_task_summary(&self, id: Uuid, summary: String) {
+        const MAX_SUMMARY_BYTES: usize = 1024 * 1024;
+        let text = if summary.len() > MAX_SUMMARY_BYTES {
+            tracing::warn!(task_id = %id, bytes = summary.len(), "task summary truncated");
+            summary.chars().take(MAX_SUMMARY_BYTES).collect()
+        } else {
+            summary
+        };
+        let mut s = self.inner.lock();
+        if let Some(task) = s.tasks.get_mut(&id) {
+            task.summary = Some(text);
+            task.updated_at = Utc::now();
+        }
+        drop(s);
+        self.save();
     }
 
     /// Assign a task to an agent (sets `assigned_to` and transitions to Assigned).
