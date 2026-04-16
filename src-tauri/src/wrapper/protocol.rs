@@ -40,6 +40,8 @@ pub const MSG_CLI_PROJECT_LIST: &str = "cli.project.list";
 pub const MSG_CLI_PROJECT_GET: &str = "cli.project.get";
 pub const MSG_CLI_PROJECT_SAVE: &str = "cli.project.save";
 pub const MSG_CLI_INTEGRATIONS_GET: &str = "cli.integrations.get";
+pub const MSG_CLI_AGENT_SEND_MESSAGE: &str = "cli.agent.send_message";
+pub const MSG_CLI_MEMORY_GET: &str = "cli.memory.get";
 pub const MSG_CLI_RESPONSE: &str = "cli.response";
 pub const MSG_CLI_ERROR: &str = "cli.error";
 pub const MSG_EVENT: &str = "event";
@@ -223,6 +225,21 @@ pub struct CliKill {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliProjectGet {
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliAgentSendMessage {
+    pub agent_id: String,
+    pub text: String,
+    /// If true, append Enter after the text. Defaults to false so the
+    /// caller can build multi-line inputs without submitting.
+    #[serde(default)]
+    pub submit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliMemoryGet {
+    pub project: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

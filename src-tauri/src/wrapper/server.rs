@@ -14,15 +14,16 @@ use crate::daemon::project;
 use crate::daemon::state::{AppState, Task, TaskState};
 use crate::terminal::pane_manager::PaneManager;
 use crate::wrapper::protocol::{
-    CliAssign, CliKill, CliProjectGet, CliProjectSave, CliSpawn, CliTaskCancel, CliTaskCreate,
+    CliAgentSendMessage, CliAssign, CliKill, CliMemoryGet, CliProjectGet, CliProjectSave,
+    CliSpawn, CliTaskCancel, CliTaskCreate,
     CliTaskComplete as CliTaskCompletePayload, CliTaskGet, Envelope, TaskAccept, TaskAssign,
     TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WrapperError, WrapperRegister,
-    MSG_CLI_ASSIGN, MSG_CLI_ERROR, MSG_CLI_EVENT_STREAM, MSG_CLI_KILL, MSG_CLI_PROJECT_GET,
-    MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE, MSG_CLI_RESPONSE, MSG_CLI_SPAWN, MSG_CLI_STATUS,
-    MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE, MSG_CLI_TASK_CREATE, MSG_CLI_TASK_GET,
-    MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER, MSG_CLI_INTEGRATIONS_GET,
-    MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN, MSG_TASK_BLOCKED,
-    MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
+    MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_ERROR, MSG_CLI_EVENT_STREAM, MSG_CLI_KILL,
+    MSG_CLI_MEMORY_GET, MSG_CLI_PROJECT_GET, MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE,
+    MSG_CLI_RESPONSE, MSG_CLI_SPAWN, MSG_CLI_STATUS, MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE,
+    MSG_CLI_TASK_CREATE, MSG_CLI_TASK_GET, MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER,
+    MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
+    MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -843,6 +844,159 @@ impl SocketServer {
                             json!({
                                 "saved": payload.name,
                                 "hub_path": hub_path_str,
+                            }),
+                        ) {
+                            Ok(mut e) => {
+                                e.correlation_id = correlation_id;
+                                e
+                            }
+                            Err(_) => cli_error(correlation_id, "failed to build response"),
+                        }
+                    }
+                    Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),
+                }
+            }
+
+            MSG_CLI_AGENT_SEND_MESSAGE => {
+                match env.decode_payload::<CliAgentSendMessage>() {
+                    Ok(payload) => {
+                        if payload.agent_id.is_empty()
+                            || payload.agent_id.len() > 64
+                            || !payload
+                                .agent_id
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                        {
+                            return cli_error(
+                                correlation_id,
+                                &format!("invalid agent_id: {:?}", payload.agent_id),
+                            );
+                        }
+                        let session = format!("alor-{}", payload.agent_id);
+                        let session_exists = tokio::process::Command::new("tmux")
+                            .args(["has-session", "-t", &session])
+                            .output()
+                            .await
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                        if !session_exists {
+                            return cli_error(
+                                correlation_id,
+                                &format!("no tmux session for agent {}", payload.agent_id),
+                            );
+                        }
+                        let send_out = tokio::process::Command::new("tmux")
+                            .args(["send-keys", "-t", &session, "-l", &payload.text])
+                            .output()
+                            .await;
+                        if let Err(e) = send_out {
+                            return cli_error(
+                                correlation_id,
+                                &format!("tmux send-keys failed: {e}"),
+                            );
+                        }
+                        if payload.submit {
+                            let _ = tokio::process::Command::new("tmux")
+                                .args(["send-keys", "-t", &session, "Enter"])
+                                .output()
+                                .await;
+                        }
+                        info!(
+                            agent_id = %payload.agent_id,
+                            submit = payload.submit,
+                            bytes = payload.text.len(),
+                            "cli.agent.send_message"
+                        );
+                        match Envelope::new(
+                            MSG_CLI_RESPONSE,
+                            json!({"sent": payload.agent_id, "submit": payload.submit}),
+                        ) {
+                            Ok(mut e) => {
+                                e.correlation_id = correlation_id;
+                                e
+                            }
+                            Err(_) => cli_error(correlation_id, "failed to build response"),
+                        }
+                    }
+                    Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),
+                }
+            }
+
+            MSG_CLI_MEMORY_GET => {
+                match env.decode_payload::<CliMemoryGet>() {
+                    Ok(payload) => {
+                        let hub_dir = match project::memory_hub_dir(&payload.project) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                return cli_error(
+                                    correlation_id,
+                                    &format!("invalid project: {e}"),
+                                )
+                            }
+                        };
+                        if !hub_dir.exists() {
+                            match Envelope::new(
+                                MSG_CLI_RESPONSE,
+                                json!({"project": payload.project, "files": {}}),
+                            ) {
+                                Ok(mut e) => {
+                                    e.correlation_id = correlation_id;
+                                    return e;
+                                }
+                                Err(_) => {
+                                    return cli_error(
+                                        correlation_id,
+                                        "failed to build response",
+                                    )
+                                }
+                            }
+                        }
+                        let entries = match std::fs::read_dir(&hub_dir) {
+                            Ok(it) => it,
+                            Err(e) => {
+                                return cli_error(
+                                    correlation_id,
+                                    &format!("read hub dir: {e}"),
+                                )
+                            }
+                        };
+                        let mut files = serde_json::Map::new();
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if !path.is_file() {
+                                continue;
+                            }
+                            let name = match path.file_name().and_then(|s| s.to_str()) {
+                                Some(n) => n.to_string(),
+                                None => continue,
+                            };
+                            match std::fs::metadata(&path) {
+                                Ok(meta) if meta.len() > 1_048_576 => {
+                                    files.insert(
+                                        name,
+                                        json!({
+                                            "truncated": true,
+                                            "size": meta.len(),
+                                        }),
+                                    );
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                            match std::fs::read_to_string(&path) {
+                                Ok(content) => {
+                                    files.insert(name, json!(content));
+                                }
+                                Err(e) => {
+                                    files.insert(name, json!({"error": e.to_string()}));
+                                }
+                            }
+                        }
+                        match Envelope::new(
+                            MSG_CLI_RESPONSE,
+                            json!({
+                                "project": payload.project,
+                                "files": files,
                             }),
                         ) {
                             Ok(mut e) => {
