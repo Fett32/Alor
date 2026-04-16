@@ -10,11 +10,27 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 
+fn expand_tilde(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    if s == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    path
+}
+
 pub fn link_agent_memory(
     project_name: &str,
     agent_name: &str,
     source_path: PathBuf,
 ) -> Result<PathBuf> {
+    let source_path = expand_tilde(source_path);
     let hub_dir = super::project::memory_hub_dir(project_name)?;
     
     // Ensure project hub exists

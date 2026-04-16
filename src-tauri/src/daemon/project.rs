@@ -70,8 +70,25 @@ fn projects_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Validate a project name is safe for use as a path component.
+/// Rejects empty strings, names longer than 64 chars, and any characters
+/// outside alphanumeric / dash / underscore. Prevents path traversal.
+pub fn validate_project_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("project name is empty");
+    }
+    if name.len() > 64 {
+        anyhow::bail!("project name too long (max 64 chars): {name:?}");
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        anyhow::bail!("invalid project name (allowed: alphanumeric, dash, underscore): {name:?}");
+    }
+    Ok(())
+}
+
 /// Get the memory hub directory for a specific project.
 pub fn memory_hub_dir(project_name: &str) -> Result<PathBuf> {
+    validate_project_name(project_name)?;
     let data = session::data_dir()?;
     let dir = data.join("hubs").join(project_name);
     Ok(dir)
@@ -95,6 +112,7 @@ pub fn ensure_project_dirs(project_name: &str) -> Result<()> {
 
 /// Load a project profile by name.
 pub fn load_profile(name: &str) -> Result<Option<ProjectProfile>> {
+    validate_project_name(name)?;
     let dir = projects_dir()?;
     let path = dir.join(format!("{name}.yaml"));
 
@@ -109,15 +127,19 @@ pub fn load_profile(name: &str) -> Result<Option<ProjectProfile>> {
     Ok(Some(profile))
 }
 
-/// Save a project profile.
+/// Save a project profile. Writes to a temp file then atomically renames.
 pub fn save_profile(profile: &ProjectProfile) -> Result<PathBuf> {
+    validate_project_name(&profile.name)?;
     let dir = ensure_projects_dir()?;
     let path = dir.join(format!("{}.yaml", profile.name));
+    let tmp = dir.join(format!(".{}.yaml.tmp", profile.name));
 
     let content = serde_yaml::to_string(profile)
         .context("serialize project profile")?;
-    std::fs::write(&path, content)
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&tmp, content)
+        .with_context(|| format!("write temp {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
 
     tracing::info!(project = %profile.name, "project profile saved to {}", path.display());
     Ok(path)
@@ -148,6 +170,56 @@ pub fn list_profiles() -> Result<Vec<ProjectProfile>> {
     }
 
     Ok(profiles)
+}
+
+/// Build a TASK BRIEF that will be prepended to a task description when
+/// the task is dispatched to an agent. Gives the wrapper a stable reference
+/// frame (project, key files, docs) without needing to look it up itself.
+pub fn build_task_brief(
+    profile: &ProjectProfile,
+    task_title: &str,
+    task_description: &str,
+) -> String {
+    let mut buf = String::new();
+
+    buf.push_str("## Project\n");
+    buf.push_str(&profile.name);
+    if !profile.description.is_empty() {
+        buf.push_str(" — ");
+        buf.push_str(&profile.description);
+    }
+    buf.push('\n');
+
+    if let Some(root) = &profile.root_dir {
+        buf.push_str("Root: ");
+        buf.push_str(root);
+        buf.push('\n');
+    }
+
+    if !profile.key_files.is_empty() {
+        buf.push_str("\n## Key files\n");
+        for kf in &profile.key_files {
+            buf.push_str("- ");
+            buf.push_str(kf);
+            buf.push('\n');
+        }
+    }
+
+    if !profile.doc_paths.is_empty() {
+        buf.push_str("\n## Documentation\n");
+        for dp in &profile.doc_paths {
+            buf.push_str("- ");
+            buf.push_str(dp);
+            buf.push('\n');
+        }
+    }
+
+    buf.push_str("\n## Task\n");
+    buf.push_str(task_title);
+    buf.push_str("\n\n");
+    buf.push_str(task_description);
+
+    buf
 }
 
 fn load_one_profile(path: &Path) -> Result<ProjectProfile> {

@@ -118,8 +118,11 @@ pub fn save_wrapper_pids(new_pids: &[u32]) -> anyhow::Result<()> {
     pids.dedup();
 
     let json = serde_json::to_string(&pids)?;
-    std::fs::write(&path, json)
-        .with_context(|| format!("write wrapper pids {}", path.display()))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)
+        .with_context(|| format!("write temp wrapper pids {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename wrapper pids {}", path.display()))?;
     Ok(())
 }
 
@@ -168,8 +171,11 @@ impl SessionInfo {
     pub fn write(&self) -> anyhow::Result<()> {
         let path = session_file()?;
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)
-            .with_context(|| format!("write session file {}", path.display()))?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)
+            .with_context(|| format!("write temp session file {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("rename session file {}", path.display()))?;
         Ok(())
     }
 

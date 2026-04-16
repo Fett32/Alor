@@ -124,6 +124,10 @@ pub struct Task {
     /// Unified diff or JSON representation of proposed changes.
     #[serde(default)]
     pub proposal_diff: Option<String>,
+    /// Name of the project profile this task relates to; used to build a
+    /// TASK BRIEF (key files, docs) that is prepended when dispatching.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 impl Task {
@@ -143,6 +147,7 @@ impl Task {
             user_intervened_at: None,
             proposal_brief: None,
             proposal_diff: None,
+            project: None,
         }
     }
 
@@ -366,12 +371,26 @@ impl AppState {
     }
 
     /// Transition a task to PROPOSED state with a brief and/or diff.
+    /// Brief and diff are each capped at 10 MiB to prevent a malicious or
+    /// runaway agent from ballooning the session state file.
     pub fn propose_task(
         &self,
         id: Uuid,
         brief: Option<String>,
         diff: Option<String>,
     ) -> anyhow::Result<Task> {
+        const MAX_PROPOSAL_BYTES: usize = 10 * 1024 * 1024;
+        if let Some(ref b) = brief {
+            if b.len() > MAX_PROPOSAL_BYTES {
+                anyhow::bail!("proposal brief exceeds 10 MiB ({} bytes)", b.len());
+            }
+        }
+        if let Some(ref d) = diff {
+            if d.len() > MAX_PROPOSAL_BYTES {
+                anyhow::bail!("proposal diff exceeds 10 MiB ({} bytes)", d.len());
+            }
+        }
+
         let mut s = self.inner.lock();
         let task = s
             .tasks

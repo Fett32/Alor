@@ -181,6 +181,10 @@ pub struct DaemonShutdown {}
 pub struct CliTaskCreate {
     pub title: String,
     pub description: String,
+    /// Project name (profile) this task belongs to. Used to generate a
+    /// TASK BRIEF prefix (key files, docs) when the task is dispatched.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,5 +233,12 @@ pub struct CliProjectSave {
     pub stack: Option<Vec<String>>,
     pub key_files: Option<Vec<String>>,
     pub doc_paths: Option<Vec<String>>,
+    /// Path to an agent's memory index file. When set, the daemon links
+    /// it into the project's Memory Hub (move + symlink).
+    #[serde(default)]
+    pub memory_index: Option<String>,
+    /// Which agent this memory_index belongs to. Defaults to "claude".
+    #[serde(default)]
+    pub memory_agent: Option<String>,
 }
 

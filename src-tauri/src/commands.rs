@@ -48,8 +48,10 @@ pub async fn assign_task(
     title: String,
     description: String,
     agent_id: Option<String>,
+    project: Option<String>,
 ) -> Result<Task, String> {
     let mut task = Task::new(title.clone(), description.clone());
+    task.project = project.clone();
 
     if let Some(ref aid) = agent_id {
         task.assigned_to = Some(aid.clone());
@@ -61,6 +63,7 @@ pub async fn assign_task(
     tracing::info!(
         task_id = %task_id,
         agent = ?agent_id,
+        project = ?project,
         "task created"
     );
 
@@ -73,10 +76,20 @@ pub async fn assign_task(
             return state.get_task(task_id).ok_or_else(|| "task not found".to_string());
         }
 
+        let dispatch_description = match project.as_deref() {
+            Some(name) => match crate::daemon::project::load_profile(name) {
+                Ok(Some(profile)) => {
+                    crate::daemon::project::build_task_brief(&profile, &title, &description)
+                }
+                _ => description.clone(),
+            },
+            None => description.clone(),
+        };
+
         let payload = TaskAssign {
             task_id,
             title,
-            description,
+            description: dispatch_description,
             timeout_secs: None,
         };
 
@@ -232,13 +245,24 @@ pub async fn kill_all_agents(
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // 2. Kill all tmux sessions managed by Alor
-    let _ = std::process::Command::new("bash")
-        .arg("-c")
-        .arg("tmux list-sessions -F '#{session_name}' | grep '^alor-' | xargs -I {} tmux kill-session -t {}")
-        .output();
+    // 2. Kill all tmux sessions managed by Alor (alor-* prefix).
+    // Enumerate natively instead of shelling out through bash -c.
+    if let Ok(out) = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+    {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for session in stdout.lines().filter(|s| s.starts_with("alor-")) {
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", session])
+                    .output();
+            }
+        }
+    }
 
-    // 3. Kill the main display session specifically
+    // 3. Kill the main display session specifically (covers the case where
+    //    list-sessions failed or alor-main wasn't caught above).
     let _ = std::process::Command::new("tmux")
         .args(["kill-session", "-t", "alor-main"])
         .output();

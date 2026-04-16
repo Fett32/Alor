@@ -471,7 +471,8 @@ impl SocketServer {
             MSG_CLI_TASK_CREATE => {
                 match env.decode_payload::<CliTaskCreate>() {
                     Ok(payload) => {
-                        let task = Task::new(&payload.title, &payload.description);
+                        let mut task = Task::new(&payload.title, &payload.description);
+                        task.project = payload.project.clone();
                         let task_id = task.id;
                         self.app_state.add_task(task);
                         info!(task_id = %task_id, title = %payload.title, "task created via CLI");
@@ -582,13 +583,34 @@ impl SocketServer {
                             }
                         };
 
+                        // If the task is tied to a project, prepend a TASK BRIEF
+                        // with key files + docs so the agent has context.
+                        let dispatch_description = match task.project.as_deref() {
+                            Some(name) => match project::load_profile(name) {
+                                Ok(Some(profile)) => project::build_task_brief(
+                                    &profile,
+                                    &task.title,
+                                    &task.description,
+                                ),
+                                Ok(None) => {
+                                    warn!(project = %name, "project profile not found; dispatching raw description");
+                                    task.description.clone()
+                                }
+                                Err(e) => {
+                                    warn!(project = %name, "failed to load project profile: {e}; dispatching raw description");
+                                    task.description.clone()
+                                }
+                            },
+                            None => task.description.clone(),
+                        };
+
                         // Build the envelope before locking writers.
                         let assign_env = match Envelope::new(
                             MSG_TASK_ASSIGN,
                             TaskAssign {
                                 task_id: task.id,
                                 title: task.title.clone(),
-                                description: task.description.clone(),
+                                description: dispatch_description,
                                 timeout_secs: None,
                             },
                         ) {
@@ -779,25 +801,55 @@ impl SocketServer {
                         if let Some(dp) = payload.doc_paths {
                             profile.doc_paths = dp;
                         }
-                        match project::save_profile(&profile) {
-                            Ok(_path) => {
-                                match Envelope::new(
-                                    MSG_CLI_RESPONSE,
-                                    json!({"saved": payload.name}),
-                                ) {
-                                    Ok(mut e) => {
-                                        e.correlation_id = correlation_id;
-                                        e
-                                    }
-                                    Err(_) => {
-                                        cli_error(correlation_id, "failed to build response")
-                                    }
-                                }
-                            }
-                            Err(e) => cli_error(
+                        if let Some(ref mi) = payload.memory_index {
+                            profile.memory_index = Some(mi.clone());
+                        }
+
+                        if let Err(e) = project::save_profile(&profile) {
+                            return cli_error(
                                 correlation_id,
                                 &format!("failed to save project: {e}"),
-                            ),
+                            );
+                        }
+
+                        let mut hub_path_str: Option<String> = None;
+                        if let Some(mi) = payload.memory_index.as_deref() {
+                            let agent = payload.memory_agent.as_deref().unwrap_or("claude");
+                            match crate::daemon::memory::link_agent_memory(
+                                &payload.name,
+                                agent,
+                                std::path::PathBuf::from(mi),
+                            ) {
+                                Ok(hub_path) => {
+                                    info!(
+                                        project = %payload.name,
+                                        agent = %agent,
+                                        hub_path = %hub_path.display(),
+                                        "agent memory linked into hub"
+                                    );
+                                    hub_path_str = Some(hub_path.display().to_string());
+                                }
+                                Err(e) => {
+                                    return cli_error(
+                                        correlation_id,
+                                        &format!("failed to link agent memory: {e}"),
+                                    );
+                                }
+                            }
+                        }
+
+                        match Envelope::new(
+                            MSG_CLI_RESPONSE,
+                            json!({
+                                "saved": payload.name,
+                                "hub_path": hub_path_str,
+                            }),
+                        ) {
+                            Ok(mut e) => {
+                                e.correlation_id = correlation_id;
+                                e
+                            }
+                            Err(_) => cli_error(correlation_id, "failed to build response"),
                         }
                     }
                     Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),

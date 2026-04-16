@@ -30,7 +30,12 @@ struct CliStatusRequest {}
 #[derive(Serialize)]
 struct CliTaskList {}
 #[derive(Serialize)]
-struct CliTaskCreate { title: String, description: String }
+struct CliTaskCreate {
+    title: String,
+    description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+}
 #[derive(Serialize)]
 struct CliTaskCancel { task_id: Uuid }
 #[derive(Serialize)]
@@ -61,6 +66,8 @@ struct CliProjectSave {
     doc_paths: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory_index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_agent: Option<String>,
 }
 #[derive(Serialize)]
 struct CliAssign { task_id: Uuid, agent_id: String }
@@ -112,7 +119,11 @@ enum Commands {
 enum TaskAction {
     List,
     Get { task_id: Uuid },
-    Create { title: String, description: String },
+    Create {
+        title: String,
+        description: String,
+        #[arg(long)] project: Option<String>,
+    },
     Cancel { task_id: Uuid },
     Complete { task_id: Uuid },
 }
@@ -128,6 +139,8 @@ enum ProjectAction {
         #[arg(long, value_delimiter = ',')] stack: Option<Vec<String>>,
         #[arg(long, value_delimiter = ',')] key_files: Option<Vec<String>>,
         #[arg(long, value_delimiter = ',')] doc_paths: Option<Vec<String>>,
+        #[arg(long)] memory_index: Option<String>,
+        #[arg(long)] memory_agent: Option<String>,
     },
 }
 
@@ -165,15 +178,15 @@ async fn main() {
         Commands::Task { action } => match action {
             TaskAction::List => cmd_task_list().await,
             TaskAction::Get { task_id } => cmd_task_get(task_id).await,
-            TaskAction::Create { title, description } => cmd_task_create(title, description).await,
+            TaskAction::Create { title, description, project } => cmd_task_create(title, description, project).await,
             TaskAction::Cancel { task_id } => cmd_task_cancel(task_id).await,
             TaskAction::Complete { task_id } => cmd_task_complete(task_id).await,
         },
         Commands::Project { action } => match action {
             ProjectAction::List => cmd_project_list().await,
             ProjectAction::Get { name } => cmd_project_get(name).await,
-            ProjectAction::Save { name, description, root_dir, stack, key_files, doc_paths } => {
-                cmd_project_save(name, description, root_dir, stack, key_files, doc_paths).await
+            ProjectAction::Save { name, description, root_dir, stack, key_files, doc_paths, memory_index, memory_agent } => {
+                cmd_project_save(name, description, root_dir, stack, key_files, doc_paths, memory_index, memory_agent).await
             }
         },
         Commands::Assign { task_id, agent_id } => cmd_assign(task_id, agent_id).await,
@@ -247,8 +260,8 @@ async fn cmd_task_get(task_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_task_create(title: String, description: String) -> Result<()> {
-    let req = Envelope::new("cli.task.create", CliTaskCreate { title, description })?;
+async fn cmd_task_create(title: String, description: String, project: Option<String>) -> Result<()> {
+    let req = Envelope::new("cli.task.create", CliTaskCreate { title, description, project })?;
     let resp = send_request(&req).await?;
     println!("Created task: {}", resp.payload.get("task_id").and_then(|v| v.as_str()).unwrap_or("?"));
     Ok(())
@@ -290,8 +303,26 @@ async fn cmd_project_get(name: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_project_save(name: String, description: Option<String>, root_dir: Option<String>, stack: Option<Vec<String>>, key_files: Option<Vec<String>>, doc_paths: Option<Vec<String>>) -> Result<()> {
-    let req = Envelope::new("cli.project.save", CliProjectSave { name: name.clone(), description, stack, root_dir, key_files, doc_paths, memory_index: None })?;
+async fn cmd_project_save(
+    name: String,
+    description: Option<String>,
+    root_dir: Option<String>,
+    stack: Option<Vec<String>>,
+    key_files: Option<Vec<String>>,
+    doc_paths: Option<Vec<String>>,
+    memory_index: Option<String>,
+    memory_agent: Option<String>,
+) -> Result<()> {
+    let req = Envelope::new("cli.project.save", CliProjectSave {
+        name: name.clone(),
+        description,
+        stack,
+        root_dir,
+        key_files,
+        doc_paths,
+        memory_index,
+        memory_agent,
+    })?;
     let resp = send_request(&req).await?;
     println!("Project saved to {}", resp.payload.get("path").and_then(|v| v.as_str()).unwrap_or("?"));
     Ok(())

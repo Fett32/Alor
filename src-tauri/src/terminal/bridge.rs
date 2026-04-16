@@ -117,16 +117,31 @@ impl TerminalBridge {
     }
 
     /// Send keystrokes from xterm.js to the PTY.
+    ///
+    /// The PTY writer is synchronous; a full kernel tty buffer could otherwise
+    /// block this task (and anything sharing its runtime thread) indefinitely.
+    /// We run the blocking write on a dedicated blocking thread and bound the
+    /// whole call with a timeout so the Tauri IPC command always returns.
     pub async fn send_keys(&self, keys: &str) -> Result<()> {
-        let mut writer_guard = self.writer.lock().await;
-        if let Some(ref mut writer) = *writer_guard {
-            writer
-                .write_all(keys.as_bytes())
-                .context("write to PTY failed")?;
-            writer.flush().context("flush PTY failed")?;
+        const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let writer = self.writer.clone();
+        let bytes = keys.as_bytes().to_vec();
+
+        let write_task = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut guard = writer.blocking_lock();
+            let w = guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("PTY relay not started"))?;
+            w.write_all(&bytes).context("write to PTY failed")?;
+            w.flush().context("flush PTY failed")?;
             Ok(())
-        } else {
-            anyhow::bail!("PTY relay not started")
+        });
+
+        match tokio::time::timeout(WRITE_TIMEOUT, write_task).await {
+            Ok(Ok(inner)) => inner,
+            Ok(Err(join_err)) => Err(anyhow::anyhow!("PTY write task panicked: {join_err}")),
+            Err(_) => anyhow::bail!("PTY write timed out after {:?}", WRITE_TIMEOUT),
         }
     }
 
