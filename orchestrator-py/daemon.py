@@ -177,7 +177,14 @@ async def event_stream() -> AsyncIterator[Event]:
                         data=payload.get("data") or {},
                         timestamp=payload.get("timestamp"),
                     )
-                except (json.JSONDecodeError, KeyError):
+                except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+                    # Don't silently swallow parse errors — we need to see
+                    # them when "why did my event never fire" is the question.
+                    import sys
+                    print(
+                        f"[event_stream] malformed envelope, skipping: {e}",
+                        file=sys.stderr,
+                    )
                     continue
         finally:
             writer.close()

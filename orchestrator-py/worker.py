@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -97,6 +98,18 @@ async def run_task(
     print_footer(session_start, cost[0], totals)
 
     summary = "\n".join(s.strip() for s in collected if s.strip()) or None
+    # Cap summary client-side too so we don't blow through the daemon's
+    # 1 MiB hard cap and get silently truncated; 64 KiB is plenty for a
+    # post-task report.
+    if summary is not None:
+        encoded = summary.encode("utf-8")
+        MAX = 64 * 1024
+        if len(encoded) > MAX:
+            trimmed = encoded[:MAX]
+            # Back up to a valid UTF-8 boundary.
+            while trimmed and (trimmed[-1] & 0xC0) == 0x80:
+                trimmed = trimmed[:-1]
+            summary = trimmed.decode("utf-8", errors="ignore") + "\n…[truncated]"
 
     try:
         await sock.send_complete(task_id, summary=summary)
@@ -211,6 +224,16 @@ async def main() -> int:
     totals: dict[str, int] = {}
     cost: list[float] = [0.0]
     stop = asyncio.Event()
+
+    # Graceful shutdown on SIGTERM/SIGINT — sets the stop event so both
+    # daemon_loop and stdin_loop exit cleanly instead of leaving orphan tmux
+    # sessions + half-closed sockets.
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass  # Non-Unix; the KeyboardInterrupt path still catches Ctrl-C.
 
     # Connect to daemon first — fail fast if it's not reachable.
     sock = AgentClient(args.agent_id)

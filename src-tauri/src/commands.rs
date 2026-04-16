@@ -309,12 +309,15 @@ pub async fn kill_all_agents(
         .args(["kill-session", "-t", "alor-main"])
         .output();
 
-    // 4. Kill all wrapper processes (backup)
-    let _ = std::process::Command::new("pkill")
-        .arg("-9")
-        .arg("-f")
-        .arg("alor-wrapper")
-        .output();
+    // 4. Kill all worker processes (backup). Covers both the tmux wrapper
+    //    path (alor-wrapper) and the SDK Python workers launched via
+    //    run-worker.sh / worker.py. The tmux kill above usually handles
+    //    these, but pkill is belt-and-suspenders for stuck processes.
+    for pattern in ["alor-wrapper", "run-worker.sh", "orchestrator-py/worker.py"] {
+        let _ = std::process::Command::new("pkill")
+            .args(["-9", "-f", pattern])
+            .output();
+    }
 
     // 5. Clear internal state
     state.clear_all_agents();

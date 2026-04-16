@@ -125,7 +125,7 @@ class AgentClient:
         )
 
     async def recv(self) -> Envelope | None:
-        """Read one envelope.  Returns None on EOF."""
+        """Read one envelope. Returns None on EOF. Raises on malformed JSON."""
         if self._reader is None:
             raise AgentClientError("not connected")
         line = await self._reader.readline()
@@ -134,9 +134,16 @@ class AgentClient:
         return Envelope.from_line(line.decode().strip())
 
     async def recv_forever(self) -> AsyncIterator[Envelope]:
-        """Iterator form — yields until EOF."""
+        """Iterator form — yields until EOF. Skips malformed envelopes instead
+        of killing the whole worker loop."""
         while True:
-            env = await self.recv()
+            try:
+                env = await self.recv()
+            except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+                # One garbage line shouldn't take down the worker.
+                import sys
+                print(f"[agent_client] skipping malformed envelope: {e}", file=sys.stderr)
+                continue
             if env is None:
                 return
             yield env

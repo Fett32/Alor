@@ -145,17 +145,21 @@ impl SocketServer {
                 }
                 info!(sub_id, "cli event stream subscriber connected");
 
-                // Keep reading until disconnect
+                // Keep reading until disconnect. We swallow read errors
+                // locally so the subscriber is always removed from the map —
+                // previously `?` would propagate out and skip the cleanup.
                 loop {
                     line.clear();
-                    let n = reader.read_line(&mut line).await?;
-                    if n == 0 {
-                        break;
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(sub_id, "event stream read error: {e}");
+                            break;
+                        }
                     }
                 }
 
-                // Explicitly remove on disconnect so dead subscribers don't
-                // accumulate in the map.
                 {
                     let mut subs = self.event_subscribers.lock().await;
                     subs.remove(&sub_id);
@@ -313,18 +317,25 @@ impl SocketServer {
                     if let Some(ref s) = payload.summary {
                         self.app_state.set_task_summary(payload.task_id, s.clone());
                     }
-                    if let Err(e) = self.app_state.transition_task(payload.task_id, TaskState::Completed) {
-                        warn!("transition to Completed failed: {e}");
+                    // Only broadcast task.completed if the transition actually
+                    // succeeded — otherwise the orch hears "done" but state
+                    // still says not-done.
+                    match self.app_state.transition_task(payload.task_id, TaskState::Completed) {
+                        Ok(_) => {
+                            self.broadcast_event(
+                                "task.completed",
+                                json!({
+                                    "task_id": payload.task_id.to_string(),
+                                    "agent_id": agent_id,
+                                    "summary": payload.summary,
+                                }),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            warn!("transition to Completed failed: {e}; not broadcasting");
+                        }
                     }
-                    self.broadcast_event(
-                        "task.completed",
-                        json!({
-                            "task_id": payload.task_id.to_string(),
-                            "agent_id": agent_id,
-                            "summary": payload.summary,
-                        }),
-                    )
-                    .await;
 
                     // Notify orchestrator by injecting into its tmux session,
                     // but only if the session appears idle (at a prompt).
@@ -401,15 +412,17 @@ impl SocketServer {
             }
 
             MSG_USER_INTERVENTION => {
-                if let Ok(payload) = env.decode_payload::<UserIntervention>() {
-                    info!(agent_id = %payload.agent_id, "user intervention recorded");
-                    let affected = self.app_state.record_user_intervention(&payload.agent_id);
+                // Ignore the payload's agent_id — use the connection-bound id
+                // so a wrapper can't flag intervention on behalf of another.
+                if env.decode_payload::<UserIntervention>().is_ok() {
+                    info!(agent_id, "user intervention recorded");
+                    let affected = self.app_state.record_user_intervention(agent_id);
                     let task_ids: Vec<String> =
                         affected.iter().map(|id| id.to_string()).collect();
                     self.broadcast_event(
                         "user.intervention",
                         json!({
-                            "agent_id": payload.agent_id,
+                            "agent_id": agent_id,
                             "task_ids": task_ids,
                         }),
                     )
@@ -669,19 +682,31 @@ impl SocketServer {
                             }
                         };
 
-                        // Hold the writers lock through the send to avoid
-                        // check-then-act race (agent disconnects between check and send).
+                        // Hold the writers lock around persist+send so the
+                        // agent can't disconnect between the two, and so
+                        // state.json has the assignment before the wrapper
+                        // hears about it (persist-before-broadcast).
                         {
                             let mut writers = self.writers.lock().await;
-                            let writer = match writers.get_mut(&payload.agent_id) {
-                                Some(w) => w,
-                                None => {
-                                    return cli_error(
-                                        correlation_id,
-                                        &format!("agent {} is not connected", payload.agent_id),
-                                    );
-                                }
-                            };
+                            if !writers.contains_key(&payload.agent_id) {
+                                return cli_error(
+                                    correlation_id,
+                                    &format!("agent {} is not connected", payload.agent_id),
+                                );
+                            }
+
+                            // Persist assignment first.
+                            if let Err(e) = self
+                                .app_state
+                                .assign_task_to_agent(payload.task_id, &payload.agent_id)
+                            {
+                                return cli_error(
+                                    correlation_id,
+                                    &format!("failed to update task state: {e}"),
+                                );
+                            }
+
+                            let writer = writers.get_mut(&payload.agent_id).unwrap();
                             let mut line = match serde_json::to_string(&assign_env) {
                                 Ok(l) => l,
                                 Err(e) => {
@@ -693,23 +718,17 @@ impl SocketServer {
                             };
                             line.push('\n');
                             if let Err(e) = writer.write_all(line.as_bytes()).await {
+                                // Wire write failed after we persisted — mark
+                                // Stale so the slot doesn't stay at capacity.
+                                let _ = self
+                                    .app_state
+                                    .transition_task(payload.task_id, TaskState::Stale);
                                 return cli_error(
                                     correlation_id,
                                     &format!("failed to send to agent: {e}"),
                                 );
                             }
                             let _ = writer.flush().await;
-                        }
-
-                        // Update task assignment.
-                        if let Err(e) = self
-                            .app_state
-                            .assign_task_to_agent(payload.task_id, &payload.agent_id)
-                        {
-                            return cli_error(
-                                correlation_id,
-                                &format!("failed to update task state: {e}"),
-                            );
                         }
 
                         self.broadcast_event(
@@ -1346,6 +1365,27 @@ impl SocketServer {
                 }
             }
         };
+
+        // Collision guard: a template-derived id could accidentally collide
+        // with an existing yaml slot (e.g. template 'claude' + project 'alor'
+        // derives 'claude-alor', which is also a fixed yaml slot). Refuse so
+        // we don't overwrite state metadata or spawn an orphan session.
+        if config.template
+            && instance_id != payload.agent
+            && self
+                .agent_configs
+                .iter()
+                .any(|(id, _)| id == &instance_id)
+        {
+            return cli_error(
+                correlation_id,
+                &format!(
+                    "instance id '{}' conflicts with an existing yaml slot; \
+                     use agent_ensure_running('{}') instead, or spawn with an explicit --name",
+                    instance_id, instance_id
+                ),
+            );
+        }
 
         // Register the instance in state with the base config's metadata plus
         // any runtime overrides.

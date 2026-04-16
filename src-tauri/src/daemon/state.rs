@@ -52,6 +52,7 @@ impl TaskState {
                 | TaskState::Cancelled
                 | TaskState::Rejected
                 | TaskState::TimedOut
+                | TaskState::Stale
         )
     }
 
@@ -90,8 +91,6 @@ impl TaskState {
                 | (Recovering, Accepted)
                 | (Recovering, Cancelled)
                 | (Recovering, Interrupted)
-                | (Stale, Accepted)
-                | (Stale, Cancelled)
         )
     }
 }
@@ -373,11 +372,27 @@ impl AppState {
                     }
                 }
             };
-            // Write to temp file then atomic rename.
+            // Write to temp file, fsync, then atomic rename. Without the
+            // fsync the rename can beat dirty pagecache to disk and leave
+            // a truncated file after a crash, which is exactly what
+            // "atomic rename" was supposed to prevent.
             let tmp_path = path.with_extension("json.tmp");
-            if let Err(e) = std::fs::write(&tmp_path, &json) {
-                tracing::warn!("failed to write temp session file: {e}");
-                return;
+            match std::fs::File::create(&tmp_path) {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    if let Err(e) = f.write_all(json.as_bytes()) {
+                        tracing::warn!("failed to write temp session file: {e}");
+                        return;
+                    }
+                    if let Err(e) = f.sync_all() {
+                        tracing::warn!("failed to fsync session file: {e}");
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to open temp session file: {e}");
+                    return;
+                }
             }
             if let Err(e) = std::fs::rename(&tmp_path, path) {
                 tracing::warn!("failed to rename session file: {e}");
@@ -412,6 +427,11 @@ impl AppState {
             .get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("task {} not found", id))?;
         task.transition(next)?;
+        // Clear assigned_to when terminal so the agent's active-task count
+        // drops and max_concurrent slots free up.
+        if task.state.is_terminal() {
+            task.assigned_to = None;
+        }
         let result = task.clone();
         drop(s);
         self.save();
@@ -466,7 +486,15 @@ impl AppState {
         const MAX_SUMMARY_BYTES: usize = 1024 * 1024;
         let text = if summary.len() > MAX_SUMMARY_BYTES {
             tracing::warn!(task_id = %id, bytes = summary.len(), "task summary truncated");
-            summary.chars().take(MAX_SUMMARY_BYTES).collect()
+            // Truncate on a UTF-8 char boundary at or before MAX_SUMMARY_BYTES
+            // so we never emit an invalid sequence.
+            let mut end = MAX_SUMMARY_BYTES;
+            while end > 0 && !summary.is_char_boundary(end) {
+                end -= 1;
+            }
+            let mut s = summary;
+            s.truncate(end);
+            s
         } else {
             summary
         };
@@ -578,8 +606,19 @@ impl AppState {
         let now = Utc::now();
         let mut affected = Vec::new();
         for task in s.tasks.values_mut() {
+            // Flag any in-flight task on this agent. Previously only Accepted
+            // matched, which missed Assigned (pre-ack), Proposed (awaiting
+            // approval), and Staged (post-approval mid-apply).
             if task.assigned_to.as_deref() == Some(agent_id)
-                && matches!(task.state, TaskState::Accepted)
+                && matches!(
+                    task.state,
+                    TaskState::Assigned
+                        | TaskState::Accepted
+                        | TaskState::Proposed
+                        | TaskState::Staged
+                        | TaskState::Blocked
+                        | TaskState::Recovering
+                )
             {
                 task.user_intervened = true;
                 task.user_intervened_at = Some(now);

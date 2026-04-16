@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -150,6 +151,15 @@ async def main() -> int:
     )
 
     stop_events = asyncio.Event()
+
+    # Graceful shutdown on SIGTERM so Tauri's kill_all can close us cleanly
+    # without leaving a dangling SDK session. SIGINT is left alone — it has
+    # REPL semantics (Ctrl-C at the prompt).
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGTERM, stop_events.set)
+    except NotImplementedError:
+        pass
 
     session_start = time.monotonic()
     totals: dict[str, int] = {}
