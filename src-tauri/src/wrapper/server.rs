@@ -399,10 +399,15 @@ impl SocketServer {
             MSG_USER_INTERVENTION => {
                 if let Ok(payload) = env.decode_payload::<UserIntervention>() {
                     info!(agent_id = %payload.agent_id, "user intervention recorded");
-                    self.app_state.record_user_intervention(&payload.agent_id);
+                    let affected = self.app_state.record_user_intervention(&payload.agent_id);
+                    let task_ids: Vec<String> =
+                        affected.iter().map(|id| id.to_string()).collect();
                     self.broadcast_event(
                         "user.intervention",
-                        json!({"agent_id": payload.agent_id}),
+                        json!({
+                            "agent_id": payload.agent_id,
+                            "task_ids": task_ids,
+                        }),
                     )
                     .await;
                 }
@@ -921,12 +926,49 @@ impl SocketServer {
                             }
                         }
 
-                        // Only yaml-declared slots are idempotently spawnable.
+                        // Idempotent spawn: first try yaml-declared slot, then
+                        // a state-persisted instance that was spawned from a
+                        // template. Everything else is an error.
                         let has_config = self
                             .agent_configs
                             .iter()
                             .any(|(id, _)| id == &payload.agent_id);
-                        if !has_config {
+
+                        let spawn_payload = if has_config {
+                            CliSpawn {
+                                name: Some(payload.agent_id.clone()),
+                                agent: payload.agent_id.clone(),
+                                role: None,
+                                project: None,
+                                working_dir: None,
+                            }
+                        } else if let Some(existing) = self.app_state.get_agent(&payload.agent_id) {
+                            match existing.template.as_deref() {
+                                Some(tmpl)
+                                    if self
+                                        .agent_configs
+                                        .iter()
+                                        .any(|(id, _)| id == tmpl) =>
+                                {
+                                    CliSpawn {
+                                        name: Some(payload.agent_id.clone()),
+                                        agent: tmpl.to_string(),
+                                        role: None,
+                                        project: existing.project.clone(),
+                                        working_dir: existing.working_dir.clone(),
+                                    }
+                                }
+                                _ => {
+                                    return cli_error(
+                                        correlation_id,
+                                        &format!(
+                                            "agent '{}' has no yaml config and no usable template",
+                                            payload.agent_id
+                                        ),
+                                    )
+                                }
+                            }
+                        } else {
                             return cli_error(
                                 correlation_id,
                                 &format!(
@@ -934,14 +976,6 @@ impl SocketServer {
                                     payload.agent_id
                                 ),
                             );
-                        }
-
-                        // Delegate to the existing spawn path. name = agent_id so
-                        // we get the yaml-declared slot, not an auto-numbered dup.
-                        let spawn_payload = CliSpawn {
-                            name: Some(payload.agent_id.clone()),
-                            agent: payload.agent_id.clone(),
-                            role: None,
                         };
                         let resp = self.handle_spawn(correlation_id, spawn_payload).await;
                         // Re-label the success envelope to expose `spawned: true`.
@@ -1193,16 +1227,54 @@ impl SocketServer {
             }
         };
 
-        // Determine instance ID: explicit --name, or auto-generate a unique one.
-        let instance_id = match payload.name {
-            Some(ref name) => name.clone(),
-            None => self.unique_instance_id(&payload.agent),
+        // Effective project + working_dir: payload override beats yaml config.
+        let effective_project = payload.project.clone().or_else(|| config.project.clone());
+        let effective_working_dir = payload
+            .working_dir
+            .clone()
+            .or_else(|| config.working_dir.clone());
+
+        // Templates must be parameterized at spawn time — refuse bare template
+        // spawns that didn't pass either a project or a working_dir override.
+        if config.template
+            && payload.project.is_none()
+            && payload.working_dir.is_none()
+        {
+            return cli_error(
+                correlation_id,
+                &format!(
+                    "'{}' is a template; agent_spawn needs a project and/or working_dir override",
+                    payload.agent
+                ),
+            );
+        }
+
+        // If spawning from a template, record the template id so the instance
+        // can be respawned after daemon restart using the template's command.
+        let template_ref = if config.template {
+            Some(payload.agent.clone())
+        } else {
+            None
         };
 
-        // Register the instance in state with the base config's metadata.
-        // If yaml-declared (instance_id == payload.agent or already registered),
-        // update in place so project/tier/max_concurrent stay in sync with the
-        // current yaml.
+        // Determine instance ID: explicit --name, auto-derived from project for
+        // template spawns, or a unique numbered id as a last resort.
+        let instance_id = match payload.name.clone() {
+            Some(name) => name,
+            None => {
+                if config.template {
+                    match effective_project.as_deref() {
+                        Some(proj) if !proj.is_empty() => format!("{}-{}", payload.agent, proj),
+                        _ => self.unique_instance_id(&payload.agent),
+                    }
+                } else {
+                    self.unique_instance_id(&payload.agent)
+                }
+            }
+        };
+
+        // Register the instance in state with the base config's metadata plus
+        // any runtime overrides.
         {
             let existing = self.app_state.get_agent(&instance_id);
             if existing.is_none() {
@@ -1213,16 +1285,20 @@ impl SocketServer {
                     .unwrap_or_else(|| instance_id.clone());
                 let mut agent = crate::daemon::state::Agent::new(&instance_id, &display_name);
                 agent.tmux_session = Some(format!("alor-{instance_id}"));
-                agent.project = config.project.clone();
+                agent.project = effective_project.clone();
                 agent.tier = config.tier.clone();
                 agent.max_concurrent = config.max_concurrent;
+                agent.working_dir = effective_working_dir.clone();
+                agent.template = template_ref.clone();
                 self.app_state.register_agent(agent);
             } else {
                 self.app_state.set_agent_metadata(
                     &instance_id,
-                    config.project.clone(),
+                    effective_project.clone(),
                     Some(config.tier.clone()),
                     Some(config.max_concurrent),
+                    effective_working_dir.clone(),
+                    template_ref.clone(),
                 );
             }
         }
@@ -1230,7 +1306,7 @@ impl SocketServer {
         // Resolve workdir once; both runtime branches use it.
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let expanded_workdir: Option<std::path::PathBuf> =
-            config.working_dir.as_ref().map(|wd| {
+            effective_working_dir.as_ref().map(|wd| {
                 if wd.starts_with('~') {
                     std::path::PathBuf::from(&home)
                         .join(wd.strip_prefix("~/").unwrap_or(&wd[1..]))
@@ -1262,7 +1338,7 @@ impl SocketServer {
             if let Some(ref wd) = expanded_workdir {
                 c.arg("--workdir").arg(wd);
             }
-            if let Some(ref proj) = config.project {
+            if let Some(ref proj) = effective_project {
                 c.arg("--project").arg(proj);
             }
             c

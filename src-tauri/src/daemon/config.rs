@@ -67,6 +67,11 @@ pub struct AgentConfig {
     ///     daemon and hosts a ClaudeSDKClient internally.
     #[serde(default = "default_runtime")]
     pub runtime: String,
+    /// If true, this yaml declares a *template* rather than a fixed slot.
+    /// Templates are not auto-registered; the orchestrator spawns instances
+    /// from them at runtime with a project + working_dir override.
+    #[serde(default)]
+    pub template: bool,
 }
 
 fn default_role() -> String {
@@ -150,6 +155,10 @@ pub fn register_agents_from_config(state: &AppState, configs: &[(String, AgentCo
         existing.iter().map(|a| a.id.as_str()).collect();
 
     for (id, cfg) in configs {
+        if cfg.template {
+            tracing::debug!(agent_id = %id, "template config, not registering as slot");
+            continue;
+        }
         if existing_ids.contains(id.as_str()) {
             tracing::debug!(agent_id = %id, "agent already registered, skipping");
             continue;

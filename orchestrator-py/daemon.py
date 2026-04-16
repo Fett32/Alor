@@ -113,13 +113,21 @@ async def memory_get(project: str) -> dict[str, Any]:
 
 
 async def agent_spawn(
-    agent: str, name: str | None = None, role: str | None = None
+    agent: str,
+    name: str | None = None,
+    role: str | None = None,
+    project: str | None = None,
+    working_dir: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"agent": agent}
     if name:
         payload["name"] = name
     if role:
         payload["role"] = role
+    if project:
+        payload["project"] = project
+    if working_dir:
+        payload["working_dir"] = working_dir
     return await _one_shot("cli.spawn", payload)
 
 

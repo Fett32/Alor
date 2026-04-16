@@ -70,9 +70,18 @@ def format_event_for_agent(evt: daemon.Event) -> str | None:
         return f"[Alor event] task {task_id} blocked by {agent}: {reason}"
     if evt.event == "user.intervention":
         agent = d.get("agent_id", "?")
+        task_ids = d.get("task_ids") or []
+        if task_ids:
+            short_ids = ", ".join(str(t)[:8] for t in task_ids)
+            return (
+                f"[Alor event] {agent} received user intervention "
+                f"on task(s) {short_ids}. Likely Fett typed directly into "
+                "the pane — task_get if you need the current state."
+            )
         return (
-            f"[Alor event] {agent} received user intervention — "
-            "a task may need attention. Consider task_get on its active task."
+            f"[Alor event] {agent} received user intervention "
+            "(no active task flagged). Likely Fett typed a question or redirect "
+            "into the pane while the agent was idle."
         )
     if evt.event == "wrapper.error":
         agent = d.get("agent_id", "?")

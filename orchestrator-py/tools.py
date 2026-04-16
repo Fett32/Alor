@@ -126,11 +126,21 @@ async def agent_ensure_running(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "agent_spawn",
-    "Spawn a new agent instance from a base config. Use `agent` = base "
-    "config name (e.g. 'claude-alor'), `name` = unique instance id (e.g. "
-    "'claude-alor-2') when you need a sibling slot for parallel work. "
-    "Fails if the instance name is already registered and running.",
-    {"agent": str, "name": str, "role": str},
+    "Spawn a new agent instance from a base config or template. "
+    "`agent` = base config name (e.g. 'claude-alor' for a fixed slot, or "
+    "'claude' for the generic template). `name` = instance id; omit when "
+    "spawning from a template and you also pass `project` — the daemon "
+    "will auto-derive '{agent}-{project}' (e.g. 'claude-mandaspace'). "
+    "Pass `project` + `working_dir` to parameterize a template for a "
+    "specific project (working_dir may include ~). Fails if the instance "
+    "id is already registered and running.",
+    {
+        "agent": str,
+        "name": str,
+        "role": str,
+        "project": str,
+        "working_dir": str,
+    },
 )
 async def agent_spawn(args: dict[str, Any]) -> dict[str, Any]:
     try:
@@ -139,6 +149,8 @@ async def agent_spawn(args: dict[str, Any]) -> dict[str, Any]:
                 agent=args["agent"],
                 name=args.get("name") or None,
                 role=args.get("role") or None,
+                project=args.get("project") or None,
+                working_dir=args.get("working_dir") or None,
             )
         )
     except Exception as e:

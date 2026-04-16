@@ -216,6 +216,14 @@ pub struct CliSpawn {
     pub name: Option<String>,
     pub agent: String,
     pub role: Option<String>,
+    /// Runtime project override (wins over the yaml config's project).
+    /// Used when spawning an instance from a template.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Runtime working-dir override (wins over the yaml config's working_dir).
+    /// Used when spawning an instance from a template.
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

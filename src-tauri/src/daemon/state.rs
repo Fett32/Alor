@@ -204,6 +204,16 @@ pub struct Agent {
     /// Bounded deque of recent task ids this agent handled (most recent first).
     #[serde(default)]
     pub task_history: VecDeque<Uuid>,
+    /// Working directory for this instance.  Set at spawn time from either
+    /// the yaml config or a runtime override; persisted so the daemon can
+    /// respawn template-based instances after restart.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// For instances spawned from a template: the template's yaml id
+    /// (e.g. "claude" for a claude-mandaspace instance).  None for fixed
+    /// yaml-declared slots.
+    #[serde(default)]
+    pub template: Option<String>,
 }
 
 fn default_tier() -> String {
@@ -229,6 +239,8 @@ impl Agent {
             tier: default_tier(),
             max_concurrent: default_max_concurrent(),
             task_history: VecDeque::new(),
+            working_dir: None,
+            template: None,
         }
     }
 
@@ -521,14 +533,19 @@ impl AppState {
             .count()
     }
 
-    /// Update metadata fields on an existing agent (project, tier, max_concurrent).
-    /// Used to propagate AgentConfig values to spawned instances.
+    /// Update metadata fields on an existing agent (project, tier, max_concurrent,
+    /// working_dir, template).  Used to propagate AgentConfig values and any
+    /// runtime overrides to spawned instances.  `None` leaves a field unchanged;
+    /// `Some(None)` is not expressible here — call set_agent_metadata_clear_* if
+    /// you need to wipe a field.
     pub fn set_agent_metadata(
         &self,
         agent_id: &str,
         project: Option<String>,
         tier: Option<String>,
         max_concurrent: Option<u8>,
+        working_dir: Option<String>,
+        template: Option<String>,
     ) {
         let mut s = self.inner.lock();
         if let Some(agent) = s.agents.get_mut(agent_id) {
@@ -541,6 +558,12 @@ impl AppState {
             if let Some(m) = max_concurrent {
                 agent.max_concurrent = m;
             }
+            if let Some(wd) = working_dir {
+                agent.working_dir = Some(wd);
+            }
+            if let Some(tmpl) = template {
+                agent.template = Some(tmpl);
+            }
         }
         drop(s);
         self.save();
@@ -548,10 +571,12 @@ impl AppState {
     }
 
     /// Mark any Running/Accepted task assigned to `agent_id` as user-intervened.
-    pub fn record_user_intervention(&self, agent_id: &str) {
+    /// Returns the task_ids that were flagged so callers can include them in
+    /// event payloads.
+    pub fn record_user_intervention(&self, agent_id: &str) -> Vec<Uuid> {
         let mut s = self.inner.lock();
         let now = Utc::now();
-        let mut changed = false;
+        let mut affected = Vec::new();
         for task in s.tasks.values_mut() {
             if task.assigned_to.as_deref() == Some(agent_id)
                 && matches!(task.state, TaskState::Accepted)
@@ -559,7 +584,7 @@ impl AppState {
                 task.user_intervened = true;
                 task.user_intervened_at = Some(now);
                 task.updated_at = now;
-                changed = true;
+                affected.push(task.id);
                 tracing::info!(
                     task_id = %task.id,
                     agent_id,
@@ -568,10 +593,11 @@ impl AppState {
             }
         }
         drop(s);
-        if changed {
+        if !affected.is_empty() {
             self.save();
             self.emit_event("tasks-changed");
         }
+        affected
     }
 
     // --- agents --------------------------------------------------------------
