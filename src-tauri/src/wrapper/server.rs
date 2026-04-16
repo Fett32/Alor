@@ -14,12 +14,12 @@ use crate::daemon::project;
 use crate::daemon::state::{AppState, Task, TaskState};
 use crate::terminal::pane_manager::PaneManager;
 use crate::wrapper::protocol::{
-    CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliKill, CliMemoryGet, CliProjectGet,
-    CliProjectSave, CliSpawn, CliTaskCancel, CliTaskCreate,
+    CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliDelete, CliKill, CliMemoryGet,
+    CliProjectGet, CliProjectSave, CliSpawn, CliTaskCancel, CliTaskCreate,
     CliTaskComplete as CliTaskCompletePayload, CliTaskGet, Envelope, TaskAccept, TaskAssign,
     TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WrapperError, WrapperRegister,
-    MSG_CLI_AGENT_ENSURE_RUNNING, MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_ERROR,
-    MSG_CLI_EVENT_STREAM, MSG_CLI_KILL, MSG_CLI_MEMORY_GET, MSG_CLI_PROJECT_GET,
+    MSG_CLI_AGENT_ENSURE_RUNNING, MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_DELETE,
+    MSG_CLI_ERROR, MSG_CLI_EVENT_STREAM, MSG_CLI_KILL, MSG_CLI_MEMORY_GET, MSG_CLI_PROJECT_GET,
     MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE, MSG_CLI_RESPONSE, MSG_CLI_SPAWN, MSG_CLI_STATUS,
     MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE, MSG_CLI_TASK_CREATE, MSG_CLI_TASK_GET,
     MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER, MSG_CLI_INTEGRATIONS_GET,
@@ -44,7 +44,11 @@ pub const DAEMON_SOCKET: &str = "/tmp/alor/daemon.sock";
 /// A connected wrapper's write half, keyed by agent_id.
 type WriterMap = Arc<Mutex<HashMap<String, tokio::net::unix::OwnedWriteHalf>>>;
 type ChildMap = Arc<Mutex<HashMap<String, std::process::Child>>>;
-type EventSubscribers = Arc<Mutex<HashMap<u64, tokio::net::unix::OwnedWriteHalf>>>;
+/// Each subscriber's writer lives behind its own mutex so broadcast_event
+/// can snapshot handles under the outer lock, drop it, then write per-sub
+/// without stalling every subscriber on one slow client.
+type EventSubscribers =
+    Arc<Mutex<HashMap<u64, Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>>>>;
 
 /// Shared state for the socket server.
 #[derive(Clone)]
@@ -137,7 +141,7 @@ impl SocketServer {
                 let sub_id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
                 {
                     let mut subs = self.event_subscribers.lock().await;
-                    subs.insert(sub_id, write_half);
+                    subs.insert(sub_id, Arc::new(Mutex::new(write_half)));
                 }
                 info!(sub_id, "cli event stream subscriber connected");
 
@@ -421,6 +425,14 @@ impl SocketServer {
             MSG_ERROR => {
                 if let Ok(payload) = env.decode_payload::<WrapperError>() {
                     error!(agent_id, message = %payload.message, "wrapper error");
+                    self.broadcast_event(
+                        "wrapper.error",
+                        json!({
+                            "agent_id": agent_id,
+                            "message": payload.message,
+                        }),
+                    )
+                    .await;
                 }
             }
 
@@ -730,6 +742,68 @@ impl SocketServer {
             MSG_CLI_SPAWN => {
                 match env.decode_payload::<CliSpawn>() {
                     Ok(payload) => self.handle_spawn(correlation_id, payload).await,
+                    Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),
+                }
+            }
+
+            MSG_CLI_DELETE => {
+                match env.decode_payload::<CliDelete>() {
+                    Ok(payload) => {
+                        // Refuse to delete a template or fixed-slot yaml id —
+                        // only template-spawned instances are tombstone-safe.
+                        let is_yaml_slot = self
+                            .agent_configs
+                            .iter()
+                            .any(|(id, _)| id == &payload.instance);
+                        if is_yaml_slot {
+                            return cli_error(
+                                correlation_id,
+                                &format!(
+                                    "refusing to delete '{}': core yaml slot. Kill it instead.",
+                                    payload.instance
+                                ),
+                            );
+                        }
+
+                        // Make sure any running process/session is gone first —
+                        // delete implies kill, so don't leave an orphan.
+                        {
+                            let mut spawned = self.spawned.lock().await;
+                            if let Some(mut child) = spawned.remove(&payload.instance) {
+                                let _ = child.kill();
+                            }
+                        }
+                        let tmux_session = format!("alor-{}", payload.instance);
+                        let _ = std::process::Command::new("tmux")
+                            .args(["kill-session", "-t", &tmux_session])
+                            .output();
+
+                        let removed = self.app_state.remove_agent(&payload.instance);
+                        if !removed {
+                            return cli_error(
+                                correlation_id,
+                                &format!("agent '{}' not found in state", payload.instance),
+                            );
+                        }
+
+                        info!(instance = %payload.instance, "agent tombstoned via CLI");
+                        self.broadcast_event(
+                            "agent.deleted",
+                            json!({"instance": &payload.instance}),
+                        )
+                        .await;
+
+                        match Envelope::new(
+                            MSG_CLI_RESPONSE,
+                            json!({"deleted": payload.instance}),
+                        ) {
+                            Ok(mut e) => {
+                                e.correlation_id = correlation_id;
+                                e
+                            }
+                            Err(_) => cli_error(correlation_id, "failed to build response"),
+                        }
+                    }
                     Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),
                 }
             }
@@ -1426,17 +1500,27 @@ impl SocketServer {
             Err(_) => return,
         };
         line.push('\n');
-        let bytes = line.as_bytes();
+        let bytes: Arc<[u8]> = Arc::from(line.into_bytes());
 
-        let mut subs = self.event_subscribers.lock().await;
+        // Snapshot subscriber handles under the outer lock, then release it
+        // so a single stuck subscriber can't stall other broadcasts.
+        let handles: Vec<(u64, Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>)> = {
+            let subs = self.event_subscribers.lock().await;
+            subs.iter().map(|(id, w)| (*id, w.clone())).collect()
+        };
+
         let mut dead = Vec::new();
-        for (id, writer) in subs.iter_mut() {
-            if writer.write_all(bytes).await.is_err() || writer.flush().await.is_err() {
-                dead.push(*id);
+        for (id, writer) in handles {
+            let mut w = writer.lock().await;
+            if w.write_all(&bytes).await.is_err() || w.flush().await.is_err() {
+                dead.push(id);
             }
         }
-        for id in dead {
-            subs.remove(&id);
+        if !dead.is_empty() {
+            let mut subs = self.event_subscribers.lock().await;
+            for id in dead {
+                subs.remove(&id);
+            }
         }
     }
 

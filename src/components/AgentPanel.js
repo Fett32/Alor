@@ -271,6 +271,25 @@ function buildAgentItem(agent) {
     item.appendChild(btnKill);
   }
 
+  // Add "Delete" button for template-spawned instances only.
+  // Core yaml slots (claude, claude-alor, codex, cursor, etc.) get Kill only —
+  // they're the permanent roster. Template instances (claude-mandaspace, etc.)
+  // get Kill + Delete so Fett can tombstone a stale row.
+  if (agent.template) {
+    const btnDelete = document.createElement("button");
+    btnDelete.className = "agent-delete-cta";
+    btnDelete.textContent = "Delete";
+    btnDelete.title = `Permanently remove ${agent.id} from state`;
+    btnDelete.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (confirm(`Permanently delete ${agent.id}? This tombstones the row.`)) {
+        invoke("delete_agent", { id: agent.id })
+          .catch(err => alert(`Failed to delete agent: ${err}`));
+      }
+    });
+    item.appendChild(btnDelete);
+  }
+
   item.addEventListener("click", () => selectAgent(agent.id));
 
   return item;

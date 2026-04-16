@@ -35,7 +35,6 @@ def load_system_prompt() -> str:
 def print_event(evt: daemon.Event) -> None:
     ts = evt.timestamp or ""
     print(f"\r{C_DIM}[event {ts} {evt.event}] {evt.data}{C_RESET}")
-    print(f"{C_CYAN}orch>{C_RESET} ", end="", flush=True)
 
 
 # Events that should wake the orch agent (push into SDK context) rather than
@@ -106,6 +105,7 @@ async def event_watcher(
             print_event(evt)
             injected = format_event_for_agent(evt)
             if injected is None:
+                print(f"{C_CYAN}orch>{C_RESET} ", end="", flush=True)
                 continue
             try:
                 async with client_lock:

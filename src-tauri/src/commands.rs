@@ -228,6 +228,48 @@ pub async fn kill_agent(
     Ok(())
 }
 
+/// Permanently delete a template-spawned agent instance from state.
+/// Kills any running process/session first, then tombstones the row.
+/// Refuses to delete core yaml slots — kill those instead.
+#[tauri::command]
+pub async fn delete_agent(
+    state: State<'_, AppState>,
+    pm: State<'_, PaneManager>,
+    server: State<'_, SocketServer>,
+    id: String,
+) -> Result<(), String> {
+    // Guard: only template-derived instances are tombstone-safe.
+    match state.get_agent(&id) {
+        Some(agent) if agent.template.is_none() => {
+            return Err(format!(
+                "refusing to delete '{id}': not a template instance. Kill it instead."
+            ));
+        }
+        None => return Err(format!("agent '{id}' not found")),
+        _ => {}
+    }
+
+    // Graceful shutdown first (best-effort, same as kill_agent).
+    if server.is_connected(&id).await {
+        let env = Envelope::new(MSG_SHUTDOWN, &DaemonShutdown {}).map_err(err)?;
+        let _ = server.send_to(&id, &env).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Kill tmux session.
+    let session = format!("alor-{}", id);
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &session])
+        .output();
+
+    // Tombstone the row.
+    state.remove_agent(&id);
+
+    // Drop the pane from alor-main if we had one.
+    let _ = pm.remove_agent_pane(&id).await;
+    Ok(())
+}
+
 /// Kill all running agents and their tmux sessions.
 #[tauri::command]
 pub async fn kill_all_agents(

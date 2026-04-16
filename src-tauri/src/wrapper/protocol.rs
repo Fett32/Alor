@@ -35,6 +35,7 @@ pub const MSG_CLI_TASK_COMPLETE: &str = "cli.task.complete";
 pub const MSG_CLI_ASSIGN: &str = "cli.assign";
 pub const MSG_CLI_SPAWN: &str = "cli.spawn";
 pub const MSG_CLI_KILL: &str = "cli.kill";
+pub const MSG_CLI_DELETE: &str = "cli.delete";
 pub const MSG_CLI_EVENT_STREAM: &str = "cli.event.stream";
 pub const MSG_CLI_PROJECT_LIST: &str = "cli.project.list";
 pub const MSG_CLI_PROJECT_GET: &str = "cli.project.get";
@@ -228,6 +229,14 @@ pub struct CliSpawn {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliKill {
+    pub instance: String,
+}
+
+/// Permanent tombstone — removes the agent row from state.json.
+/// Intended for template-spawned instances only; core yaml slots should
+/// be killed (disconnect) rather than deleted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliDelete {
     pub instance: String,
 }
 

@@ -256,6 +256,7 @@ pub fn run() {
             commands::approve_task,
             commands::spawn_agent,
             commands::kill_agent,
+            commands::delete_agent,
             commands::kill_all_agents,
             commands::get_agents,
             commands::register_agent,

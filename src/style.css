@@ -277,6 +277,27 @@ html, body {
   border-color: #d06060;
 }
 
+.agent-delete-cta {
+  margin-left: 4px;
+  background: rgba(120, 120, 120, 0.1);
+  border: 1px solid rgba(120, 120, 120, 0.3);
+  color: #888;
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  transition: all 0.15s;
+}
+
+.agent-delete-cta:hover {
+  background: #555;
+  color: #fff;
+  border-color: #555;
+}
+
 .agent-empty {
   padding: 12px 14px;
   font-size: 11px;

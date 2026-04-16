@@ -146,7 +146,10 @@ async def stdin_loop(
 ) -> None:
     """Let Fett type follow-ups into the worker's tmux pane."""
     while not stop.is_set():
-        print(f"{C_CYAN}{agent_id}>{C_RESET} ", end="", flush=True)
+        # Don't reprint the prompt while a task is using the SDK client —
+        # it just adds noise under the streaming task output.
+        if not client_lock.locked():
+            print(f"{C_CYAN}{agent_id}>{C_RESET} ", end="", flush=True)
         line = await read_line()
         if line is None:
             stop.set()

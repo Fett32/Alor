@@ -623,6 +623,22 @@ impl AppState {
         self.inner.lock().agents.get(id).cloned()
     }
 
+    /// Permanently remove an agent row from state. Used for tombstoning
+    /// template-spawned instances (claude-mandaspace, etc.) — core yaml
+    /// slots should be killed (disconnect) rather than deleted.
+    /// Returns true if the agent existed and was removed.
+    pub fn remove_agent(&self, id: &str) -> bool {
+        let removed = {
+            let mut s = self.inner.lock();
+            s.agents.remove(id).is_some()
+        };
+        if removed {
+            self.save();
+            self.emit_event("agents-changed");
+        }
+        removed
+    }
+
     pub fn clear_all_agents(&self) {
         let mut s = self.inner.lock();
         for agent in s.agents.values_mut() {
