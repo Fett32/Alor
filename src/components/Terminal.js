@@ -120,14 +120,17 @@ function createTerminal() {
   let mouseHeld = false;
   let resizePending = false;
 
-  window.addEventListener("mousedown", () => { mouseHeld = true; });
+  // Capture phase so we win the race against our own mouse-forwarder
+  // below, which stops propagation to xterm.js (and would otherwise skip
+  // these bubble-phase window listeners too).
+  window.addEventListener("mousedown", () => { mouseHeld = true; }, { capture: true });
   window.addEventListener("mouseup", () => {
     mouseHeld = false;
     if (resizePending) {
       resizePending = false;
       fitAndReport();
     }
-  });
+  }, { capture: true });
 
   term.open($container);
   // First layout pass: flex/grid may not have final sizes yet; fit twice on rAF.
@@ -197,6 +200,87 @@ function createTerminal() {
   }, { capture: true });
 
   // -----------------------------------------------------------------------
+  // Helper: convert a mouse event's pixel coords to a 1-based tmux cell
+  // column and row.  Shared by the wheel and click forwarders.
+  // -----------------------------------------------------------------------
+  function cellFromEvent(e) {
+    const rect = $container.getBoundingClientRect();
+    const cols = term.cols || 80;
+    const rows = term.rows || 24;
+    const cellW = rect.width / cols;
+    const cellH = rect.height / rows;
+    const col = Math.max(1, Math.min(cols, Math.floor((e.clientX - rect.left) / cellW) + 1));
+    const row = Math.max(1, Math.min(rows, Math.floor((e.clientY - rect.top) / cellH) + 1));
+    return { col, row };
+  }
+
+  // -----------------------------------------------------------------------
+  // Left/right click forwarding -> tmux SGR mouse escape.
+  // Same rationale as the wheel handler: xterm.js isn't reliably enabling
+  // mouse tracking, so clicks never reach tmux and `select-pane -t =`
+  // never fires.  Without that, clicking another pane doesn't focus it
+  // for typing.  We synthesise button press (M) + release (m) events in
+  // SGR mouse mode 1006 so tmux can route them properly.
+  //
+  // Middle-click (button 1) is handled separately above — it reads X11
+  // PRIMARY and pastes, we do NOT want it to also forward as a tmux
+  // select-pane.
+  // -----------------------------------------------------------------------
+  // Track the currently-held button so mousemove can forward drag events
+  // in SGR motion form (base button + 32). Only one button tracked at a
+  // time; tmux doesn't need chord drags.
+  let heldButton = -1;
+  let lastCol = 0;
+  let lastRow = 0;
+
+  $container.addEventListener("mousedown", (e) => {
+    if (e.button === 1) return; // handled by middle-click paste
+    if (!term) return;
+    const { col, row } = cellFromEvent(e);
+    const button = e.button === 2 ? 2 : 0; // 0 = left, 2 = right
+    heldButton = button;
+    lastCol = col;
+    lastRow = row;
+    const seq = `\x1b[<${button};${col};${row}M`;
+    invoke("terminal_send_keys", { keys: seq }).catch(() => {});
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, { capture: true });
+
+  $container.addEventListener("mousemove", (e) => {
+    if (heldButton < 0) return;
+    if (!term) return;
+    const { col, row } = cellFromEvent(e);
+    if (col === lastCol && row === lastRow) return; // still in same cell
+    lastCol = col;
+    lastRow = row;
+    // SGR motion: base button + 32 mask.
+    const seq = `\x1b[<${heldButton + 32};${col};${row}M`;
+    invoke("terminal_send_keys", { keys: seq }).catch(() => {});
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, { capture: true });
+
+  // mouseup fires on window (not just container) in case the user drags
+  // outside and releases there — otherwise the button looks stuck held.
+  window.addEventListener("mouseup", (e) => {
+    if (e.button === 1) return;
+    if (!term) return;
+    if (heldButton < 0) return;
+    const { col, row } = cellFromEvent(e);
+    const button = heldButton;
+    heldButton = -1;
+    const seq = `\x1b[<${button};${col};${row}m`;
+    invoke("terminal_send_keys", { keys: seq }).catch(() => {});
+  }, { capture: true });
+
+  // Suppress the browser's default right-click context menu; tmux has
+  // its own MouseDown3Pane menu that we want to show instead.
+  $container.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+  });
+
+  // -----------------------------------------------------------------------
   // Wheel events -> tmux SGR mouse escape.
   // xterm.js by default scrolls its own internal buffer on wheel. With
   // multiple tmux panes rendered inside one xterm, that shows historical
@@ -211,13 +295,7 @@ function createTerminal() {
   // -----------------------------------------------------------------------
   $container.addEventListener("wheel", (e) => {
     if (!term) return;
-    const rect = $container.getBoundingClientRect();
-    const cols = term.cols || 80;
-    const rows = term.rows || 24;
-    const cellW = rect.width / cols;
-    const cellH = rect.height / rows;
-    const col = Math.max(1, Math.min(cols, Math.floor((e.clientX - rect.left) / cellW) + 1));
-    const row = Math.max(1, Math.min(rows, Math.floor((e.clientY - rect.top) / cellH) + 1));
+    const { col, row } = cellFromEvent(e);
     // SGR mouse mode 1006: CSI < button ; col ; row M (press) or m (release).
     // Wheel up = button 64, wheel down = 65. Scroll events only have press.
     const button = e.deltaY < 0 ? 64 : 65;
