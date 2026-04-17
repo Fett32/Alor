@@ -161,17 +161,6 @@ function createTerminal() {
       return false;
     }
 
-    // Ctrl+Shift+L → reset manual-layout lock so rebalance_layout re-engages
-    // the next time an agent is added or removed. After a user drag-resizes
-    // a pane border, the backend auto-locks the layout; this is the escape
-    // hatch back to automatic tiling.
-    if (event.ctrlKey && event.shiftKey && event.code === "KeyL") {
-      invoke("pane_set_layout_mode", { manual: false }).catch((err) => {
-        console.warn("[Terminal] pane_set_layout_mode failed:", err);
-      });
-      return false;
-    }
-
     return true;
   });
 

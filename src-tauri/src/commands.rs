@@ -449,22 +449,11 @@ pub async fn pane_list(
     Ok(pm.visible_agents().await)
 }
 
-/// Flip pane layout between automatic rebalancing and manual (user-controlled).
-/// In manual mode, `rebalance_layout` is a no-op so drag-resized borders
-/// survive pane add/remove. Returns the new state for optimistic UI updates.
+/// Force a re-tile of alor-main panes right now. Useful when the layout has
+/// drifted from a manual drag, an add/remove didn't fire recently, or the
+/// user just wants things evened out.
 #[tauri::command]
-pub async fn pane_set_layout_mode(
-    pm: State<'_, PaneManager>,
-    manual: bool,
-) -> Result<bool, String> {
-    pm.set_manual_layout(manual);
-    Ok(pm.is_manual_layout())
-}
-
-/// Query current layout mode (manual vs automatic).
-#[tauri::command]
-pub async fn pane_get_layout_mode(
-    pm: State<'_, PaneManager>,
-) -> Result<bool, String> {
-    Ok(pm.is_manual_layout())
+pub async fn pane_rebalance(pm: State<'_, PaneManager>) -> Result<(), String> {
+    pm.rebalance().await;
+    Ok(())
 }

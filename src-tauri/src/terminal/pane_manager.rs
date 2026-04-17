@@ -12,7 +12,6 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -53,12 +52,8 @@ struct PaneInfo {
 
 #[derive(Default, Clone)]
 pub struct PaneManager {
-    /// Maps agent_id → pane info
+    /// Maps agent_id to pane info
     panes: Arc<Mutex<HashMap<String, PaneInfo>>>,
-    /// When true, skip auto-rebalance so user drag-resize survives
-    /// subsequent add/remove. Flipped by a Tauri command or implicitly
-    /// once the user adjusts a border.
-    manual_layout: Arc<AtomicBool>,
 }
 
 impl PaneManager {
@@ -66,19 +61,14 @@ impl PaneManager {
         Self::default()
     }
 
-    /// Turn manual layout mode on/off. While on, `rebalance_layout` is a no-op
-    /// so dragging tmux pane borders isn't undone by the next add/remove.
-    pub fn set_manual_layout(&self, manual: bool) {
-        self.manual_layout.store(manual, Ordering::SeqCst);
-        tracing::info!(manual, "pane layout mode updated");
+    /// Public wrapper around the internal `rebalance_layout` so the UI can
+    /// force a reflow on demand (e.g. after a manual drag leaves things
+    /// proportioned wrong, or when add/remove hasn't fired recently).
+    pub async fn rebalance(&self) {
+        self.rebalance_layout().await;
     }
 
-    /// Current manual-layout state. Exposed for the frontend toggle.
-    pub fn is_manual_layout(&self) -> bool {
-        self.manual_layout.load(Ordering::SeqCst)
-    }
-
-    /// Push the tmux options that govern mouse → selection/paste behaviour.
+    /// Push the tmux options that govern mouse to selection/paste behaviour.
     /// Called on session create and also when reusing a session — the options
     /// are scoped to the session so they don't leak into the user's own tmux.
     async fn apply_tmux_mouse_config(&self) {
@@ -131,80 +121,10 @@ impl PaneManager {
             .output()
             .await;
 
-        // --------------------------------------------------------------
-        // Auto-lock layout on first user pane-border drag.
-        //
-        // Problem: after the user drags a pane border with the mouse, the
-        // next add/remove calls rebalance_layout() which stomps their
-        // geometry via `select-layout`. We want their drag to stick.
-        //
-        // Trick: tmux's `after-resize-pane` hook fires when the user
-        // drags a border (mouse binding uses `resize-pane -M`), but NOT
-        // when we apply a named layout via `select-layout -E`. So we can
-        // use the hook as a "user touched it" signal. The hook sets a
-        // session-scoped user option `@alor-user-resized=1`, which
-        // rebalance_layout() checks and promotes to the in-memory
-        // `manual_layout` flag.
-        // --------------------------------------------------------------
-
-        // Start clean each boot — a fresh alor-main should reflow once
-        // before locking. For a reused session this also gives us a
-        // known starting state.
-        let _ = Command::new("tmux")
-            .args([
-                "set-option", "-t", MAIN_SESSION,
-                "@alor-user-resized", "0",
-            ])
-            .output()
-            .await;
-
-        // Hook: user drag → flip the marker. `set-option -t` with a
-        // bare session name targets the session object, so the value
-        // persists across layout changes within the session.
-        let _ = Command::new("tmux")
-            .args([
-                "set-hook", "-t", MAIN_SESSION,
-                "after-resize-pane",
-                &format!("set-option -t {MAIN_SESSION} @alor-user-resized 1"),
-            ])
-            .output()
-            .await;
-
         // NOTE: middle-click paste is handled in the frontend (it intercepts
         // the button-1 mousedown before xterm.js forwards it to tmux, reads
         // X11 PRIMARY, and writes back to the PTY). This keeps the paste
         // source under our control and works identically on X11 and Wayland.
-    }
-
-    /// Read the `@alor-user-resized` session option. Returns true iff the
-    /// tmux hook above has fired since we last cleared it.
-    async fn user_resized_marker(&self) -> bool {
-        let out = Command::new("tmux")
-            .args([
-                "show-option", "-v", "-t", MAIN_SESSION,
-                "@alor-user-resized",
-            ])
-            .output()
-            .await;
-        match out {
-            Ok(o) if o.status.success() => {
-                String::from_utf8_lossy(&o.stdout).trim() == "1"
-            }
-            _ => false,
-        }
-    }
-
-    /// Clear the `@alor-user-resized` marker so the next rebalance will
-    /// proceed. Used by the frontend "reset layout" shortcut after the
-    /// caller flips `manual_layout` back off.
-    async fn clear_user_resized_marker(&self) {
-        let _ = Command::new("tmux")
-            .args([
-                "set-option", "-t", MAIN_SESSION,
-                "@alor-user-resized", "0",
-            ])
-            .output()
-            .await;
     }
 
     /// Ensure alor-main exists. Creates it if needed.
@@ -511,26 +431,7 @@ impl PaneManager {
     /// then switches to even-vertical within the right column so all pane
     /// borders remain draggable. Named layouts lock borders; the even-*
     /// re-layout converts it to a custom geometry that tmux lets you drag.
-    ///
-    /// No-op in manual-layout mode: the user has drag-resized borders and
-    /// doesn't want us to stomp their geometry on the next add/remove.
     async fn rebalance_layout(&self) {
-        if self.manual_layout.load(Ordering::SeqCst) {
-            tracing::debug!("skipping rebalance_layout: manual mode");
-            return;
-        }
-
-        // Promote the tmux `after-resize-pane` marker to in-memory state:
-        // if the user has dragged a border since we last laid out, lock.
-        // Clear the marker immediately so programmatic resizes below don't
-        // re-trip it (select-layout fires after-resize-pane for each pane).
-        if self.user_resized_marker().await {
-            tracing::info!("user drag-resize detected, auto-locking layout");
-            self.manual_layout.store(true, Ordering::SeqCst);
-            self.clear_user_resized_marker().await;
-            return;
-        }
-
         // Step 1: main-vertical sets the overall shape.
         let _ = Command::new("tmux")
             .args(["select-layout", "-t", MAIN_SESSION, "main-vertical"])
@@ -546,10 +447,6 @@ impl PaneManager {
             .args(["select-layout", "-t", MAIN_SESSION, "-E"])
             .output()
             .await;
-
-        // Our own select-layout calls fire after-resize-pane too; clear the
-        // marker so the next rebalance doesn't mistake it for a user drag.
-        self.clear_user_resized_marker().await;
     }
 
     /// Count current panes in alor-main.

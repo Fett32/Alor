@@ -60,6 +60,20 @@ async function init() {
       }
     });
   }
+
+  // Balance button — force a pane re-tile in alor-main.
+  const $btnBalance = document.getElementById("btn-balance");
+  if ($btnBalance) {
+    $btnBalance.addEventListener("click", async () => {
+      try {
+        await invoke("pane_rebalance");
+        console.log("[main] pane_rebalance successful");
+      } catch (err) {
+        console.error("[main] pane_rebalance failed:", err);
+        alert(`Failed to rebalance: ${err}`);
+      }
+    });
+  }
 }
 
 if (document.readyState === "loading") {

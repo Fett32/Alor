@@ -273,8 +273,7 @@ pub fn run() {
             commands::pane_show,
             commands::pane_hide,
             commands::pane_list,
-            commands::pane_set_layout_mode,
-            commands::pane_get_layout_mode,
+            commands::pane_rebalance,
         ])
         .run(tauri::generate_context!())
         .expect("error running alor");

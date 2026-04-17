@@ -94,11 +94,9 @@ html, body {
   font-family: var(--font-mono);
 }
 
+.btn-header,
 .btn-header-danger {
   margin-left: 16px;
-  background: rgba(208, 96, 96, 0.1);
-  border: 1px solid rgba(208, 96, 96, 0.3);
-  color: #d06060;
   border-radius: var(--radius-sm);
   padding: 4px 12px;
   font-size: 10px;
@@ -107,6 +105,24 @@ html, body {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   transition: all 0.15s;
+}
+
+.btn-header {
+  background: rgba(124, 111, 247, 0.1);
+  border: 1px solid rgba(124, 111, 247, 0.3);
+  color: #7c6ff7;
+}
+
+.btn-header:hover {
+  background: #7c6ff7;
+  color: #fff;
+  border-color: #7c6ff7;
+}
+
+.btn-header-danger {
+  background: rgba(208, 96, 96, 0.1);
+  border: 1px solid rgba(208, 96, 96, 0.3);
+  color: #d06060;
 }
 
 .btn-header-danger:hover {
