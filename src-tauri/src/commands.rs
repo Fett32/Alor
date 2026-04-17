@@ -396,65 +396,60 @@ pub async fn terminal_paste_primary(
 #[tauri::command]
 pub async fn terminal_set_primary(text: String) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
-    use tokio::process::Command;
 
     if text.is_empty() {
         return Ok(());
     }
 
-    // Try xclip first.
-    if let Ok(mut child) = Command::new("xclip")
-        .args(["-i", "-selection", "primary"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes()).await;
-            drop(stdin);
-            let _ = child.wait().await;
-            return Ok(());
+    // Write to BOTH X11 PRIMARY and Wayland primary selection. On Sway
+    // these are separate surfaces: XWayland apps read xclip's selection,
+    // native Wayland apps read wl-copy's. Populate both so middle-click
+    // works regardless of which kind of window the user is pasting into.
+    async fn pipe(cmd: &str, args: &[&str], text: &str) {
+        use tokio::process::Command as TokioCommand;
+        if let Ok(mut child) = TokioCommand::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes()).await;
+                drop(stdin);
+                let _ = child.wait().await;
+            }
         }
     }
 
-    // Fall back to wl-copy --primary.
-    if let Ok(mut child) = Command::new("wl-copy")
-        .args(["--primary"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes()).await;
-            drop(stdin);
-            let _ = child.wait().await;
-        }
-    }
+    pipe("xclip", &["-i", "-selection", "primary"], &text).await;
+    pipe("wl-copy", &["--primary"], &text).await;
 
     Ok(())
 }
 
-/// Try xclip first (works on X11 and XWayland), then wl-paste (pure Wayland).
-/// Returns an empty string on any failure — paste is best-effort.
+/// Read the PRIMARY selection from whichever of wl-paste or xclip has
+/// content. Wayland first because Sway keeps X11 and Wayland primary
+/// separate; a selection made in a native Wayland app only lives in
+/// the Wayland side. Falls through to xclip for XWayland-sourced text.
+/// Returns an empty string if both are empty or both fail.
 async fn read_primary_selection() -> String {
     use tokio::process::Command;
-
-    // xclip -selection primary -o
-    if let Ok(out) = Command::new("xclip")
-        .args(["-selection", "primary", "-o"])
-        .output()
-        .await
-    {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).into_owned();
-        }
-    }
 
     // wl-paste --primary --no-newline
     if let Ok(out) = Command::new("wl-paste")
         .args(["--primary", "--no-newline"])
+        .output()
+        .await
+    {
+        if out.status.success() && !out.stdout.is_empty() {
+            return String::from_utf8_lossy(&out.stdout).into_owned();
+        }
+    }
+
+    // xclip -selection primary -o
+    if let Ok(out) = Command::new("xclip")
+        .args(["-selection", "primary", "-o"])
         .output()
         .await
     {
