@@ -81,16 +81,22 @@ pub fn send_keys(name: &str, text: &str) -> Result<()> {
 
 /// Apply Alor's default session options (mouse, scrollback, paste detection).
 /// Called on session creation and also when reusing a pre-existing session.
+///
+/// set-option does NOT accept the `=name` exact-match sigil (tmux 3.4
+/// returns "no such session" on that form) — so this uses the bare name.
+/// Collision with another `alor-*` prefix would be a problem, but we
+/// block same-name duplicates at spawn time via the handle_spawn
+/// collision guard, so in practice the bare name lands on the right
+/// session.
 pub fn ensure_session_defaults(name: &str) {
-    let t = session_target(name);
     let _ = Command::new("tmux")
-        .args(["set-option", "-t", &t, "mouse", "on"])
+        .args(["set-option", "-t", name, "mouse", "on"])
         .output();
     let _ = Command::new("tmux")
-        .args(["set-option", "-t", &t, "history-limit", "50000"])
+        .args(["set-option", "-t", name, "history-limit", "50000"])
         .output();
     let _ = Command::new("tmux")
-        .args(["set-option", "-t", &t, "assume-paste-time", "0"])
+        .args(["set-option", "-t", name, "assume-paste-time", "0"])
         .output();
 }
 

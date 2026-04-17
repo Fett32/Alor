@@ -1227,6 +1227,42 @@ impl SocketServer {
                                 &format!("no tmux session for agent {}", payload.agent_id),
                             );
                         }
+                        // Runtime-type gate. BEGIN/END framing is only
+                        // safe for `claude-sdk` workers whose stdin loop
+                        // implements the sentinel state machine
+                        // (orchestrator-py/worker.py). For any other
+                        // runtime (wrapper, future codex/gemini) the
+                        // sentinel bytes would land verbatim in the
+                        // CLI's pty — visible garbage to the user plus
+                        // a wedged send from the orch's POV (no
+                        // `worker.orch_response` will ever echo back).
+                        //
+                        // Fail-closed: unknown/unresolvable agents are
+                        // rejected rather than silently downgraded, so
+                        // a caller passing a typo'd agent_id gets a
+                        // clear error instead of a framed send to an
+                        // agent we can't prove is SDK-backed.
+                        //
+                        // Callers that genuinely want to reach a
+                        // wrapper-runtime worker must set
+                        // `suppress_echo: false` explicitly.
+                        if payload.suppress_echo
+                            && !is_framed_send_allowed(
+                                &self.agent_configs,
+                                &self.app_state,
+                                &payload.agent_id,
+                            )
+                        {
+                            return cli_error(
+                                correlation_id,
+                                &format!(
+                                    "framed send (suppress_echo=true) not supported for agent '{}': \
+                                     only claude-sdk runtime workers implement BEGIN/END framing. \
+                                     Retry with suppress_echo=false to inject raw text.",
+                                    payload.agent_id
+                                ),
+                            );
+                        }
                         // If the caller asked to suppress the stdin echo
                         // (orch → SDK-worker path), wrap the payload in
                         // BEGIN/END framing so the worker's stdin state
@@ -1673,13 +1709,19 @@ impl SocketServer {
                 // scrollback instead of the worker's real history. Wrapper-
                 // runtime agents already get this via ensure_session_defaults.
                 if config.runtime == "claude-sdk" {
+                    // set-option uses the BARE name — tmux 3.4 rejects
+                    // the `=name` exact-match sigil on set-option
+                    // specifically ("no such session"), even though it
+                    // works for has-session and kill-session. We rely on
+                    // the handle_spawn collision guard above and the
+                    // validated alphanumeric agent_id so the bare name
+                    // lands on the right session.
                     let session_name = format!("alor-{instance_id}");
-                    let target = format!("={session_name}");
                     let _ = std::process::Command::new("tmux")
-                        .args(["set-option", "-t", &target, "mouse", "on"])
+                        .args(["set-option", "-t", &session_name, "mouse", "on"])
                         .output();
                     let _ = std::process::Command::new("tmux")
-                        .args(["set-option", "-t", &target, "history-limit", "50000"])
+                        .args(["set-option", "-t", &session_name, "history-limit", "50000"])
                         .output();
                 }
 
@@ -1778,5 +1820,159 @@ fn cli_error(correlation_id: Uuid, message: &str) -> Envelope {
         kind: MSG_CLI_ERROR.to_string(),
         correlation_id,
         payload: serde_json::json!({"error": message}),
+    }
+}
+
+/// Runtime layer that hosts `claude-sdk` workers and speaks the
+/// BEGIN/END framing state machine in its stdin loop (orchestrator-py's
+/// worker.py). Any other runtime (wrapper, future codex/gemini) has a
+/// raw pty with no framing awareness — injecting sentinel-wrapped
+/// payloads would splat literal `__ALOR_ORCH_ECHO_BEGIN__<uuid>` lines
+/// into the CLI's prompt.
+const SDK_FRAMED_RUNTIME: &str = "claude-sdk";
+
+/// Resolve an agent_id to the runtime string declared in its yaml
+/// config.
+///
+/// Resolution order:
+///   1. Direct match against a loaded yaml slot (`agent_configs`).
+///   2. For template-spawned instances: follow `Agent.template` from
+///      runtime state back to the template's yaml config.
+///
+/// Returns `None` only when the agent is neither a known yaml slot nor
+/// a state-persisted instance of a known template. In that unresolved
+/// case the caller MUST treat the agent as non-SDK (fail-closed) —
+/// allowing a framed send to an unidentifiable agent would defeat the
+/// whole point of the gate.
+fn resolve_agent_runtime(
+    agent_configs: &[(String, AgentConfig)],
+    app_state: &AppState,
+    agent_id: &str,
+) -> Option<String> {
+    if let Some((_, cfg)) = agent_configs.iter().find(|(id, _)| id == agent_id) {
+        return Some(cfg.runtime.clone());
+    }
+    let agent = app_state.get_agent(agent_id)?;
+    let template_id = agent.template.as_deref()?;
+    agent_configs
+        .iter()
+        .find(|(id, _)| id == template_id)
+        .map(|(_, cfg)| cfg.runtime.clone())
+}
+
+/// Gate for `cli.agent.send_message` with `suppress_echo=true`. Only
+/// agents whose resolved runtime is `claude-sdk` may receive framed
+/// sends; everything else (wrapper, unknown) is rejected so sentinel
+/// bytes never land in a non-framing pty.
+fn is_framed_send_allowed(
+    agent_configs: &[(String, AgentConfig)],
+    app_state: &AppState,
+    agent_id: &str,
+) -> bool {
+    matches!(
+        resolve_agent_runtime(agent_configs, app_state, agent_id).as_deref(),
+        Some(SDK_FRAMED_RUNTIME)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::state::Agent;
+
+    /// Build a minimal AgentConfig with just `runtime` set; every other
+    /// field defaults. Kept here rather than in config.rs because these
+    /// tests are the only thing that need a programmatically-built
+    /// config (production code deserializes from yaml).
+    fn cfg(runtime: &str) -> AgentConfig {
+        // Round-trip through yaml — simpler than manually filling every
+        // field, and exercises the same defaults the loader uses in
+        // production.
+        let yaml = format!("runtime: {runtime}\n");
+        serde_yaml::from_str::<AgentConfig>(&yaml).expect("valid test yaml")
+    }
+
+    #[test]
+    fn framed_send_allowed_for_claude_sdk_slot() {
+        let configs = vec![("alor".to_string(), cfg("claude-sdk"))];
+        let state = AppState::new();
+        assert!(is_framed_send_allowed(&configs, &state, "alor"));
+    }
+
+    #[test]
+    fn framed_send_rejected_for_wrapper_slot() {
+        // The latent hazard: default runtime is "wrapper", and a
+        // framed send to one would splat literal BEGIN/END markers
+        // into the CLI's pty.
+        let configs = vec![("codex".to_string(), cfg("wrapper"))];
+        let state = AppState::new();
+        assert!(!is_framed_send_allowed(&configs, &state, "codex"));
+    }
+
+    #[test]
+    fn framed_send_rejected_for_unknown_agent() {
+        // Fail-closed: no config + no state entry means we can't prove
+        // it's SDK-framed-safe, so reject.
+        let configs = vec![("alor".to_string(), cfg("claude-sdk"))];
+        let state = AppState::new();
+        assert!(!is_framed_send_allowed(&configs, &state, "ghost"));
+    }
+
+    #[test]
+    fn framed_send_allowed_for_claude_sdk_template_instance() {
+        // Template-spawned instance: no direct config entry, but its
+        // `template` field points at a yaml slot whose runtime is
+        // claude-sdk. Must resolve transitively.
+        let configs = vec![("claude".to_string(), cfg("claude-sdk"))];
+        let state = AppState::new();
+        let mut instance = Agent::new("claude-mandaspace", "claude-mandaspace");
+        instance.template = Some("claude".to_string());
+        state.register_agent(instance);
+        assert!(is_framed_send_allowed(
+            &configs,
+            &state,
+            "claude-mandaspace"
+        ));
+    }
+
+    #[test]
+    fn framed_send_rejected_for_wrapper_template_instance() {
+        // Same transitive lookup, but the template is a wrapper
+        // runtime — the gate must still refuse.
+        let configs = vec![("codex".to_string(), cfg("wrapper"))];
+        let state = AppState::new();
+        let mut instance = Agent::new("codex-scratch", "codex-scratch");
+        instance.template = Some("codex".to_string());
+        state.register_agent(instance);
+        assert!(!is_framed_send_allowed(&configs, &state, "codex-scratch"));
+    }
+
+    #[test]
+    fn framed_send_rejected_when_template_points_at_missing_config() {
+        // Defensive: if an instance's template id no longer resolves
+        // (e.g. yaml was deleted between spawn and now), we can't
+        // prove runtime, so fail-closed.
+        let configs: Vec<(String, AgentConfig)> = vec![];
+        let state = AppState::new();
+        let mut instance = Agent::new("orphan", "orphan");
+        instance.template = Some("gone".to_string());
+        state.register_agent(instance);
+        assert!(!is_framed_send_allowed(&configs, &state, "orphan"));
+    }
+
+    #[test]
+    fn resolve_runtime_direct_slot_wins_over_template() {
+        // If an agent_id exists as both a direct yaml slot AND a
+        // state-persisted instance (shouldn't happen in practice, but
+        // belts-and-suspenders), the direct config is authoritative.
+        let configs = vec![("alor".to_string(), cfg("claude-sdk"))];
+        let state = AppState::new();
+        let mut instance = Agent::new("alor", "alor");
+        instance.template = Some("some-wrapper-template".to_string());
+        state.register_agent(instance);
+        assert_eq!(
+            resolve_agent_runtime(&configs, &state, "alor").as_deref(),
+            Some("claude-sdk")
+        );
     }
 }
