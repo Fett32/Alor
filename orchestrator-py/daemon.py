@@ -114,6 +114,11 @@ async def agent_send_message(
     specifically want the send to register as a user-origin event
     (currently no legitimate case; the flag exists so wrapper-runtime
     agents stay unaffected if future callers opt out).
+
+    When `suppress_echo` is True the daemon stamps a uuid into the
+    sentinel prefix and returns it as `correlation_id` in the response;
+    the SDK worker echoes the same id back in the subsequent
+    `worker.orch_response` event so callers can match the reply.
     """
     return await _one_shot(
         "cli.agent.send_message",
@@ -124,6 +129,119 @@ async def agent_send_message(
             "suppress_echo": suppress_echo,
         },
     )
+
+
+async def agent_send_message_await(
+    agent_id: str,
+    text: str,
+    submit: bool = True,
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """Fire `agent_send_message` and await the matching `worker.orch_response`.
+
+    Turns the fire-and-forget inject into a real query/response primitive.
+    `submit` defaults to True here (different from `agent_send_message`) —
+    you almost always want Enter appended so the worker's stdin loop
+    actually processes the line.
+
+    Return shape:
+        {
+            "correlation_id": <uuid str>,
+            "timeout": <bool>,
+            "text": <reply text or None>,
+            "agent_id": <str or None>,
+            "during_task": <bool or None>,
+            "task_id": <str or None>,
+        }
+
+    On timeout, `text` is None and `timeout` is True — the caller decides
+    whether to retry, surface the timeout to Fett, etc. Does not raise on
+    timeout (it's a valid outcome: worker busy / SDK stalled / reply got
+    dropped).
+
+    Implementation: opens its own `cli.event.stream` subscription BEFORE
+    firing the send to close the race window where the reply fires before
+    we subscribe. The orch's primary event_watcher is unaffected — the
+    daemon broadcasts to all subscribers, so both see the event.
+    """
+    try:
+        reader, writer = await asyncio.open_unix_connection(DAEMON_SOCKET)
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        raise DaemonError(f"daemon not reachable at {DAEMON_SOCKET}: {e}") from e
+
+    try:
+        writer.write((json.dumps(_envelope("cli.event.stream")) + "\n").encode())
+        await writer.drain()
+
+        # Fire the send AFTER subscribing. Response carries the
+        # correlation_id the daemon stamped into the sentinel.
+        send_resp = await agent_send_message(
+            agent_id, text, submit=submit, suppress_echo=True
+        )
+        corrid = send_resp.get("correlation_id")
+        if not corrid:
+            raise DaemonError(
+                "agent_send_message did not return correlation_id "
+                "(is suppress_echo disabled or daemon too old?)"
+            )
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return {
+                    "correlation_id": corrid,
+                    "timeout": True,
+                    "text": None,
+                    "agent_id": None,
+                    "during_task": None,
+                    "task_id": None,
+                }
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return {
+                    "correlation_id": corrid,
+                    "timeout": True,
+                    "text": None,
+                    "agent_id": None,
+                    "during_task": None,
+                    "task_id": None,
+                }
+            if not line:
+                return {
+                    "correlation_id": corrid,
+                    "timeout": True,
+                    "text": None,
+                    "agent_id": None,
+                    "during_task": None,
+                    "task_id": None,
+                }
+            try:
+                env = json.loads(line.decode().strip())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            payload = env.get("payload") or {}
+            if payload.get("event") != "worker.orch_response":
+                continue
+            data = payload.get("data") or {}
+            if data.get("correlation_id") != corrid:
+                continue
+            return {
+                "correlation_id": corrid,
+                "timeout": False,
+                "text": data.get("text"),
+                "agent_id": data.get("agent_id"),
+                "during_task": data.get("during_task"),
+                "task_id": data.get("task_id"),
+            }
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
 async def memory_get(project: str) -> dict[str, Any]:

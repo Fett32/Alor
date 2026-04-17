@@ -50,6 +50,7 @@ INJECTABLE_EVENTS = {
     "user.intervention",
     "wrapper.error",
     "worker.user_input",
+    "worker.orch_response",
 }
 
 
@@ -112,6 +113,20 @@ def format_event_for_agent(evt: daemon.Event) -> str | None:
             "or create a new task — the worker is already answering him in "
             "its own pane. If this is just conversational follow-up to the "
             "worker, stay silent."
+        )
+    if evt.event == "worker.orch_response":
+        # Direct reply to an orch-origin `agent_send_message` send. Orch
+        # asked for this — no "stay silent" hedge. If the orch used the
+        # awaiting variant (`await_response=True`), it already received
+        # the text as a tool result; this event is redundant but harmless
+        # in that path. In the fire-and-forget path it's the ONLY way the
+        # orch sees the reply.
+        agent = d.get("agent_id", "?")
+        corrid = str(d.get("correlation_id") or "")[:8] or "?"
+        text = d.get("text", "") or "(empty reply)"
+        return (
+            f"[Alor event] {agent} replied to your send {corrid}:\n\n"
+            f"{text}"
         )
     return None
 

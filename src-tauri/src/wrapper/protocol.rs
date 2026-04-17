@@ -24,6 +24,7 @@ pub const MSG_REGISTER: &str = "wrapper.register";
 pub const MSG_ERROR: &str = "wrapper.error";
 pub const MSG_USER_INTERVENTION: &str = "user.intervention";
 pub const MSG_WORKER_USER_INPUT: &str = "worker.user_input";
+pub const MSG_WORKER_ORCH_RESPONSE: &str = "worker.orch_response";
 pub const MSG_SHUTDOWN: &str = "daemon.shutdown";
 
 // Phase 9: CLI message types
@@ -191,6 +192,36 @@ pub struct WorkerUserInput {
     #[serde(default)]
     pub during_task: bool,
     /// Optional task_id for mid-task inputs.
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
+}
+
+// ---------------------------------------------------------------------------
+// W→O  worker.orch_response — SDK worker reports back the reply to an
+//      orch-origin `agent_send_message` (sentinel-prefixed) query
+// ---------------------------------------------------------------------------
+
+/// Mirror of `WorkerUserInput` for the other direction. When the orchestrator
+/// injects a message into a worker's pane via `cli.agent.send_message` with
+/// `suppress_echo: true`, the daemon stamps a correlation_id into the
+/// sentinel prefix. The SDK worker extracts that id, runs the SDK turn to
+/// completion (ResultMessage), and emits this event carrying the final
+/// assistant TextBlock as `text`. Orch matches `correlation_id` back to its
+/// originating send so `agent_send_message` becomes a real query/response
+/// channel instead of fire-and-forget.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerOrchResponse {
+    pub agent_id: String,
+    /// The uuid the daemon embedded in the sentinel on the outbound send.
+    pub correlation_id: Uuid,
+    /// Final assistant text from the SDK turn. Same "latest TextBlock wins"
+    /// semantics as `TaskComplete::summary`.
+    pub text: String,
+    /// True if the worker was mid-task when the orch send landed. SDK
+    /// workers serialize behind `client_lock`, so mid-task sends are queued.
+    #[serde(default)]
+    pub during_task: bool,
+    /// Optional task_id for mid-task sends.
     #[serde(default)]
     pub task_id: Option<Uuid>,
 }

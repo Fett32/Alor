@@ -175,11 +175,29 @@ async def agent_kill(args: dict[str, Any]) -> dict[str, Any]:
     "agent_send_message",
     "Inject text into a connected agent's tmux pane. Use for answering "
     "agent questions or relaying follow-up instructions without creating a "
-    "new task. Set submit=true to append Enter.",
-    {"agent_id": str, "text": str, "submit": bool},
+    "new task. Set submit=true to append Enter. Set await_response=true to "
+    "block until the agent's SDK turn finishes and the reply comes back — "
+    "returns the reply text inline so you can act on the answer in the "
+    "same turn. Default is fire-and-forget (reply arrives later as a "
+    "`worker.orch_response` event injection).",
+    {
+        "agent_id": str,
+        "text": str,
+        "submit": bool,
+        "await_response": bool,
+    },
 )
 async def agent_send_message(args: dict[str, Any]) -> dict[str, Any]:
     try:
+        if bool(args.get("await_response", False)):
+            # Awaiting variant: submit defaults to True because you
+            # almost always want Enter appended when you're blocking
+            # on the reply — otherwise the SDK never runs.
+            submit = bool(args.get("submit", True))
+            result = await daemon.agent_send_message_await(
+                args["agent_id"], args["text"], submit=submit
+            )
+            return _ok(result)
         return _ok(
             await daemon.agent_send_message(
                 args["agent_id"], args["text"], bool(args.get("submit", False))

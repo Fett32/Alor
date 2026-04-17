@@ -33,18 +33,38 @@ DEFAULT_MODEL = os.environ.get("ALOR_WORKER_MODEL", "claude-opus-4-7")
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "worker_prompt.md"
 
 # Echo-guard sentinel. Kept in lockstep with the Rust daemon's
-# `WORKER_ECHO_SENTINEL` (src-tauri/src/wrapper/server.rs). Any stdin line
-# that starts with this prefix originated from a programmatic
+# `WORKER_ECHO_SENTINEL_PREFIX` (src-tauri/src/wrapper/server.rs). Any stdin
+# line that starts with this prefix originated from a programmatic
 # `cli.agent.send_message` with `suppress_echo: true` — typically the
-# orchestrator answering the worker through the tmux path. The worker
-# strips the prefix before feeding text to the SDK, and skips emitting a
-# `worker.user_input` event so orch→worker messages don't bounce back
-# and re-enter the orch as if Fett had typed them.
+# orchestrator asking the worker a question through the tmux path.
+#
+# On-wire format: `{PREFIX}{correlation_id} {text}` — the daemon stamps a
+# fresh uuid per send so the worker can (a) skip forwarding the line as a
+# `worker.user_input` event (no echo loop), and (b) emit a
+# `worker.orch_response` event carrying the same uuid after the SDK turn
+# completes, so orch matches the reply to its originating send.
 #
 # Kept to printable ASCII so it survives tmux→pty→prompt_toolkit intact;
 # unbound control chars (RS/US) get silently dropped by prompt_toolkit
 # and would break the guard.
-WORKER_ECHO_SENTINEL = "__ALOR_ORCH_ECHO__ "
+WORKER_ECHO_SENTINEL_PREFIX = "__ALOR_ORCH_ECHO__"
+
+
+def parse_sentinel(line: str) -> tuple[str | None, str]:
+    """Extract (correlation_id, text) from a sentinel-prefixed stdin line.
+
+    Returns (None, original_line) if the line is not sentinel-prefixed.
+    Returns (corrid, text) when prefixed; `text` may be empty if the
+    daemon sent nothing after the id (defensive — shouldn't happen).
+    """
+    if not line.startswith(WORKER_ECHO_SENTINEL_PREFIX):
+        return (None, line)
+    rest = line[len(WORKER_ECHO_SENTINEL_PREFIX):]
+    space_idx = rest.find(" ")
+    if space_idx == -1:
+        # No separator — treat whole remainder as the id, empty text.
+        return (rest, "")
+    return (rest[:space_idx], rest[space_idx + 1:])
 
 
 def render_prompt(agent_id: str, project: str | None, workdir: str, model: str) -> str:
@@ -216,12 +236,15 @@ async def stdin_loop(
 ) -> None:
     """Let Fett type follow-ups into the worker's tmux pane.
 
-    Non-slash lines are forwarded to the daemon as `worker.user_input`
+    Fett-typed lines are forwarded to the daemon as `worker.user_input`
     events so the orchestrator stays aware of follow-ups. Lines prefixed
-    with `WORKER_ECHO_SENTINEL` originated from a programmatic send
-    (orch → tmux send-keys with `suppress_echo: true`); the sentinel is
-    stripped and the line is NOT forwarded — avoids an echo loop back into
-    the orch's SDK context.
+    with `WORKER_ECHO_SENTINEL_PREFIX` originated from a programmatic send
+    (orch → tmux send-keys with `suppress_echo: true`); the prefix +
+    embedded correlation_id are extracted and the line is NOT forwarded
+    as `worker.user_input` — avoids an echo loop. Instead, after the SDK
+    turn completes we emit `worker.orch_response` carrying the
+    correlation_id, so the orch can match the reply to its originating
+    send and treat `agent_send_message` as a real query/response channel.
     """
     while not stop.is_set():
         # prompt_toolkit owns the prompt line; patch_stdout keeps streaming
@@ -230,12 +253,11 @@ async def stdin_loop(
         if line is None:
             stop.set()
             return
-        # Echo-guard: identify (and strip) programmatic injections BEFORE
-        # .strip() — the sentinel must be anchored at the start of the raw
-        # line so leading whitespace in Fett's typed text can't spoof it.
-        is_programmatic = line.startswith(WORKER_ECHO_SENTINEL)
-        if is_programmatic:
-            line = line[len(WORKER_ECHO_SENTINEL):]
+        # Echo-guard: parse sentinel BEFORE .strip() — the prefix must be
+        # anchored at the start of the raw line so leading whitespace in
+        # Fett's typed text can't spoof it.
+        orch_correlation_id, line = parse_sentinel(line)
+        is_programmatic = orch_correlation_id is not None
         text = line.strip()
         if not text:
             continue
@@ -255,9 +277,11 @@ async def stdin_loop(
                     print(f"{C_RED}[reset failed] {e}{C_RESET}")
             continue
 
-        # Forward to the orch as an event so it stays aware of post-task
-        # follow-ups. Skip when the line came from a programmatic sender
-        # (orch itself) — otherwise orch→worker→orch loops on every reply.
+        # Forward Fett-typed lines to the orch as an event so it stays
+        # aware of post-task follow-ups. Skip when the line came from a
+        # programmatic sender (orch itself) — otherwise orch→worker→orch
+        # loops on every reply. The programmatic branch emits
+        # `worker.orch_response` instead (below).
         if not is_programmatic:
             task_id = current.get("task_id")
             try:
@@ -271,12 +295,53 @@ async def stdin_loop(
                 # daemon is unreachable. The orch just won't see this line.
                 print(f"{C_RED}[forward to daemon failed] {e}{C_RESET}")
 
+        # Capture the final assistant TextBlock so we can forward it back
+        # to the orch as `worker.orch_response`. Mirrors run_task's
+        # "latest TextBlock wins" summary semantics. Only installed for
+        # the programmatic branch — Fett-typed follow-ups aren't matched
+        # to any pending send so there's no reply to report.
+        latest: dict[str, str] = {"text": ""}
+
+        def capture_orch_reply(t: str) -> None:
+            latest["text"] = t
+            print(t)
+
+        on_text = capture_orch_reply if is_programmatic else None
+
         try:
             async with client_lock:
                 await client.query(text)
-                await process_response(client, totals, cost)
+                await process_response(client, totals, cost, on_text=on_text)
         except Exception as e:
             print(f"{C_RED}[error] {e}{C_RESET}")
+            # Fall through to footer + (if programmatic) emit an empty
+            # reply so the orch's await doesn't hang forever.
+
+        if is_programmatic:
+            task_id = current.get("task_id")
+            reply = latest["text"].strip()
+            # Cap reply client-side to match the worker summary logic
+            # (64 KiB). Protects the daemon / orch from a runaway turn.
+            encoded = reply.encode("utf-8")
+            MAX = 64 * 1024
+            if len(encoded) > MAX:
+                trimmed = encoded[:MAX]
+                while trimmed and (trimmed[-1] & 0xC0) == 0x80:
+                    trimmed = trimmed[:-1]
+                reply = trimmed.decode("utf-8", errors="ignore") + "\n…[truncated]"
+            try:
+                await sock.send_worker_orch_response(
+                    correlation_id=orch_correlation_id,
+                    text=reply,
+                    during_task=task_id is not None,
+                    task_id=task_id,
+                )
+            except Exception as e:
+                # Non-fatal — orch will just time out waiting. Worth a
+                # visible warning though, since this means a tool call on
+                # the orch side will return a timeout marker.
+                print(f"{C_RED}[orch_response send failed] {e}{C_RESET}")
+
         print_footer(session_start, cost[0], totals)
 
 

@@ -28,6 +28,7 @@ MSG_STATUS_RESPONSE = "status.response"
 MSG_SHUTDOWN = "daemon.shutdown"
 MSG_USER_INTERVENTION = "user.intervention"
 MSG_WORKER_USER_INPUT = "worker.user_input"
+MSG_WORKER_ORCH_RESPONSE = "worker.orch_response"
 
 
 class AgentClientError(RuntimeError):
@@ -133,6 +134,31 @@ class AgentClient:
         if task_id is not None:
             payload["task_id"] = task_id
         await self.send(MSG_WORKER_USER_INPUT, payload)
+
+    async def send_worker_orch_response(
+        self,
+        correlation_id: str,
+        text: str,
+        during_task: bool,
+        task_id: str | None,
+    ) -> None:
+        """Forward the SDK turn result for a sentinel-prefixed orch send
+        back to the daemon as a broadcast event.
+
+        Mirror of `send_worker_user_input` for the orch→worker→orch reply
+        direction. `correlation_id` is the uuid the daemon embedded in the
+        sentinel on the outbound send; orch uses it to match this reply
+        against its originating `agent_send_message` call.
+        """
+        payload: dict[str, Any] = {
+            "agent_id": self.agent_id,
+            "correlation_id": correlation_id,
+            "text": text,
+            "during_task": during_task,
+        }
+        if task_id is not None:
+            payload["task_id"] = task_id
+        await self.send(MSG_WORKER_ORCH_RESPONSE, payload)
 
     async def send_status(
         self, task_id: str | None, alive: bool, details: str | None = None
