@@ -1185,10 +1185,18 @@ impl SocketServer {
                         }
                         // Exact-match target — `alor-claude` must not fall
                         // through to `alor-claude-alor` and deliver to the
-                        // wrong worker.
-                        let session = format!("=alor-{}", payload.agent_id);
+                        // wrong worker.  tmux's target syntax splits: bare
+                        // `=name` resolves a session (what has-session
+                        // wants), but send-keys takes a target-pane so we
+                        // need `=name:` to pick the active pane of the
+                        // exact session.  Before fixing this split,
+                        // send-keys silently failed with "can't find pane"
+                        // and the daemon reported success to the orch
+                        // anyway — every agent_send_message was a no-op.
+                        let session_target = format!("=alor-{}", payload.agent_id);
+                        let pane_target = format!("{session_target}:");
                         let session_exists = tokio::process::Command::new("tmux")
-                            .args(["has-session", "-t", &session])
+                            .args(["has-session", "-t", &session_target])
                             .output()
                             .await
                             .map(|o| o.status.success())
@@ -1211,18 +1219,31 @@ impl SocketServer {
                             payload.text.clone()
                         };
                         let send_out = tokio::process::Command::new("tmux")
-                            .args(["send-keys", "-t", &session, "-l", &effective_text])
+                            .args(["send-keys", "-t", &pane_target, "-l", &effective_text])
                             .output()
                             .await;
-                        if let Err(e) = send_out {
-                            return cli_error(
-                                correlation_id,
-                                &format!("tmux send-keys failed: {e}"),
-                            );
-                        }
+                        let send_ok = match &send_out {
+                            Ok(o) if o.status.success() => true,
+                            Ok(o) => {
+                                return cli_error(
+                                    correlation_id,
+                                    &format!(
+                                        "tmux send-keys rejected target {pane_target}: {}",
+                                        String::from_utf8_lossy(&o.stderr).trim()
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                return cli_error(
+                                    correlation_id,
+                                    &format!("tmux send-keys failed: {e}"),
+                                );
+                            }
+                        };
+                        let _ = send_ok; // consume
                         if payload.submit {
                             let _ = tokio::process::Command::new("tmux")
-                                .args(["send-keys", "-t", &session, "Enter"])
+                                .args(["send-keys", "-t", &pane_target, "Enter"])
                                 .output()
                                 .await;
                         }

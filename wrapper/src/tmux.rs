@@ -3,17 +3,25 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-/// Wrap a session name with `=` so tmux treats the `-t` target as an exact
-/// match instead of a prefix. Without this, `alor-claude` matches
-/// `alor-claude-alor` and operations silently hit the wrong session.
-fn target(name: &str) -> String {
+/// Exact-match session target. Used with commands that take a
+/// target-session (has-session, kill-session, set-option). Bare `=name`
+/// resolves correctly at the session level.
+fn session_target(name: &str) -> String {
     format!("={name}")
+}
+
+/// Exact-match pane target. tmux's target-pane grammar is
+/// `session:window.pane`; a bare `=name` without the `:` is rejected
+/// with "can't find pane". Trailing `:` picks the active pane of that
+/// exact session, which is what we want for send-keys and capture-pane.
+fn pane_target(name: &str) -> String {
+    format!("={name}:")
 }
 
 /// Returns true if a tmux session with this name currently exists.
 pub fn session_exists(name: &str) -> bool {
     Command::new("tmux")
-        .args(["has-session", "-t", &target(name)])
+        .args(["has-session", "-t", &session_target(name)])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -47,7 +55,7 @@ pub fn create_session_with_dir(name: &str, command: &str, workdir: Option<&str>)
 
 /// Inject `text` into the tmux session as a single block, followed by Enter.
 pub fn send_keys(name: &str, text: &str) -> Result<()> {
-    let t = target(name);
+    let t = pane_target(name);
     // Use -l (literal) so tmux doesn't interpret special sequences.
     let out = Command::new("tmux")
         .args(["send-keys", "-t", &t, "-l", text])
@@ -74,7 +82,7 @@ pub fn send_keys(name: &str, text: &str) -> Result<()> {
 /// Apply Alor's default session options (mouse, scrollback, paste detection).
 /// Called on session creation and also when reusing a pre-existing session.
 pub fn ensure_session_defaults(name: &str) {
-    let t = target(name);
+    let t = session_target(name);
     let _ = Command::new("tmux")
         .args(["set-option", "-t", &t, "mouse", "on"])
         .output();
@@ -90,7 +98,7 @@ pub fn ensure_session_defaults(name: &str) {
 /// Returns each line as a separate String.
 pub fn capture_pane(name: &str, lines: usize) -> Result<Vec<String>> {
     let start = format!("-{}", lines);
-    let t = target(name);
+    let t = pane_target(name);
     let out = Command::new("tmux")
         .args([
             "capture-pane",
