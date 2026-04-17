@@ -389,6 +389,53 @@ pub async fn terminal_paste_primary(
     bridge.send_keys(&text).await.map_err(err)
 }
 
+/// Push a string into the X11 PRIMARY selection.  Called from the frontend
+/// whenever xterm.js selection changes so that middle-click paste (here and
+/// in any other app on the desktop) pastes exactly what the user just
+/// highlighted. Silent on failure — writing PRIMARY is best-effort.
+#[tauri::command]
+pub async fn terminal_set_primary(text: String) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    // Try xclip first.
+    if let Ok(mut child) = Command::new("xclip")
+        .args(["-i", "-selection", "primary"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes()).await;
+            drop(stdin);
+            let _ = child.wait().await;
+            return Ok(());
+        }
+    }
+
+    // Fall back to wl-copy --primary.
+    if let Ok(mut child) = Command::new("wl-copy")
+        .args(["--primary"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes()).await;
+            drop(stdin);
+            let _ = child.wait().await;
+        }
+    }
+
+    Ok(())
+}
+
 /// Try xclip first (works on X11 and XWayland), then wl-paste (pure Wayland).
 /// Returns an empty string on any failure — paste is best-effort.
 async fn read_primary_selection() -> String {

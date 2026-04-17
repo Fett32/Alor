@@ -236,6 +236,11 @@ function createTerminal() {
   $container.addEventListener("mousedown", (e) => {
     if (e.button === 1) return; // handled by middle-click paste
     if (!term) return;
+    // xterm.js hosts a hidden textarea that receives keyboard input; the
+    // browser focuses it on a real click. Since we swallow the click
+    // below (stopImmediatePropagation), xterm never focuses itself and
+    // typing stops working. Focus it explicitly.
+    term.focus();
     const { col, row } = cellFromEvent(e);
     const button = e.button === 2 ? 2 : 0; // 0 = left, 2 = right
     heldButton = button;
@@ -278,6 +283,22 @@ function createTerminal() {
   // its own MouseDown3Pane menu that we want to show instead.
   $container.addEventListener("contextmenu", (e) => {
     e.preventDefault();
+  });
+
+  // -----------------------------------------------------------------------
+  // xterm.js selection -> X11 PRIMARY selection.
+  // xterm.js's own drag-to-select survives our mouse-forwarder (its
+  // internal listeners are on the canvas, not the outer $container) and
+  // shows a persistent highlight the user can see while choosing text.
+  // We mirror that selection into PRIMARY so middle-click paste (and
+  // middle-click in any other app) gets exactly what's visibly selected.
+  // -----------------------------------------------------------------------
+  term.onSelectionChange(() => {
+    const sel = term.getSelection?.() ?? "";
+    if (!sel) return;
+    invoke("terminal_set_primary", { text: sel }).catch((err) => {
+      console.warn("[Terminal] set_primary failed:", err);
+    });
   });
 
   // -----------------------------------------------------------------------

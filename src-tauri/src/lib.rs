@@ -281,6 +281,7 @@ pub fn run() {
             commands::terminal_send_keys,
             commands::terminal_resize,
             commands::terminal_paste_primary,
+            commands::terminal_set_primary,
             commands::pane_show,
             commands::pane_hide,
             commands::pane_list,
