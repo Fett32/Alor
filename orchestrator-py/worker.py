@@ -29,7 +29,7 @@ from common import (
     banner, print_footer, process_response, read_line,
 )
 
-DEFAULT_MODEL = os.environ.get("ALOR_WORKER_MODEL", "claude-opus-4-7")
+DEFAULT_MODEL = os.environ.get("ALOR_WORKER_MODEL", "claude-opus-4-7[1m]")
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "worker_prompt.md"
 
 # Echo-guard framing. Kept in lockstep with the Rust daemon's
@@ -297,11 +297,11 @@ async def stdin_loop(
 
         # ---- Inside a programmatic frame: only the matching END closes. ----
         if in_frame:
-            # Exact END match (prefix + stashed uuid). Deliberately strict:
-            # we do NOT re-parse BEGIN markers inside a frame so the body
-            # can contain arbitrary text (including our own marker strings)
-            # without tripping false boundaries. Only the uuid we issued on
-            # BEGIN can close this frame.
+            # Exact END match (prefix + stashed uuid). Deliberately strict on
+            # END: we do NOT match END markers with a different uuid, so the
+            # body can contain arbitrary text (including our own END marker
+            # strings for other uuids) without tripping false boundaries.
+            # Only the uuid we issued on BEGIN can close this frame.
             expected_end = f"{WORKER_ECHO_SENTINEL_END}{frame_uuid}"
             if raw_line.rstrip() == expected_end:
                 body = "\n".join(frame_buffer)
@@ -363,8 +363,44 @@ async def stdin_loop(
                     print_footer(session_start, cost[0], totals)
                 continue
 
-            # Not the matching END — body line. Append verbatim (preserve
-            # blanks / leading whitespace / would-be slash commands).
+            # Nested BEGIN recovery. If a BEGIN marker arrives while we're
+            # already inside a frame, the previous BEGIN never got its END —
+            # concurrent `agent_send_message` calls interleaving at the
+            # tmux-server level (tmux doesn't guarantee send-keys atomicity
+            # across calls to the same pane), pane detach/reattach losing
+            # keystrokes mid-frame, or a daemon crash between the BEGIN and
+            # END enqueue. Without this recovery the stale buffer would
+            # accumulate forever and only flush on worker EOF.
+            #
+            # Bounded damage: discard the stale frame (its orch caller will
+            # time out — same outcome as if the END had been lost) and start
+            # fresh on the new uuid. The new frame completes normally.
+            #
+            # Collision risk: a body line that happens to exactly match
+            # `BEGIN_PREFIX + <uuid-shaped-string>` would trigger a false
+            # reset. That's the same shape of risk we already accept for
+            # END collisions, and the prefix is a distinctive 24-byte
+            # literal — vanishingly unlikely in free-form prose.
+            kind, marker_uuid = parse_frame_marker(raw_line)
+            if kind == "begin" and marker_uuid:
+                stale_uuid = frame_uuid or "?"
+                print(
+                    f"{C_YELLOW}[warn] nested BEGIN {marker_uuid[:8]} "
+                    f"inside unclosed frame {stale_uuid[:8]} — discarding "
+                    f"{len(frame_buffer)} buffered line(s), restarting on "
+                    f"new uuid{C_RESET}"
+                )
+                # Stay in_frame; swap uuid + buffer + task_id for the fresh
+                # frame. The orch that issued the stale BEGIN will time out
+                # on its own await — we can't resurrect that send.
+                frame_uuid = marker_uuid
+                frame_buffer = []
+                frame_task_id = current.get("task_id")
+                continue
+
+            # Not the matching END, not a nested BEGIN — body line. Append
+            # verbatim (preserve blanks / leading whitespace / would-be
+            # slash commands / stray END markers for other uuids).
             frame_buffer.append(raw_line)
             continue
 
