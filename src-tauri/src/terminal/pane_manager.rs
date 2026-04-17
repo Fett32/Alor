@@ -21,18 +21,19 @@ const MAIN_SESSION: &str = "alor-main";
 const MAX_RIGHT_COLUMNS: usize = 3;
 
 /// Shell snippet piped from tmux `copy-pipe-no-clear` on drag-select.
-/// Syncs the selection to BOTH the X11 CLIPBOARD and PRIMARY selections so
-/// Ctrl+V and middle-click paste into other apps both work. Plain sh compatible
-/// (tmux invokes /bin/sh, not bash). Uses xclip if available, falls back to
-/// wl-copy for Wayland-native environments.
-const COPY_PIPE_CMD: &str = r#"T=$(cat); \
-if command -v xclip >/dev/null 2>&1; then \
-  printf '%s' "$T" | xclip -i -selection clipboard >/dev/null 2>&1; \
-  printf '%s' "$T" | xclip -i -selection primary   >/dev/null 2>&1; \
-elif command -v wl-copy >/dev/null 2>&1; then \
-  printf '%s' "$T" | wl-copy                 >/dev/null 2>&1; \
-  printf '%s' "$T" | wl-copy --primary       >/dev/null 2>&1; \
-fi"#;
+/// Syncs the selection to BOTH X11 (xclip) and Wayland (wl-copy) surfaces
+/// because Sway keeps their primary/clipboard buffers separate — a
+/// selection written only to one is invisible to apps on the other side
+/// (e.g. native-Wayland terminals vs XWayland browsers). We write all
+/// four: X11 clipboard, X11 primary, Wayland clipboard, Wayland primary.
+/// Errors are suppressed — this is best-effort and should never fail the
+/// tmux copy pipeline.
+pub(crate) const COPY_PIPE_CMD: &str = r#"T=$(cat); \
+command -v xclip  >/dev/null 2>&1 && printf '%s' "$T" | xclip -i -selection clipboard >/dev/null 2>&1; \
+command -v xclip  >/dev/null 2>&1 && printf '%s' "$T" | xclip -i -selection primary   >/dev/null 2>&1; \
+command -v wl-copy>/dev/null 2>&1 && printf '%s' "$T" | wl-copy                       >/dev/null 2>&1; \
+command -v wl-copy>/dev/null 2>&1 && printf '%s' "$T" | wl-copy --primary             >/dev/null 2>&1; \
+true"#;
 
 // ---------------------------------------------------------------------------
 // Pane tracking
@@ -68,10 +69,62 @@ impl PaneManager {
         self.rebalance_layout().await;
     }
 
+    /// Propagate the display-related env vars from the Rust process into
+    /// tmux's global environment.  Without this, tmux sessions inherit
+    /// only whatever the tmux server was launched with — commonly DISPLAY
+    /// but not WAYLAND_DISPLAY, which makes the copy-pipe's `wl-copy`
+    /// silently fail when it tries to talk to a Wayland socket it can't
+    /// find.  Called on startup so every session created after this has
+    /// the right env.
+    async fn propagate_display_env(&self) {
+        // Collect (name, value) pairs once so we reuse them across every
+        // existing alor-* session below.
+        let vars: Vec<(&str, String)> = ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DISPLAY"]
+            .iter()
+            .filter_map(|v| std::env::var(v).ok().map(|val| (*v, val)))
+            .collect();
+        if vars.is_empty() {
+            return;
+        }
+
+        // Global: inherited by every new-session.
+        for (k, v) in &vars {
+            let _ = Command::new("tmux")
+                .args(["set-environment", "-g", k, v])
+                .output()
+                .await;
+        }
+
+        // Existing sessions (reclaimed from a previous boot) need an
+        // explicit push — they're frozen with whatever env they had at
+        // creation. Iterate and overwrite for every alor-* session.
+        let sessions = Command::new("tmux")
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output()
+            .await;
+        if let Ok(out) = sessions {
+            if out.status.success() {
+                let names = String::from_utf8_lossy(&out.stdout).into_owned();
+                for name in names.lines().filter(|n| n.starts_with("alor-")) {
+                    let target = format!("={name}");
+                    for (k, v) in &vars {
+                        let _ = Command::new("tmux")
+                            .args(["set-environment", "-t", &target, k, v])
+                            .output()
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
     /// Push the tmux options that govern mouse to selection/paste behaviour.
     /// Called on session create and also when reusing a session — the options
     /// are scoped to the session so they don't leak into the user's own tmux.
     async fn apply_tmux_mouse_config(&self) {
+        // Make sure the copy-pipe shell can actually reach xclip/wl-copy.
+        self.propagate_display_env().await;
+
         // mouse on: scroll, click-to-focus, drag borders to resize, drag body
         // to select (enters copy-mode).
         let _ = Command::new("tmux")
