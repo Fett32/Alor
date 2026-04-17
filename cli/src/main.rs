@@ -39,7 +39,11 @@ struct CliTaskCreate {
 #[derive(Serialize)]
 struct CliTaskCancel { task_id: Uuid }
 #[derive(Serialize)]
-struct CliTaskComplete { task_id: Uuid }
+struct CliTaskComplete {
+    task_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+}
 #[derive(Serialize)]
 struct CliSpawn { 
     agent: String, 
@@ -125,7 +129,13 @@ enum TaskAction {
         #[arg(long)] project: Option<String>,
     },
     Cancel { task_id: Uuid },
-    Complete { task_id: Uuid },
+    Complete {
+        task_id: Uuid,
+        /// Optional close-out summary. Handy when retroactively completing
+        /// a Cancelled task (e.g. `--summary "shipped in commit X"`).
+        #[arg(long)]
+        summary: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -180,7 +190,7 @@ async fn main() {
             TaskAction::Get { task_id } => cmd_task_get(task_id).await,
             TaskAction::Create { title, description, project } => cmd_task_create(title, description, project).await,
             TaskAction::Cancel { task_id } => cmd_task_cancel(task_id).await,
-            TaskAction::Complete { task_id } => cmd_task_complete(task_id).await,
+            TaskAction::Complete { task_id, summary } => cmd_task_complete(task_id, summary).await,
         },
         Commands::Project { action } => match action {
             ProjectAction::List => cmd_project_list().await,
@@ -274,8 +284,8 @@ async fn cmd_task_cancel(task_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_task_complete(task_id: Uuid) -> Result<()> {
-    let req = Envelope::new("cli.task.complete", CliTaskComplete { task_id })?;
+async fn cmd_task_complete(task_id: Uuid, summary: Option<String>) -> Result<()> {
+    let req = Envelope::new("cli.task.complete", CliTaskComplete { task_id, summary })?;
     send_request(&req).await?;
     println!("Task completed.");
     Ok(())

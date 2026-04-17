@@ -58,10 +58,18 @@ impl TaskState {
 
     /// Validate whether a transition from `self` to `next` is legal.
     pub fn can_transition_to(&self, next: &TaskState) -> bool {
+        use TaskState::*;
+        // Narrow edge: retroactively close out a Cancelled task as Completed
+        // (bookkeeping — "I cancelled this, but it was actually done").
+        // Cancelled remains terminal for `is_terminal()` purposes so
+        // `agent_active_task_count` and `transition_task`'s assigned_to-clear
+        // semantics are unchanged.
+        if matches!((self, next), (Cancelled, Completed)) {
+            return true;
+        }
         if self.is_terminal() {
             return false;
         }
-        use TaskState::*;
         matches!(
             (self, next),
             (Pending, Assigned)
@@ -710,5 +718,31 @@ impl AppState {
         self.save();
         self.emit_event("agents-changed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_to_completed_is_legal_retroactive_closeout() {
+        // Cancelled is still terminal for counting/assigned_to semantics …
+        assert!(TaskState::Cancelled.is_terminal());
+        // … but the narrow retroactive-closeout edge is allowed.
+        assert!(TaskState::Cancelled.can_transition_to(&TaskState::Completed));
+        // Other terminal states remain fully terminal.
+        assert!(!TaskState::Cancelled.can_transition_to(&TaskState::Pending));
+        assert!(!TaskState::Cancelled.can_transition_to(&TaskState::Assigned));
+        assert!(!TaskState::Completed.can_transition_to(&TaskState::Cancelled));
+        assert!(!TaskState::Rejected.can_transition_to(&TaskState::Completed));
+    }
+
+    #[test]
+    fn task_transition_cancelled_to_completed_actually_applies() {
+        let mut t = Task::new("retro", "close out a cancelled task");
+        t.state = TaskState::Cancelled;
+        t.transition(TaskState::Completed).expect("should succeed");
+        assert_eq!(t.state, TaskState::Completed);
     }
 }

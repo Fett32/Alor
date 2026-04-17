@@ -219,6 +219,11 @@ pub struct CliTaskCreate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliTaskComplete {
     pub task_id: Uuid,
+    /// Optional close-out summary recorded via `set_task_summary`. Primarily
+    /// used to attach a retroactive note when promoting a Cancelled task to
+    /// Completed.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

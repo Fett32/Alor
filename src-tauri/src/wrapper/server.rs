@@ -641,6 +641,13 @@ impl SocketServer {
             MSG_CLI_TASK_COMPLETE => {
                 match env.decode_payload::<CliTaskCompletePayload>() {
                     Ok(payload) => {
+                        // Stash summary *before* the transition so it is
+                        // visible in the Completed task snapshot emitted by
+                        // `tasks-changed` / `task.completed`.
+                        if let Some(ref summary) = payload.summary {
+                            self.app_state
+                                .set_task_summary(payload.task_id, summary.clone());
+                        }
                         match self
                             .app_state
                             .transition_task(payload.task_id, TaskState::Completed)
