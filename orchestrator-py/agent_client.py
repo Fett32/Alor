@@ -17,6 +17,12 @@ from typing import Any, AsyncIterator
 
 DAEMON_SOCKET = "/tmp/alor/daemon.sock"
 
+# Match daemon.py's 16 MiB read buffer so task.assign envelopes carrying
+# long TASK BRIEF descriptions (or any envelope above 64 KiB) don't trip
+# asyncio.StreamReader's default limit with "Separator is found, but
+# chunk is longer than limit".
+SOCKET_READ_LIMIT = 16 * 1024 * 1024
+
 # Wire-protocol constants — must match wrapper/src/protocol.rs
 MSG_REGISTER = "wrapper.register"
 MSG_TASK_ASSIGN = "task.assign"
@@ -82,7 +88,9 @@ class AgentClient:
         The daemon's response (or lack thereof) is handled by the caller's
         recv loop — we don't block here, matching alor-wrapper's behavior.
         """
-        self._reader, self._writer = await asyncio.open_unix_connection(self.socket_path)
+        self._reader, self._writer = await asyncio.open_unix_connection(
+            self.socket_path, limit=SOCKET_READ_LIMIT
+        )
         env = Envelope.new(MSG_REGISTER, {"agent_id": self.agent_id})
         self._writer.write(env.to_json())
         await self._writer.drain()

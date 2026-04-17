@@ -16,6 +16,13 @@ from typing import Any, AsyncIterator
 DAEMON_SOCKET = "/tmp/alor/daemon.sock"
 REQUEST_TIMEOUT_S = 30.0
 
+# asyncio.StreamReader defaults to a 64 KiB buffer per readline, which is
+# the same order as our per-task summary cap — so a task_list or agent_list
+# response with even a few summaries blows past the limit and raises
+# "Separator is found, but chunk is longer than limit". Bump to 16 MiB to
+# match the daemon's server-side cap ceiling and give headroom.
+SOCKET_READ_LIMIT = 16 * 1024 * 1024
+
 
 class DaemonError(RuntimeError):
     pass
@@ -32,7 +39,7 @@ def _envelope(kind: str, payload: dict[str, Any] | None = None) -> dict[str, Any
 async def _one_shot(kind: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Send one request, read one response, close the connection."""
     try:
-        reader, writer = await asyncio.open_unix_connection(DAEMON_SOCKET)
+        reader, writer = await asyncio.open_unix_connection(DAEMON_SOCKET, limit=SOCKET_READ_LIMIT)
     except (FileNotFoundError, ConnectionRefusedError) as e:
         raise DaemonError(f"daemon not reachable at {DAEMON_SOCKET}: {e}") from e
 
@@ -165,7 +172,7 @@ async def agent_send_message_await(
     daemon broadcasts to all subscribers, so both see the event.
     """
     try:
-        reader, writer = await asyncio.open_unix_connection(DAEMON_SOCKET)
+        reader, writer = await asyncio.open_unix_connection(DAEMON_SOCKET, limit=SOCKET_READ_LIMIT)
     except (FileNotFoundError, ConnectionRefusedError) as e:
         raise DaemonError(f"daemon not reachable at {DAEMON_SOCKET}: {e}") from e
 
@@ -293,7 +300,7 @@ async def event_stream() -> AsyncIterator[Event]:
     """
     while True:
         try:
-            reader, writer = await asyncio.open_unix_connection(DAEMON_SOCKET)
+            reader, writer = await asyncio.open_unix_connection(DAEMON_SOCKET, limit=SOCKET_READ_LIMIT)
         except (FileNotFoundError, ConnectionRefusedError):
             await asyncio.sleep(2.0)
             continue
