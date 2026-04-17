@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from prompt_toolkit.patch_stdout import patch_stdout
 
 import agent_client
 from agent_client import AgentClient, Envelope, MSG_TASK_ASSIGN, MSG_STATUS_REQUEST, MSG_SHUTDOWN
@@ -163,11 +164,9 @@ async def stdin_loop(
 ) -> None:
     """Let Fett type follow-ups into the worker's tmux pane."""
     while not stop.is_set():
-        # Don't reprint the prompt while a task is using the SDK client —
-        # it just adds noise under the streaming task output.
-        if not client_lock.locked():
-            print(f"{C_CYAN}{agent_id}>{C_RESET} ", end="", flush=True)
-        line = await read_line()
+        # prompt_toolkit owns the prompt line; patch_stdout keeps streaming
+        # task output above it without clobbering the input buffer.
+        line = await read_line(f"{C_CYAN}{agent_id}>{C_RESET} ")
         if line is None:
             stop.set()
             return
@@ -249,25 +248,28 @@ async def main() -> int:
 
     print(f"{C_GREEN}{args.agent_id} online — waiting for tasks.{C_RESET}")
 
-    async with ClaudeSDKClient(options=options) as client:
-        client_lock = asyncio.Lock()
-        daemon_task = asyncio.create_task(
-            daemon_loop(sock, client, client_lock, totals, cost, session_start, stop)
-        )
-        stdin_task = asyncio.create_task(
-            stdin_loop(client, client_lock, totals, cost, session_start, args.agent_id, stop)
-        )
+    # patch_stdout keeps streaming task output above the live prompt line
+    # so Fett can type follow-ups without them getting overwritten.
+    with patch_stdout(raw=True):
+        async with ClaudeSDKClient(options=options) as client:
+            client_lock = asyncio.Lock()
+            daemon_task = asyncio.create_task(
+                daemon_loop(sock, client, client_lock, totals, cost, session_start, stop)
+            )
+            stdin_task = asyncio.create_task(
+                stdin_loop(client, client_lock, totals, cost, session_start, args.agent_id, stop)
+            )
 
-        done, pending = await asyncio.wait(
-            [daemon_task, stdin_task], return_when=asyncio.FIRST_COMPLETED
-        )
-        stop.set()
-        for t in pending:
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
+            done, pending = await asyncio.wait(
+                [daemon_task, stdin_task], return_when=asyncio.FIRST_COMPLETED
+            )
+            stop.set()
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     await sock.close()
     return 0

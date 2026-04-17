@@ -369,6 +369,54 @@ pub async fn terminal_resize(
     bridge.resize(cols, rows).await.map_err(err)
 }
 
+/// Read the X11 PRIMARY selection and inject it into the PTY.
+///
+/// Triggered by the frontend on middle-click. The webview doesn't fire a
+/// browser paste event for middle-click on non-contenteditable elements, so
+/// we synthesise the paste here: read PRIMARY via xclip (or wl-paste on
+/// Wayland), then write it into the PTY exactly as if the user had typed it.
+/// Empty selections are a silent no-op.
+#[tauri::command]
+pub async fn terminal_paste_primary(
+    bridge: State<'_, TerminalBridge>,
+) -> Result<(), String> {
+    let text = read_primary_selection().await;
+    if text.is_empty() {
+        return Ok(());
+    }
+    bridge.send_keys(&text).await.map_err(err)
+}
+
+/// Try xclip first (works on X11 and XWayland), then wl-paste (pure Wayland).
+/// Returns an empty string on any failure — paste is best-effort.
+async fn read_primary_selection() -> String {
+    use tokio::process::Command;
+
+    // xclip -selection primary -o
+    if let Ok(out) = Command::new("xclip")
+        .args(["-selection", "primary", "-o"])
+        .output()
+        .await
+    {
+        if out.status.success() {
+            return String::from_utf8_lossy(&out.stdout).into_owned();
+        }
+    }
+
+    // wl-paste --primary --no-newline
+    if let Ok(out) = Command::new("wl-paste")
+        .args(["--primary", "--no-newline"])
+        .output()
+        .await
+    {
+        if out.status.success() {
+            return String::from_utf8_lossy(&out.stdout).into_owned();
+        }
+    }
+
+    String::new()
+}
+
 // ---------------------------------------------------------------------------
 // Pane management commands
 // ---------------------------------------------------------------------------
@@ -397,4 +445,24 @@ pub async fn pane_list(
     pm: State<'_, PaneManager>,
 ) -> Result<Vec<String>, String> {
     Ok(pm.visible_agents().await)
+}
+
+/// Flip pane layout between automatic rebalancing and manual (user-controlled).
+/// In manual mode, `rebalance_layout` is a no-op so drag-resized borders
+/// survive pane add/remove. Returns the new state for optimistic UI updates.
+#[tauri::command]
+pub async fn pane_set_layout_mode(
+    pm: State<'_, PaneManager>,
+    manual: bool,
+) -> Result<bool, String> {
+    pm.set_manual_layout(manual);
+    Ok(pm.is_manual_layout())
+}
+
+/// Query current layout mode (manual vs automatic).
+#[tauri::command]
+pub async fn pane_get_layout_mode(
+    pm: State<'_, PaneManager>,
+) -> Result<bool, String> {
+    Ok(pm.is_manual_layout())
 }

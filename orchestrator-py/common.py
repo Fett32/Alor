@@ -21,6 +21,8 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import ANSI
 
 # ---- ANSI colors ------------------------------------------------------------
 
@@ -67,11 +69,32 @@ def print_footer(session_start: float, total_cost_usd: float, totals: dict[str, 
 
 # ---- stdin ------------------------------------------------------------------
 
-async def read_line() -> str | None:
-    """Read one line from stdin without blocking the event loop.  None on EOF."""
-    loop = asyncio.get_running_loop()
+# One PromptSession per process.  Holds history, key bindings, rendering
+# state; reusing it across calls is what gives Up/Down arrow history.
+_session: PromptSession | None = None
+
+
+def _get_session() -> PromptSession:
+    global _session
+    if _session is None:
+        _session = PromptSession()
+    return _session
+
+
+async def read_line(prompt: str = "") -> str | None:
+    """Read one line of input with full line-editing.
+
+    Backed by prompt_toolkit, so arrow keys, word-jump (Alt+B/F or
+    Ctrl+Left/Right), Home/End, Ctrl+W/U/K, and Up/Down history all work.
+    Returns None on EOF or Ctrl-C at an empty prompt.
+
+    `prompt` may contain ANSI escape sequences — they're wrapped in the
+    prompt_toolkit `ANSI` formatted-text so colours render correctly
+    instead of being typed as literal characters.
+    """
+    sess = _get_session()
     try:
-        return await loop.run_in_executor(None, sys.stdin.readline)
+        return await sess.prompt_async(ANSI(prompt))
     except (KeyboardInterrupt, EOFError):
         return None
 

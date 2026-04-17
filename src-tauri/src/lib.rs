@@ -264,9 +264,12 @@ pub fn run() {
             commands::terminal_attach,
             commands::terminal_send_keys,
             commands::terminal_resize,
+            commands::terminal_paste_primary,
             commands::pane_show,
             commands::pane_hide,
             commands::pane_list,
+            commands::pane_set_layout_mode,
+            commands::pane_get_layout_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error running alor");

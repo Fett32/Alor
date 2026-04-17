@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from prompt_toolkit.patch_stdout import patch_stdout
 
 import daemon
 import tools
@@ -34,8 +35,11 @@ def load_system_prompt() -> str:
 
 
 def print_event(evt: daemon.Event) -> None:
+    # With patch_stdout enabled around the REPL, prompt_toolkit re-renders
+    # the input line after each print — so we no longer need the `\r` trick
+    # or a follow-up prompt reprint.
     ts = evt.timestamp or ""
-    print(f"\r{C_DIM}[event {ts} {evt.event}] {evt.data}{C_RESET}")
+    print(f"{C_DIM}[event {ts} {evt.event}] {evt.data}{C_RESET}")
 
 
 # Events that should wake the orch agent (push into SDK context) rather than
@@ -106,7 +110,6 @@ async def event_watcher(
             print_event(evt)
             injected = format_event_for_agent(evt)
             if injected is None:
-                print(f"{C_CYAN}orch>{C_RESET} ", end="", flush=True)
                 continue
             try:
                 async with client_lock:
@@ -115,7 +118,6 @@ async def event_watcher(
                 print_footer(session_start, cost[0], totals)
             except Exception as e:
                 print(f"{C_RED}[event inject error] {e}{C_RESET}")
-            print(f"{C_CYAN}orch>{C_RESET} ", end="", flush=True)
 
     task = asyncio.create_task(consume())
     await stop.wait()
@@ -167,53 +169,56 @@ async def main() -> int:
     client_lock = asyncio.Lock()
     event_task: asyncio.Task | None = None
 
+    # patch_stdout makes every `print` go ABOVE the prompt_toolkit input
+    # line, so streaming SDK output / event markers / footers never stomp
+    # whatever Fett is currently typing.
     try:
-        async with ClaudeSDKClient(options=options) as client:
-            event_task = asyncio.create_task(
-                event_watcher(
-                    stop_events, client, client_lock, totals, cost_accumulator, session_start
-                )
-            )
-            try:
-                async with client_lock:
-                    await client.query(
-                        "Introduce yourself in one short line so Fett knows you're online and ready. "
-                        "Do not list your tools."
+        with patch_stdout(raw=True):
+            async with ClaudeSDKClient(options=options) as client:
+                event_task = asyncio.create_task(
+                    event_watcher(
+                        stop_events, client, client_lock, totals, cost_accumulator, session_start
                     )
-                    await process_response(client, totals, cost_accumulator)
-                print_footer(session_start, cost_accumulator[0], totals)
-            except Exception as e:
-                print(f"{C_RED}[greet error] {e}{C_RESET}")
-
-            while True:
-                print(f"{C_CYAN}orch>{C_RESET} ", end="", flush=True)
-                line = await read_line()
-                if line is None:
-                    print()
-                    break
-                text = line.strip()
-                if not text:
-                    continue
-                if text in ("/quit", "/exit"):
-                    break
-                if text == "/usage":
-                    print_footer(session_start, cost_accumulator[0], totals)
-                    continue
-                if text == "/reset":
-                    async with client_lock:
-                        await client.disconnect()
-                        await client.connect()
-                    print("[conversation reset]")
-                    continue
-
+                )
                 try:
                     async with client_lock:
-                        await client.query(text)
+                        await client.query(
+                            "Introduce yourself in one short line so Fett knows you're online and ready. "
+                            "Do not list your tools."
+                        )
                         await process_response(client, totals, cost_accumulator)
+                    print_footer(session_start, cost_accumulator[0], totals)
                 except Exception as e:
-                    print(f"{C_RED}[error] {e}{C_RESET}")
+                    print(f"{C_RED}[greet error] {e}{C_RESET}")
 
-                print_footer(session_start, cost_accumulator[0], totals)
+                while True:
+                    line = await read_line(f"{C_CYAN}orch>{C_RESET} ")
+                    if line is None:
+                        print()
+                        break
+                    text = line.strip()
+                    if not text:
+                        continue
+                    if text in ("/quit", "/exit"):
+                        break
+                    if text == "/usage":
+                        print_footer(session_start, cost_accumulator[0], totals)
+                        continue
+                    if text == "/reset":
+                        async with client_lock:
+                            await client.disconnect()
+                            await client.connect()
+                        print("[conversation reset]")
+                        continue
+
+                    try:
+                        async with client_lock:
+                            await client.query(text)
+                            await process_response(client, totals, cost_accumulator)
+                    except Exception as e:
+                        print(f"{C_RED}[error] {e}{C_RESET}")
+
+                    print_footer(session_start, cost_accumulator[0], totals)
     finally:
         stop_events.set()
         if event_task is not None:

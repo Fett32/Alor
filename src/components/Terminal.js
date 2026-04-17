@@ -161,16 +161,41 @@ function createTerminal() {
       return false;
     }
 
+    // Ctrl+Shift+L → reset manual-layout lock so rebalance_layout re-engages
+    // the next time an agent is added or removed. After a user drag-resizes
+    // a pane border, the backend auto-locks the layout; this is the escape
+    // hatch back to automatic tiling.
+    if (event.ctrlKey && event.shiftKey && event.code === "KeyL") {
+      invoke("pane_set_layout_mode", { manual: false }).catch((err) => {
+        console.warn("[Terminal] pane_set_layout_mode failed:", err);
+      });
+      return false;
+    }
+
     return true;
   });
 
-  // Disable middle-click paste in xterm.js — tmux owns middle-click.
-  $container.addEventListener("mousedown", (e) => {
-    if (e.button === 1) e.preventDefault();
-  });
-  $container.addEventListener("auxclick", (e) => {
-    if (e.button === 1) e.preventDefault();
-  });
+  // -----------------------------------------------------------------------
+  // Middle-click paste (X11 PRIMARY selection).
+  // xterm.js forwards mouse events to tmux (which has `mouse on`), so by the
+  // time a normal listener runs, tmux has already swallowed the click and
+  // the webview's own "paste PRIMARY on middle-click" behaviour never fires
+  // (it only works on contenteditable/textarea targets anyway).
+  //
+  // Fix: capture-phase listener on the container intercepts BEFORE xterm.js.
+  // We stop propagation so tmux never sees the click, read X11 PRIMARY in
+  // Rust (xclip / wl-paste), and inject the text into the PTY.
+  // -----------------------------------------------------------------------
+  const handleMiddleClick = (e) => {
+    if (e.button !== 1) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    invoke("terminal_paste_primary").catch((err) => {
+      console.warn("[Terminal] paste_primary failed:", err);
+    });
+  };
+  $container.addEventListener("mousedown", handleMiddleClick, { capture: true });
+  $container.addEventListener("auxclick",  handleMiddleClick, { capture: true });
 
   // -----------------------------------------------------------------------
   // Key send queue — serialise IPC calls so rapid keypresses are never
