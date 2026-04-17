@@ -268,7 +268,8 @@ impl PaneManager {
         let pane_count = self.count_panes().await;
 
         // The attach command — TMUX='' prevents "sessions should be nested" error.
-        let attach_cmd = format!("TMUX='' tmux attach -t {agent_session}");
+        // `=` forces exact-match so `alor-claude` can't attach to `alor-claude-alor`.
+        let attach_cmd = format!("TMUX='' tmux attach -t ={agent_session}");
 
         let is_orchestrator = agent_id == "orchestrator";
 
@@ -653,8 +654,13 @@ impl PaneManager {
 
     /// Check if a tmux session exists.
     pub async fn session_exists(&self, name: &str) -> bool {
+        // `=` forces exact match.  Without it, tmux's prefix matching
+        // reports `alor-claude` as existing whenever `alor-claude-alor`
+        // exists — causing the `claude` yaml template to "reclaim" the
+        // instance's session on boot and giving two agents the same pane.
+        let exact = format!("={name}");
         Command::new("tmux")
-            .args(["has-session", "-t", name])
+            .args(["has-session", "-t", &exact])
             .output()
             .await
             .map(|o| o.status.success())

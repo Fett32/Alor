@@ -3,10 +3,17 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+/// Wrap a session name with `=` so tmux treats the `-t` target as an exact
+/// match instead of a prefix. Without this, `alor-claude` matches
+/// `alor-claude-alor` and operations silently hit the wrong session.
+fn target(name: &str) -> String {
+    format!("={name}")
+}
+
 /// Returns true if a tmux session with this name currently exists.
 pub fn session_exists(name: &str) -> bool {
     Command::new("tmux")
-        .args(["has-session", "-t", name])
+        .args(["has-session", "-t", &target(name)])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -40,9 +47,10 @@ pub fn create_session_with_dir(name: &str, command: &str, workdir: Option<&str>)
 
 /// Inject `text` into the tmux session as a single block, followed by Enter.
 pub fn send_keys(name: &str, text: &str) -> Result<()> {
+    let t = target(name);
     // Use -l (literal) so tmux doesn't interpret special sequences.
     let out = Command::new("tmux")
-        .args(["send-keys", "-t", name, "-l", text])
+        .args(["send-keys", "-t", &t, "-l", text])
         .output()
         .context("failed to spawn tmux send-keys (text)")?;
     if !out.status.success() {
@@ -54,7 +62,7 @@ pub fn send_keys(name: &str, text: &str) -> Result<()> {
 
     // Send a final Enter to submit
     let out = Command::new("tmux")
-        .args(["send-keys", "-t", name, "Enter"])
+        .args(["send-keys", "-t", &t, "Enter"])
         .output()
         .context("failed to spawn tmux send-keys (Enter)")?;
     if !out.status.success() {
@@ -66,14 +74,15 @@ pub fn send_keys(name: &str, text: &str) -> Result<()> {
 /// Apply Alor's default session options (mouse, scrollback, paste detection).
 /// Called on session creation and also when reusing a pre-existing session.
 pub fn ensure_session_defaults(name: &str) {
+    let t = target(name);
     let _ = Command::new("tmux")
-        .args(["set-option", "-t", name, "mouse", "on"])
+        .args(["set-option", "-t", &t, "mouse", "on"])
         .output();
     let _ = Command::new("tmux")
-        .args(["set-option", "-t", name, "history-limit", "50000"])
+        .args(["set-option", "-t", &t, "history-limit", "50000"])
         .output();
     let _ = Command::new("tmux")
-        .args(["set-option", "-t", name, "assume-paste-time", "0"])
+        .args(["set-option", "-t", &t, "assume-paste-time", "0"])
         .output();
 }
 
@@ -81,11 +90,12 @@ pub fn ensure_session_defaults(name: &str) {
 /// Returns each line as a separate String.
 pub fn capture_pane(name: &str, lines: usize) -> Result<Vec<String>> {
     let start = format!("-{}", lines);
+    let t = target(name);
     let out = Command::new("tmux")
         .args([
             "capture-pane",
             "-p",          // print to stdout
-            "-t", name,
+            "-t", &t,
             "-S", &start,  // start N lines back
         ])
         .output()

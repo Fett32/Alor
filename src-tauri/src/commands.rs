@@ -215,15 +215,17 @@ pub async fn kill_agent(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    // 2. Kill the specific tmux session (backup in case wrapper is stuck)
-    let session = format!("alor-{}", id);
+    // 2. Kill the specific tmux session (backup in case wrapper is stuck).
+    // The leading `=` forces exact match — without it, `alor-claude` would
+    // prefix-match `alor-claude-alor` and kill the wrong session.
+    let session = format!("=alor-{}", id);
     let _ = std::process::Command::new("tmux")
         .args(["kill-session", "-t", &session])
         .output();
 
     // 3. Clear internal state
     let _ = state.set_agent_connected(&id, false).map_err(err)?;
-    
+
     pm.remove_agent_pane(&id).await.map_err(err)?;
     Ok(())
 }
@@ -256,8 +258,8 @@ pub async fn delete_agent(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    // Kill tmux session.
-    let session = format!("alor-{}", id);
+    // Kill tmux session (exact-match; see kill_agent for the prefix trap).
+    let session = format!("=alor-{}", id);
     let _ = std::process::Command::new("tmux")
         .args(["kill-session", "-t", &session])
         .output();
@@ -297,7 +299,7 @@ pub async fn kill_all_agents(
             let stdout = String::from_utf8_lossy(&out.stdout);
             for session in stdout.lines().filter(|s| s.starts_with("alor-")) {
                 let _ = std::process::Command::new("tmux")
-                    .args(["kill-session", "-t", session])
+                    .args(["kill-session", "-t", &format!("={session}")])
                     .output();
             }
         }

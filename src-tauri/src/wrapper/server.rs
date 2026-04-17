@@ -821,7 +821,9 @@ impl SocketServer {
                                 let _ = child.kill();
                             }
                         }
-                        let tmux_session = format!("alor-{}", payload.instance);
+                        // `=` prefix = tmux exact-match, so `alor-claude` can't
+                        // accidentally kill `alor-claude-alor`.
+                        let tmux_session = format!("=alor-{}", payload.instance);
                         let _ = std::process::Command::new("tmux")
                             .args(["kill-session", "-t", &tmux_session])
                             .output();
@@ -871,8 +873,8 @@ impl SocketServer {
                             }
                         };
 
-                        // Also kill the tmux session
-                        let tmux_session = format!("alor-{}", payload.instance);
+                        // Also kill the tmux session (exact-match target).
+                        let tmux_session = format!("=alor-{}", payload.instance);
                         let _ = std::process::Command::new("tmux")
                             .args(["kill-session", "-t", &tmux_session])
                             .output();
@@ -1139,7 +1141,10 @@ impl SocketServer {
                                 &format!("invalid agent_id: {:?}", payload.agent_id),
                             );
                         }
-                        let session = format!("alor-{}", payload.agent_id);
+                        // Exact-match target — `alor-claude` must not fall
+                        // through to `alor-claude-alor` and deliver to the
+                        // wrong worker.
+                        let session = format!("=alor-{}", payload.agent_id);
                         let session_exists = tokio::process::Command::new("tmux")
                             .args(["has-session", "-t", &session])
                             .output()

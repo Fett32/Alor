@@ -128,12 +128,17 @@ pub fn run() {
                 daemon::session::kill_stale_wrappers();
                 std::thread::sleep(std::time::Duration::from_millis(200));
 
-                // Recovery: identify agents that have existing tmux sessions
+                // Recovery: identify agents that have existing tmux sessions.
+                // Templates are recipes, not slots — never reclaim them
+                // even if `session_exists` were to misfire.
                 let mut to_launch = Vec::new();
                 for (id, cfg) in configs_for_launch {
+                    if cfg.template {
+                        continue;
+                    }
                     let session_name = format!("alor-{}", id);
                     let exists = tauri::async_runtime::block_on(pm_recovery.session_exists(&session_name));
-                    
+
                     if cfg.autolaunch || exists {
                         if exists {
                             tracing::info!(agent_id = %id, "reclaiming existing tmux session");
