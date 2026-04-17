@@ -179,7 +179,10 @@ async def agent_kill(args: dict[str, Any]) -> dict[str, Any]:
     "block until the agent's SDK turn finishes and the reply comes back — "
     "returns the reply text inline so you can act on the answer in the "
     "same turn. Default is fire-and-forget (reply arrives later as a "
-    "`worker.orch_response` event injection).",
+    "`worker.orch_response` event injection). "
+    "Only works against `claude-sdk` runtime workers — wrapper-runtime "
+    "agents (codex, gemini, etc.) reject framed sends; use a new task for "
+    "those instead.",
     {
         "agent_id": str,
         "text": str,
