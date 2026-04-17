@@ -17,14 +17,15 @@ use crate::wrapper::protocol::{
     CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliDelete, CliKill, CliMemoryGet,
     CliProjectGet, CliProjectSave, CliSpawn, CliTaskCancel, CliTaskCreate,
     CliTaskComplete as CliTaskCompletePayload, CliTaskGet, Envelope, TaskAccept, TaskAssign,
-    TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WrapperError, WrapperRegister,
-    MSG_CLI_AGENT_ENSURE_RUNNING, MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_DELETE,
-    MSG_CLI_ERROR, MSG_CLI_EVENT_STREAM, MSG_CLI_KILL, MSG_CLI_MEMORY_GET, MSG_CLI_PROJECT_GET,
-    MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE, MSG_CLI_RESPONSE, MSG_CLI_SPAWN, MSG_CLI_STATUS,
-    MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE, MSG_CLI_TASK_CREATE, MSG_CLI_TASK_GET,
-    MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER, MSG_CLI_INTEGRATIONS_GET,
-    MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN, MSG_TASK_BLOCKED, MSG_TASK_COMPLETE,
-    MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
+    TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WorkerUserInput, WrapperError,
+    WrapperRegister, MSG_CLI_AGENT_ENSURE_RUNNING, MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN,
+    MSG_CLI_DELETE, MSG_CLI_ERROR, MSG_CLI_EVENT_STREAM, MSG_CLI_KILL, MSG_CLI_MEMORY_GET,
+    MSG_CLI_PROJECT_GET, MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE, MSG_CLI_RESPONSE,
+    MSG_CLI_SPAWN, MSG_CLI_STATUS, MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE,
+    MSG_CLI_TASK_CREATE, MSG_CLI_TASK_GET, MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT,
+    MSG_REGISTER, MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT,
+    MSG_TASK_ASSIGN, MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE,
+    MSG_USER_INTERVENTION, MSG_WORKER_USER_INPUT,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -40,6 +41,17 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub const DAEMON_SOCKET: &str = "/tmp/alor/daemon.sock";
+
+/// Prefix the daemon prepends to `cli.agent.send_message` text when
+/// `suppress_echo: true`. SDK workers (Python worker.py) check for this
+/// sentinel on stdin; if present, they strip it and skip emitting a
+/// `worker.user_input` event so programmatic orch→worker sends don't
+/// bounce back as if Fett had typed them. MUST stay in lockstep with
+/// `orchestrator-py/worker.py::WORKER_ECHO_SENTINEL`.
+///
+/// Kept to printable ASCII because tmux→pty→prompt_toolkit tends to drop
+/// unbound control bytes (RS/US) silently, which would defeat the guard.
+pub const WORKER_ECHO_SENTINEL: &str = "__ALOR_ORCH_ECHO__ ";
 
 /// A connected wrapper's write half, keyed by agent_id.
 type WriterMap = Arc<Mutex<HashMap<String, tokio::net::unix::OwnedWriteHalf>>>;
@@ -453,6 +465,29 @@ impl SocketServer {
                         json!({
                             "agent_id": agent_id,
                             "task_ids": task_ids,
+                        }),
+                    )
+                    .await;
+                }
+            }
+
+            MSG_WORKER_USER_INPUT => {
+                // SDK-worker stdin forwarded as an event. agent_id is the
+                // connection-bound one so a worker can't impersonate others.
+                if let Ok(payload) = env.decode_payload::<WorkerUserInput>() {
+                    info!(
+                        agent_id,
+                        during_task = payload.during_task,
+                        bytes = payload.text.len(),
+                        "worker user input received"
+                    );
+                    self.broadcast_event(
+                        "worker.user_input",
+                        json!({
+                            "agent_id": agent_id,
+                            "text": payload.text,
+                            "during_task": payload.during_task,
+                            "task_id": payload.task_id.map(|t| t.to_string()),
                         }),
                     )
                     .await;
@@ -1157,8 +1192,19 @@ impl SocketServer {
                                 &format!("no tmux session for agent {}", payload.agent_id),
                             );
                         }
+                        // If the caller asked to suppress the stdin echo
+                        // (orch → SDK-worker path), prepend the sentinel so
+                        // the worker recognizes this line as programmatic and
+                        // skips forwarding it back as a `worker.user_input`
+                        // event. The sentinel is stripped by the worker
+                        // before the text reaches the SDK.
+                        let effective_text = if payload.suppress_echo {
+                            format!("{}{}", WORKER_ECHO_SENTINEL, payload.text)
+                        } else {
+                            payload.text.clone()
+                        };
                         let send_out = tokio::process::Command::new("tmux")
-                            .args(["send-keys", "-t", &session, "-l", &payload.text])
+                            .args(["send-keys", "-t", &session, "-l", &effective_text])
                             .output()
                             .await;
                         if let Err(e) = send_out {
@@ -1177,6 +1223,7 @@ impl SocketServer {
                             agent_id = %payload.agent_id,
                             submit = payload.submit,
                             bytes = payload.text.len(),
+                            suppress_echo = payload.suppress_echo,
                             "cli.agent.send_message"
                         );
                         match Envelope::new(

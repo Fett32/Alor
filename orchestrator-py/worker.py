@@ -32,6 +32,20 @@ from common import (
 DEFAULT_MODEL = os.environ.get("ALOR_WORKER_MODEL", "claude-opus-4-7")
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "worker_prompt.md"
 
+# Echo-guard sentinel. Kept in lockstep with the Rust daemon's
+# `WORKER_ECHO_SENTINEL` (src-tauri/src/wrapper/server.rs). Any stdin line
+# that starts with this prefix originated from a programmatic
+# `cli.agent.send_message` with `suppress_echo: true` — typically the
+# orchestrator answering the worker through the tmux path. The worker
+# strips the prefix before feeding text to the SDK, and skips emitting a
+# `worker.user_input` event so orch→worker messages don't bounce back
+# and re-enter the orch as if Fett had typed them.
+#
+# Kept to printable ASCII so it survives tmux→pty→prompt_toolkit intact;
+# unbound control chars (RS/US) get silently dropped by prompt_toolkit
+# and would break the guard.
+WORKER_ECHO_SENTINEL = "__ALOR_ORCH_ECHO__ "
+
 
 def render_prompt(agent_id: str, project: str | None, workdir: str, model: str) -> str:
     template = PROMPT_TEMPLATE_PATH.read_text()
@@ -60,6 +74,7 @@ async def run_task(
     totals: dict[str, int],
     cost: list[float],
     session_start: float,
+    current: dict[str, str | None],
 ) -> None:
     payload = env.payload
     task_id = payload.get("task_id", "")
@@ -87,20 +102,27 @@ async def run_task(
         latest["text"] = text
         print(text)
 
+    # Publish the active task_id so stdin_loop can tag forwarded events with
+    # `during_task: true` and the task id. Cleared in `finally` so post-task
+    # stdin fires with `during_task: false`.
+    current["task_id"] = task_id or None
     try:
-        async with client_lock:
-            await client.query(prompt)
-            await process_response(client, totals, cost, on_text=capture)
-    except Exception as e:
-        err = f"worker exception during task: {e}"
-        print(f"{C_RED}[task error] {err}{C_RESET}")
         try:
-            await sock.send_error(err)
-        except Exception:
-            pass
-        return
+            async with client_lock:
+                await client.query(prompt)
+                await process_response(client, totals, cost, on_text=capture)
+        except Exception as e:
+            err = f"worker exception during task: {e}"
+            print(f"{C_RED}[task error] {err}{C_RESET}")
+            try:
+                await sock.send_error(err)
+            except Exception:
+                pass
+            return
 
-    print_footer(session_start, cost[0], totals)
+        print_footer(session_start, cost[0], totals)
+    finally:
+        current["task_id"] = None
 
     summary = latest["text"].strip() or None
     # Cap summary client-side too so we don't blow through the daemon's
@@ -130,13 +152,16 @@ async def daemon_loop(
     cost: list[float],
     session_start: float,
     stop: asyncio.Event,
+    current: dict[str, str | None],
 ) -> None:
     """Receive envelopes from the daemon forever."""
     async for env in sock.recv_forever():
         if stop.is_set():
             break
         if env.kind == MSG_TASK_ASSIGN:
-            await run_task(client, client_lock, sock, env, totals, cost, session_start)
+            await run_task(
+                client, client_lock, sock, env, totals, cost, session_start, current
+            )
         elif env.kind == MSG_STATUS_REQUEST:
             task_id = (env.payload or {}).get("task_id")
             try:
@@ -161,8 +186,18 @@ async def stdin_loop(
     session_start: float,
     agent_id: str,
     stop: asyncio.Event,
+    sock: AgentClient,
+    current: dict[str, str | None],
 ) -> None:
-    """Let Fett type follow-ups into the worker's tmux pane."""
+    """Let Fett type follow-ups into the worker's tmux pane.
+
+    Non-slash lines are forwarded to the daemon as `worker.user_input`
+    events so the orchestrator stays aware of follow-ups. Lines prefixed
+    with `WORKER_ECHO_SENTINEL` originated from a programmatic send
+    (orch → tmux send-keys with `suppress_echo: true`); the sentinel is
+    stripped and the line is NOT forwarded — avoids an echo loop back into
+    the orch's SDK context.
+    """
     while not stop.is_set():
         # prompt_toolkit owns the prompt line; patch_stdout keeps streaming
         # task output above it without clobbering the input buffer.
@@ -170,6 +205,12 @@ async def stdin_loop(
         if line is None:
             stop.set()
             return
+        # Echo-guard: identify (and strip) programmatic injections BEFORE
+        # .strip() — the sentinel must be anchored at the start of the raw
+        # line so leading whitespace in Fett's typed text can't spoof it.
+        is_programmatic = line.startswith(WORKER_ECHO_SENTINEL)
+        if is_programmatic:
+            line = line[len(WORKER_ECHO_SENTINEL):]
         text = line.strip()
         if not text:
             continue
@@ -188,6 +229,22 @@ async def stdin_loop(
                 except Exception as e:
                     print(f"{C_RED}[reset failed] {e}{C_RESET}")
             continue
+
+        # Forward to the orch as an event so it stays aware of post-task
+        # follow-ups. Skip when the line came from a programmatic sender
+        # (orch itself) — otherwise orch→worker→orch loops on every reply.
+        if not is_programmatic:
+            task_id = current.get("task_id")
+            try:
+                await sock.send_worker_user_input(
+                    text=text,
+                    during_task=task_id is not None,
+                    task_id=task_id,
+                )
+            except Exception as e:
+                # Non-fatal: keep the local conversation going even if the
+                # daemon is unreachable. The orch just won't see this line.
+                print(f"{C_RED}[forward to daemon failed] {e}{C_RESET}")
 
         try:
             async with client_lock:
@@ -227,6 +284,10 @@ async def main() -> int:
     totals: dict[str, int] = {}
     cost: list[float] = [0.0]
     stop = asyncio.Event()
+    # Shared pointer to the currently-running task_id (or None when idle).
+    # Updated by run_task, read by stdin_loop to tag `worker.user_input`
+    # events with the right `during_task` flag.
+    current: dict[str, str | None] = {"task_id": None}
 
     # Graceful shutdown on SIGTERM/SIGINT — sets the stop event so both
     # daemon_loop and stdin_loop exit cleanly instead of leaving orphan tmux
@@ -254,10 +315,15 @@ async def main() -> int:
         async with ClaudeSDKClient(options=options) as client:
             client_lock = asyncio.Lock()
             daemon_task = asyncio.create_task(
-                daemon_loop(sock, client, client_lock, totals, cost, session_start, stop)
+                daemon_loop(
+                    sock, client, client_lock, totals, cost, session_start, stop, current
+                )
             )
             stdin_task = asyncio.create_task(
-                stdin_loop(client, client_lock, totals, cost, session_start, args.agent_id, stop)
+                stdin_loop(
+                    client, client_lock, totals, cost, session_start,
+                    args.agent_id, stop, sock, current,
+                )
             )
 
             done, pending = await asyncio.wait(

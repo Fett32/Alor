@@ -23,6 +23,7 @@ pub const MSG_STATUS_RESPONSE: &str = "status.response";
 pub const MSG_REGISTER: &str = "wrapper.register";
 pub const MSG_ERROR: &str = "wrapper.error";
 pub const MSG_USER_INTERVENTION: &str = "user.intervention";
+pub const MSG_WORKER_USER_INPUT: &str = "worker.user_input";
 pub const MSG_SHUTDOWN: &str = "daemon.shutdown";
 
 // Phase 9: CLI message types
@@ -171,6 +172,30 @@ pub struct UserIntervention {
 }
 
 // ---------------------------------------------------------------------------
+// W→O  worker.user_input — SDK worker forwards a line Fett typed into its pane
+// ---------------------------------------------------------------------------
+
+/// SDK-runtime workers (Python worker.py) emit this every time Fett's stdin
+/// feeds a non-slash line into the local SDK. Unlike `user.intervention` —
+/// which is a noisy tmux-pane-diff signal from the Rust wrapper with no text
+/// — this carries the exact input. Orch uses it to stay aware of follow-ups
+/// that land on an agent after a task completes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerUserInput {
+    pub agent_id: String,
+    pub text: String,
+    /// True if the worker was mid-task when the input was accepted. SDK
+    /// workers serialize stdin behind `client_lock`, so mid-task input is
+    /// queued until the current turn returns — the distinction matters for
+    /// orch routing.
+    #[serde(default)]
+    pub during_task: bool,
+    /// Optional task_id for mid-task inputs.
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
+}
+
+// ---------------------------------------------------------------------------
 // daemon.shutdown — daemon tells wrapper to exit
 // ---------------------------------------------------------------------------
 
@@ -253,6 +278,12 @@ pub struct CliAgentSendMessage {
     /// caller can build multi-line inputs without submitting.
     #[serde(default)]
     pub submit: bool,
+    /// If true, the daemon prepends the WORKER_ECHO_SENTINEL so the SDK
+    /// worker recognizes this line as programmatic (orch/CLI) origin and
+    /// skips re-emitting it as a `worker.user_input` event. Used by the
+    /// orchestrator's own `agent_send_message` tool to avoid echo loops.
+    #[serde(default)]
+    pub suppress_echo: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

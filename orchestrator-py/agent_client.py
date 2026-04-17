@@ -27,6 +27,7 @@ MSG_STATUS_REQUEST = "status.request"
 MSG_STATUS_RESPONSE = "status.response"
 MSG_SHUTDOWN = "daemon.shutdown"
 MSG_USER_INTERVENTION = "user.intervention"
+MSG_WORKER_USER_INPUT = "worker.user_input"
 
 
 class AgentClientError(RuntimeError):
@@ -110,6 +111,28 @@ class AgentClient:
             MSG_WRAPPER_ERROR,
             {"agent_id": self.agent_id, "message": message},
         )
+
+    async def send_worker_user_input(
+        self,
+        text: str,
+        during_task: bool,
+        task_id: str | None,
+    ) -> None:
+        """Forward a line of Fett's stdin to the daemon as a broadcast event.
+
+        The worker feeds the same line into its local SDK client too — this
+        only makes the orch aware that something was said. Slash commands
+        and sentinel-prefixed (orch-origin) lines are filtered by the
+        caller.
+        """
+        payload: dict[str, Any] = {
+            "agent_id": self.agent_id,
+            "text": text,
+            "during_task": during_task,
+        }
+        if task_id is not None:
+            payload["task_id"] = task_id
+        await self.send(MSG_WORKER_USER_INPUT, payload)
 
     async def send_status(
         self, task_id: str | None, alive: bool, details: str | None = None

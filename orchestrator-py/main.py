@@ -49,6 +49,7 @@ INJECTABLE_EVENTS = {
     "task.blocked",
     "user.intervention",
     "wrapper.error",
+    "worker.user_input",
 }
 
 
@@ -91,6 +92,27 @@ def format_event_for_agent(evt: daemon.Event) -> str | None:
         agent = d.get("agent_id", "?")
         msg = d.get("message", "?")
         return f"[Alor event] wrapper error from {agent}: {msg}"
+    if evt.event == "worker.user_input":
+        agent = d.get("agent_id", "?")
+        text = d.get("text", "")
+        during = bool(d.get("during_task"))
+        task_id = str(d.get("task_id") or "")[:8]
+        if during:
+            context = (
+                f"mid-task ({task_id}). SDK worker is serialized on its "
+                "client_lock, so this line was queued until the current turn "
+                "returned."
+            )
+        else:
+            context = "post-task. The worker's local SDK will reply to Fett directly."
+        return (
+            f"[Alor event] Fett typed into {agent} — {context}\n\n"
+            f"Verbatim input:\n{text}\n\n"
+            "ACT ONLY IF Fett is clearly asking to re-route, reassign, kill, "
+            "or create a new task — the worker is already answering him in "
+            "its own pane. If this is just conversational follow-up to the "
+            "worker, stay silent."
+        )
     return None
 
 

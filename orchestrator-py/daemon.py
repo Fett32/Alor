@@ -100,11 +100,29 @@ async def project_list() -> dict[str, Any]:
 
 
 async def agent_send_message(
-    agent_id: str, text: str, submit: bool = False
+    agent_id: str,
+    text: str,
+    submit: bool = False,
+    suppress_echo: bool = True,
 ) -> dict[str, Any]:
+    """Inject text into an agent's tmux pane.
+
+    `suppress_echo` defaults to True because the only current caller is the
+    orchestrator's own `agent_send_message` tool — orch→worker messages
+    must not round-trip back as `worker.user_input` events, which would
+    echo-loop into the orch's SDK context. Set to False only if you
+    specifically want the send to register as a user-origin event
+    (currently no legitimate case; the flag exists so wrapper-runtime
+    agents stay unaffected if future callers opt out).
+    """
     return await _one_shot(
         "cli.agent.send_message",
-        {"agent_id": agent_id, "text": text, "submit": submit},
+        {
+            "agent_id": agent_id,
+            "text": text,
+            "submit": submit,
+            "suppress_echo": suppress_echo,
+        },
     )
 
 
