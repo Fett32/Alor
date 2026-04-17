@@ -186,6 +186,9 @@ function createTerminal() {
   // We stop propagation so tmux never sees the click, read X11 PRIMARY in
   // Rust (xclip / wl-paste), and inject the text into the PTY.
   // -----------------------------------------------------------------------
+  // One listener, not two. Middle-click fires both `mousedown` and
+  // `auxclick` — hooking both would paste twice (or thrice with browser
+  // re-dispatch quirks). `mousedown` is responsive and canonical.
   const handleMiddleClick = (e) => {
     if (e.button !== 1) return;
     e.preventDefault();
@@ -195,7 +198,14 @@ function createTerminal() {
     });
   };
   $container.addEventListener("mousedown", handleMiddleClick, { capture: true });
-  $container.addEventListener("auxclick",  handleMiddleClick, { capture: true });
+  // Still swallow `auxclick` so the browser's default middle-click paste
+  // (for contenteditable targets, rare here) never double-fires.
+  $container.addEventListener("auxclick", (e) => {
+    if (e.button === 1) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
+  }, { capture: true });
 
   // -----------------------------------------------------------------------
   // Key send queue — serialise IPC calls so rapid keypresses are never
