@@ -185,6 +185,15 @@ async def main() -> int:
     except NotImplementedError:
         pass
 
+    # Ignore SIGHUP so the orch survives the Alor daemon dying. Otherwise
+    # a daemon restart sends SIGHUP via the process group / pty and the
+    # default Python handler terminates us. The event_stream in daemon.py
+    # already reconnects on socket EOF, so staying alive is enough.
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass
+
     session_start = time.monotonic()
     totals: dict[str, int] = {}
     cost_accumulator = [0.0]

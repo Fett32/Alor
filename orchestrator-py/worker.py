@@ -154,28 +154,53 @@ async def daemon_loop(
     stop: asyncio.Event,
     current: dict[str, str | None],
 ) -> None:
-    """Receive envelopes from the daemon forever."""
-    async for env in sock.recv_forever():
+    """Receive envelopes from the daemon, reconnecting on EOF.
+
+    Without the outer reconnect loop, a daemon restart would EOF the socket,
+    return from recv_forever, exit this coroutine, and take the worker with
+    it — which is why workers used to die every time Alor restarted.
+    """
+    while not stop.is_set():
+        try:
+            async for env in sock.recv_forever():
+                if stop.is_set():
+                    return
+                if env.kind == MSG_TASK_ASSIGN:
+                    await run_task(
+                        client, client_lock, sock, env, totals, cost, session_start, current
+                    )
+                elif env.kind == MSG_STATUS_REQUEST:
+                    task_id = (env.payload or {}).get("task_id")
+                    try:
+                        await sock.send_status(task_id=task_id, alive=True, details="worker online")
+                    except Exception:
+                        pass
+                elif env.kind == MSG_SHUTDOWN:
+                    print(f"{C_YELLOW}[daemon shutdown received]{C_RESET}")
+                    stop.set()
+                    return
+                else:
+                    # Ignore unknown envelopes — may be cli.* responses or
+                    # events that the daemon mistakenly echoed.
+                    pass
+        except Exception as e:
+            print(f"{C_RED}[daemon_loop error] {e}{C_RESET}")
+
         if stop.is_set():
-            break
-        if env.kind == MSG_TASK_ASSIGN:
-            await run_task(
-                client, client_lock, sock, env, totals, cost, session_start, current
-            )
-        elif env.kind == MSG_STATUS_REQUEST:
-            task_id = (env.payload or {}).get("task_id")
-            try:
-                await sock.send_status(task_id=task_id, alive=True, details="worker online")
-            except Exception:
-                pass
-        elif env.kind == MSG_SHUTDOWN:
-            print(f"{C_YELLOW}[daemon shutdown received]{C_RESET}")
-            stop.set()
-            break
-        else:
-            # Ignore unknown envelopes — may be cli.* responses or events
-            # that the daemon mistakenly echoed.
-            pass
+            return
+
+        # recv_forever returned because the socket hit EOF (daemon restart,
+        # crash, SIGTERM to the daemon, etc). Reconnect and re-register with
+        # backoff so the worker survives the daemon cycling.
+        print(f"{C_YELLOW}[daemon connection lost, reconnecting in 2s…]{C_RESET}")
+        await sock.close()
+        await asyncio.sleep(2.0)
+        try:
+            await sock.connect_and_register()
+            print(f"{C_GREEN}[reconnected to daemon]{C_RESET}")
+        except Exception as e:
+            print(f"{C_RED}[reconnect failed] {e}; retrying in 3s{C_RESET}")
+            await asyncio.sleep(3.0)
 
 
 async def stdin_loop(
@@ -298,6 +323,15 @@ async def main() -> int:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass  # Non-Unix; the KeyboardInterrupt path still catches Ctrl-C.
+
+    # Ignore SIGHUP so the worker survives the Alor daemon dying. The old
+    # daemon's SIGHUP cascade (inherited process group, or tmux pane PTY
+    # hiccup during restart) would otherwise take Python's default handler
+    # and terminate us. The daemon_loop's reconnect path handles the rest.
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass  # Not in main thread or not supported — not fatal.
 
     # Connect to daemon first — fail fast if it's not reachable.
     sock = AgentClient(args.agent_id)
