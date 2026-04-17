@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
@@ -22,6 +24,13 @@ DAEMON_SOCKET = "/tmp/alor/daemon.sock"
 # asyncio.StreamReader's default limit with "Separator is found, but
 # chunk is longer than limit".
 SOCKET_READ_LIMIT = 16 * 1024 * 1024
+
+# In-memory outbox caps. A worker whose daemon dies mid-`task.complete`
+# used to silently lose the envelope; now the send queues under one of
+# these caps and flushes on reconnect. Kept in-memory because the worker
+# ignores SIGHUP (see worker.py main) and survives daemon cycles intact.
+OUTBOX_MAX_ENTRIES = 100
+OUTBOX_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
 
 # Wire-protocol constants — must match wrapper/src/protocol.rs
 MSG_REGISTER = "wrapper.register"
@@ -81,6 +90,61 @@ class AgentClient:
         self.socket_path = socket_path
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        # Outbox of pre-serialized frames whose send hit a dead/unwritable
+        # socket. `send()` appends here instead of raising so the worker's
+        # turn doesn't blow up; `daemon_loop` drains via `flush_outbox()`
+        # after a successful reconnect. In-memory only — see module-level
+        # cap constants and the comment there for why.
+        self._outbox: deque[bytes] = deque()
+        self._outbox_bytes: int = 0
+        self._outbox_dropped: int = 0
+
+    # --- outbox introspection (used by reconnect path + tests) ----------
+
+    def pending_count(self) -> int:
+        """Number of frames currently queued for retry."""
+        return len(self._outbox)
+
+    def pending_bytes(self) -> int:
+        """Total bytes currently queued."""
+        return self._outbox_bytes
+
+    def dropped_count(self) -> int:
+        """Cumulative frames evicted due to cap overflow."""
+        return self._outbox_dropped
+
+    def _enqueue(self, frame: bytes) -> None:
+        """Append `frame` to the outbox, evicting oldest on cap breach.
+
+        Two caps enforced: hard 100-entry ceiling and 1 MiB byte ceiling.
+        Eviction is FIFO so the oldest (most likely stale) frame is
+        dropped first. A single frame larger than the byte cap is still
+        accepted when the outbox is empty — losing it outright is strictly
+        worse than keeping one oversized envelope.
+        """
+        # Count cap.
+        while len(self._outbox) >= OUTBOX_MAX_ENTRIES:
+            dropped = self._outbox.popleft()
+            self._outbox_bytes -= len(dropped)
+            self._outbox_dropped += 1
+            print(
+                f"[agent_client] outbox full (entries); dropped oldest "
+                f"({len(dropped)} bytes)",
+                file=sys.stderr,
+            )
+        # Bytes cap. Stop evicting once the outbox is empty — the new
+        # frame alone may exceed the cap, and keeping it beats losing it.
+        while self._outbox and self._outbox_bytes + len(frame) > OUTBOX_MAX_BYTES:
+            dropped = self._outbox.popleft()
+            self._outbox_bytes -= len(dropped)
+            self._outbox_dropped += 1
+            print(
+                f"[agent_client] outbox full (bytes); dropped oldest "
+                f"({len(dropped)} bytes)",
+                file=sys.stderr,
+            )
+        self._outbox.append(frame)
+        self._outbox_bytes += len(frame)
 
     async def connect_and_register(self) -> None:
         """Open the socket and send the register envelope.
@@ -96,11 +160,61 @@ class AgentClient:
         await self._writer.drain()
 
     async def send(self, kind: str, payload: dict[str, Any]) -> None:
-        if self._writer is None:
-            raise AgentClientError("not connected")
+        """Send an envelope, or queue it if the socket is dead.
+
+        This is the choke point for all six `send_*` wrappers, so a daemon
+        restart mid-turn no longer loses the envelope: on write/drain
+        failure we append the serialized frame to the outbox and return
+        normally. Callers don't raise, callers don't know. The reconnect
+        path in `worker.daemon_loop` drains via `flush_outbox()`.
+        """
         env = Envelope.new(kind, payload)
-        self._writer.write(env.to_json())
-        await self._writer.drain()
+        frame = env.to_json()
+        if self._writer is None:
+            # Not connected — queue. Reconnect path will flush.
+            self._enqueue(frame)
+            return
+        try:
+            self._writer.write(frame)
+            await self._writer.drain()
+        except (BrokenPipeError, ConnectionResetError, ConnectionError) as e:
+            # Socket died. Stash and let the reconnect path replay.
+            print(
+                f"[agent_client] send {kind} failed ({e!r}); "
+                f"queued ({len(frame)} bytes, {self.pending_count() + 1} pending)",
+                file=sys.stderr,
+            )
+            self._enqueue(frame)
+
+    async def flush_outbox(self) -> int:
+        """Replay queued frames in FIFO order. Returns number sent.
+
+        Stops on the first write/drain failure and leaves the failing
+        frame + remainder in the queue — caller (reconnect path) retries
+        by reconnecting and calling again. If not currently connected,
+        returns 0 without touching the queue.
+        """
+        if self._writer is None:
+            return 0
+        sent = 0
+        while self._outbox:
+            frame = self._outbox[0]
+            try:
+                self._writer.write(frame)
+                await self._writer.drain()
+            except (BrokenPipeError, ConnectionResetError, ConnectionError) as e:
+                print(
+                    f"[agent_client] flush stalled after {sent} frame(s) "
+                    f"({e!r}); {self.pending_count()} still queued",
+                    file=sys.stderr,
+                )
+                return sent
+            # Only pop after a successful drain — on failure we retain
+            # the frame so the next flush can retry from where we stopped.
+            self._outbox.popleft()
+            self._outbox_bytes -= len(frame)
+            sent += 1
+        return sent
 
     async def send_accept(self, task_id: str) -> None:
         await self.send(MSG_TASK_ACCEPT, {"task_id": task_id})

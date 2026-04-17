@@ -310,6 +310,20 @@ impl SocketServer {
         match env.kind.as_str() {
             MSG_TASK_ACCEPT => {
                 if let Ok(payload) = env.decode_payload::<TaskAccept>() {
+                    // Idempotent-replay guard. Worker outboxes can re-deliver
+                    // an accept the daemon already processed before its
+                    // previous crash (Accepted → Accepted is otherwise an
+                    // illegal transition). Silent no-op on replay.
+                    if let Some(existing) = self.app_state.get_task(payload.task_id) {
+                        if existing.state == TaskState::Accepted {
+                            tracing::trace!(
+                                agent_id,
+                                task_id = %payload.task_id,
+                                "ignoring task.accept for already-accepted task (outbox replay)"
+                            );
+                            return;
+                        }
+                    }
                     info!(agent_id, task_id = %payload.task_id, "task accepted");
                     if let Err(e) = self.app_state.transition_task(payload.task_id, TaskState::Accepted) {
                         warn!("transition to Accepted failed: {e}");
@@ -342,6 +356,24 @@ impl SocketServer {
 
             MSG_TASK_COMPLETE => {
                 if let Ok(payload) = env.decode_payload::<TaskComplete>() {
+                    // Idempotent-replay guard. Worker outboxes can re-deliver
+                    // a completion the daemon already processed before its
+                    // previous crash. Without this, the replay would (a) log
+                    // a warn from the illegal Completed → Completed
+                    // transition and (b) still fire the tmux orchestrator
+                    // ping below — double-notifying for the same completion.
+                    // Treat as a silent no-op: no summary overwrite, no
+                    // broadcast, no tmux injection.
+                    if let Some(existing) = self.app_state.get_task(payload.task_id) {
+                        if existing.state == TaskState::Completed {
+                            tracing::trace!(
+                                agent_id,
+                                task_id = %payload.task_id,
+                                "ignoring task.complete for already-completed task (outbox replay)"
+                            );
+                            return;
+                        }
+                    }
                     info!(agent_id, task_id = %payload.task_id, "task complete");
                     let task_title = self.app_state.get_task(payload.task_id)
                         .map(|t| t.title.clone())
@@ -1974,5 +2006,94 @@ mod tests {
             resolve_agent_runtime(&configs, &state, "alor").as_deref(),
             Some("claude-sdk")
         );
+    }
+
+    /// Build a SocketServer wired to real AppState + PaneManager but with
+    /// no connected wrappers and no event subscribers — good enough to
+    /// exercise `handle_message` without a live socket.
+    fn server_for_test() -> SocketServer {
+        SocketServer::with_configs(
+            AppState::new(),
+            crate::terminal::pane_manager::PaneManager::new(),
+            vec![],
+        )
+    }
+
+    /// Drive a task all the way to Completed with a baseline summary so
+    /// the idempotency tests have something to protect.
+    fn completed_task_with_summary(state: &AppState, summary: &str) -> Uuid {
+        let task = Task::new("test-title", "test-description");
+        let id = task.id;
+        state.add_task(task);
+        state
+            .transition_task(id, TaskState::Assigned)
+            .expect("Pending → Assigned");
+        state
+            .transition_task(id, TaskState::Accepted)
+            .expect("Assigned → Accepted");
+        state.set_task_summary(id, summary.to_string());
+        state
+            .transition_task(id, TaskState::Completed)
+            .expect("Accepted → Completed");
+        id
+    }
+
+    #[tokio::test]
+    async fn task_complete_is_idempotent_on_replay() {
+        // Outbox replays can re-deliver a MSG_TASK_COMPLETE the daemon
+        // already processed before its previous crash. The guard must
+        // treat it as a no-op: summary untouched, state untouched, no
+        // second tmux orchestrator ping.
+        let server = server_for_test();
+        let task_id = completed_task_with_summary(&server.app_state, "first-summary");
+
+        let replay = Envelope::new(
+            MSG_TASK_COMPLETE,
+            TaskComplete {
+                task_id,
+                summary: Some("second-summary".to_string()),
+                output: None,
+            },
+        )
+        .expect("build envelope");
+
+        // Must not panic, must not re-transition, must not overwrite.
+        server.handle_message("test-agent", replay).await;
+
+        let task = server
+            .app_state
+            .get_task(task_id)
+            .expect("task still present");
+        assert_eq!(task.state, TaskState::Completed);
+        assert_eq!(
+            task.summary.as_deref(),
+            Some("first-summary"),
+            "replayed completion must not overwrite existing summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_accept_is_idempotent_on_replay() {
+        // Same shape for task.accept: Accepted → Accepted is otherwise an
+        // illegal transition, which used to log a warn on every replay.
+        let server = server_for_test();
+        let task = Task::new("t", "d");
+        let id = task.id;
+        server.app_state.add_task(task);
+        server
+            .app_state
+            .transition_task(id, TaskState::Assigned)
+            .expect("assign");
+        server
+            .app_state
+            .transition_task(id, TaskState::Accepted)
+            .expect("accept");
+
+        let replay = Envelope::new(MSG_TASK_ACCEPT, TaskAccept { task_id: id })
+            .expect("build envelope");
+        server.handle_message("test-agent", replay).await;
+
+        let t = server.app_state.get_task(id).expect("present");
+        assert_eq!(t.state, TaskState::Accepted);
     }
 }

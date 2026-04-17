@@ -237,6 +237,33 @@ async def daemon_loop(
         except Exception as e:
             print(f"{C_RED}[reconnect failed] {e}; retrying in 3s{C_RESET}")
             await asyncio.sleep(3.0)
+            # Skip the flush attempt this iteration — not connected. The
+            # outer `while not stop.is_set()` loop takes us back through
+            # the reconnect dance on the next pass.
+            continue
+
+        # Drain any envelopes that were stashed while the socket was down
+        # (e.g. a `task.complete` that caught BrokenPipeError mid-flight
+        # while the daemon was restarting). FIFO, strict: if the replay
+        # stalls again, loop back through the reconnect path instead of
+        # entering `recv_forever` with unflushed frames — we don't want
+        # fresh sends interleaved ahead of a pending completion.
+        pending = sock.pending_count()
+        if pending:
+            try:
+                flushed = await sock.flush_outbox()
+            except Exception as e:
+                print(f"{C_RED}[flush error] {e}{C_RESET}")
+                flushed = 0
+            remaining = sock.pending_count()
+            if remaining:
+                print(
+                    f"{C_YELLOW}[flushed {flushed}/{pending} queued; "
+                    f"{remaining} still pending, retrying reconnect]{C_RESET}"
+                )
+                await sock.close()
+                continue
+            print(f"{C_GREEN}[flushed {flushed} queued envelope(s)]{C_RESET}")
 
 
 async def stdin_loop(
