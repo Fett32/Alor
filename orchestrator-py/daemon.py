@@ -28,6 +28,39 @@ class DaemonError(RuntimeError):
     pass
 
 
+# Structured `cli.error` codes the daemon stamps into `payload.code`. Keep
+# in lockstep with `src-tauri/src/wrapper/protocol.rs` (ERR_CODE_*). Codes
+# named here get mapped to typed exceptions below; unrecognized codes fall
+# through to a generic DaemonError with the server's prose.
+ERR_CODE_FRAMED_SEND_NOT_SUPPORTED = "framed_send_not_supported"
+
+
+class FramedSendNotSupportedError(DaemonError):
+    """Raised when `cli.agent.send_message` with `suppress_echo=true`
+    targets an agent whose runtime can't decode BEGIN/END framing.
+
+    Only `claude-sdk` runtime workers implement the sentinel state machine;
+    wrapper-runtime agents (codex, gemini, any unknown/unresolvable agent)
+    would see literal `__ALOR_ORCH_ECHO_BEGIN__<uuid>` bytes land in their
+    pty, so the daemon fail-closes with this typed error.
+
+    Workarounds the caller can choose from:
+      - retry against a claude-sdk-backed agent, or
+      - call with `suppress_echo=False` to inject raw text (loses the
+        orch_response correlation channel — the send becomes
+        fire-and-forget).
+
+    Tied to `ERR_CODE_FRAMED_SEND_NOT_SUPPORTED` on the Rust side.
+    """
+
+
+# Map server-side code strings to the exception class to raise. Extend here
+# rather than bolting conditionals onto `_one_shot`.
+_CLI_ERROR_CODE_TO_EXC: dict[str, type[DaemonError]] = {
+    ERR_CODE_FRAMED_SEND_NOT_SUPPORTED: FramedSendNotSupportedError,
+}
+
+
 def _envelope(kind: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "type": kind,
@@ -54,7 +87,15 @@ async def _one_shot(kind: str, payload: dict[str, Any] | None = None) -> dict[st
             raise DaemonError("daemon closed connection without response")
         resp = json.loads(resp_line.decode().strip())
         if resp.get("type") in ("error", "cli.error"):
-            err = (resp.get("payload") or {}).get("error", "unknown daemon error")
+            payload = resp.get("payload") or {}
+            err = payload.get("error", "unknown daemon error")
+            # `code` is present on rejections the daemon promises to keep
+            # stable (see ERR_CODE_* in protocol.rs). Route those to typed
+            # exceptions; fall through to a generic DaemonError for
+            # uncoded errors so callers can still branch on isinstance.
+            code = payload.get("code")
+            if code and code in _CLI_ERROR_CODE_TO_EXC:
+                raise _CLI_ERROR_CODE_TO_EXC[code](err)
             raise DaemonError(f"daemon error: {err}")
         return resp.get("payload") or {}
     finally:
@@ -126,6 +167,11 @@ async def agent_send_message(
     sentinel prefix and returns it as `correlation_id` in the response;
     the SDK worker echoes the same id back in the subsequent
     `worker.orch_response` event so callers can match the reply.
+
+    Raises `FramedSendNotSupportedError` if `suppress_echo=True` and the
+    target agent's runtime can't decode BEGIN/END framing (wrapper
+    workers, unresolvable agent ids). Callers that catch this can retry
+    with `suppress_echo=False` or route the message through a new task.
     """
     return await _one_shot(
         "cli.agent.send_message",

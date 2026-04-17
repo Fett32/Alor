@@ -51,6 +51,23 @@ pub const MSG_CLI_ERROR: &str = "cli.error";
 pub const MSG_EVENT: &str = "event";
 
 // ---------------------------------------------------------------------------
+// Structured error codes for `cli.error` payloads
+// ---------------------------------------------------------------------------
+//
+// Every `cli.error` envelope carries `payload.error` (human-readable prose).
+// Rejections a caller might plausibly want to handle specifically also carry
+// `payload.code` — a stable identifier so orchestrator-py/daemon.py can map
+// them onto typed Python exceptions instead of string-matching on the prose.
+//
+// Keep the code strings stable; Python side imports them as literals.
+
+/// Caller set `suppress_echo=true` on `cli.agent.send_message` against an
+/// agent whose runtime can't decode BEGIN/END framing (wrapper runtime, or
+/// an unknown/unresolvable agent). Retry with `suppress_echo=false` or pick
+/// a `claude-sdk`-backed agent.
+pub const ERR_CODE_FRAMED_SEND_NOT_SUPPORTED: &str = "framed_send_not_supported";
+
+// ---------------------------------------------------------------------------
 // Echo-guard framing for orch → SDK-worker programmatic sends
 // ---------------------------------------------------------------------------
 //

@@ -27,7 +27,7 @@ use crate::wrapper::protocol::{
     MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
     MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
     MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT, WORKER_ECHO_SENTINEL_BEGIN,
-    WORKER_ECHO_SENTINEL_END,
+    WORKER_ECHO_SENTINEL_END, ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -1285,8 +1285,9 @@ impl SocketServer {
                                 &payload.agent_id,
                             )
                         {
-                            return cli_error(
+                            return cli_error_coded(
                                 correlation_id,
+                                ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
                                 &format!(
                                     "framed send (suppress_echo=true) not supported for agent '{}': \
                                      only claude-sdk runtime workers implement BEGIN/END framing. \
@@ -1852,6 +1853,20 @@ fn cli_error(correlation_id: Uuid, message: &str) -> Envelope {
         kind: MSG_CLI_ERROR.to_string(),
         correlation_id,
         payload: serde_json::json!({"error": message}),
+    }
+}
+
+/// Variant of `cli_error` that stamps a stable `code` alongside the
+/// human-readable `error`. Callers (orchestrator-py) pattern-match on
+/// `code` to raise typed exceptions; the `error` prose stays the surface
+/// that makes it into logs and LLM contexts. Use when the rejection is
+/// something a caller might plausibly want to handle specifically — not
+/// for every unexpected failure.
+fn cli_error_coded(correlation_id: Uuid, code: &str, message: &str) -> Envelope {
+    Envelope {
+        kind: MSG_CLI_ERROR.to_string(),
+        correlation_id,
+        payload: serde_json::json!({"code": code, "error": message}),
     }
 }
 
