@@ -51,6 +51,37 @@ pub const MSG_CLI_ERROR: &str = "cli.error";
 pub const MSG_EVENT: &str = "event";
 
 // ---------------------------------------------------------------------------
+// Echo-guard framing for orch → SDK-worker programmatic sends
+// ---------------------------------------------------------------------------
+//
+// When `cli.agent.send_message` is called with `suppress_echo: true`, the
+// daemon wraps the payload as:
+//
+//   {BEGIN}{uuid}\n
+//   <multi-line body>\n
+//   {END}{uuid}\n
+//
+// and feeds it to the worker's pane via `tmux send-keys -l`. Because tmux
+// converts each literal `\n` into an Enter keystroke, the worker's
+// prompt_toolkit `read_line` sees BEGIN, every body line, and END as
+// separate lines — which is exactly what the worker's state machine needs
+// to (a) suppress per-line `worker.user_input` emission across the whole
+// frame, and (b) dispatch the accumulated body as a single SDK turn.
+//
+// The uuid is fresh per send and echoed back on `worker.orch_response` so
+// orch can match the reply to its originating send. Including the uuid in
+// the END marker means user-text collisions with the literal END prefix
+// can't prematurely close the frame (would need to predict the uuid).
+//
+// Both markers are printable ASCII so they survive tmux → pty →
+// prompt_toolkit intact (unbound control bytes get silently dropped).
+//
+// MUST stay in lockstep with `orchestrator-py/worker.py`'s
+// `WORKER_ECHO_SENTINEL_BEGIN` / `WORKER_ECHO_SENTINEL_END`.
+pub const WORKER_ECHO_SENTINEL_BEGIN: &str = "__ALOR_ORCH_ECHO_BEGIN__";
+pub const WORKER_ECHO_SENTINEL_END: &str = "__ALOR_ORCH_ECHO_END__";
+
+// ---------------------------------------------------------------------------
 // Envelope — every message on the wire is wrapped in this
 // ---------------------------------------------------------------------------
 

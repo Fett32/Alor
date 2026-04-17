@@ -26,7 +26,8 @@ use crate::wrapper::protocol::{
     MSG_CLI_TASK_GET, MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER,
     MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
     MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
-    MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT,
+    MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT, WORKER_ECHO_SENTINEL_BEGIN,
+    WORKER_ECHO_SENTINEL_END,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -42,24 +43,6 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub const DAEMON_SOCKET: &str = "/tmp/alor/daemon.sock";
-
-/// Prefix the daemon prepends to `cli.agent.send_message` text when
-/// `suppress_echo: true`. SDK workers (Python worker.py) check for this
-/// prefix on stdin; if present, they (a) strip the prefix + following
-/// correlation_id, (b) skip emitting a `worker.user_input` event (so
-/// programmatic orch→worker sends don't bounce back as if Fett had typed
-/// them), and (c) emit a `worker.orch_response` event after the SDK turn
-/// completes, echoing the correlation_id back so orch can match the reply
-/// to its originating send.
-///
-/// On-wire format: `{PREFIX}{correlation_id} {text}` — the daemon generates
-/// a fresh uuid per suppress_echo send and the worker expects exactly one
-/// space separator between the uuid and the text. MUST stay in lockstep
-/// with `orchestrator-py/worker.py::WORKER_ECHO_SENTINEL_PREFIX`.
-///
-/// Kept to printable ASCII because tmux→pty→prompt_toolkit tends to drop
-/// unbound control bytes (RS/US) silently, which would defeat the guard.
-pub const WORKER_ECHO_SENTINEL_PREFIX: &str = "__ALOR_ORCH_ECHO__";
 
 /// A connected wrapper's write half, keyed by agent_id.
 type WriterMap = Arc<Mutex<HashMap<String, tokio::net::unix::OwnedWriteHalf>>>;
@@ -1245,17 +1228,30 @@ impl SocketServer {
                             );
                         }
                         // If the caller asked to suppress the stdin echo
-                        // (orch → SDK-worker path), prepend the sentinel +
-                        // a fresh correlation_id so the worker (a) skips
-                        // forwarding the line back as `worker.user_input`,
-                        // and (b) can echo the same id back in the
-                        // `worker.orch_response` event it emits after the
-                        // SDK turn completes. The daemon returns the id in
-                        // the cli.response payload so the caller can await
-                        // the matching reply event.
+                        // (orch → SDK-worker path), wrap the payload in
+                        // BEGIN/END framing so the worker's stdin state
+                        // machine can (a) skip emitting `worker.user_input`
+                        // across the whole frame, (b) accumulate all body
+                        // lines before dispatching a single SDK turn, and
+                        // (c) echo the same correlation_id back in the
+                        // `worker.orch_response` event after the turn
+                        // completes.
                         //
-                        // On-wire: `{PREFIX}{uuid} {text}` — exactly one
-                        // space between the uuid and the user's text.
+                        // On-wire format (fed to `tmux send-keys -l` — tmux
+                        // converts each literal `\n` into an Enter
+                        // keystroke, so BEGIN / each body line / END land
+                        // as separate read_line calls in the worker):
+                        //
+                        //   {BEGIN}{uuid}\n
+                        //   <multi-line body>\n
+                        //   {END}{uuid}\n
+                        //
+                        // The trailing `\n` after END is mandatory — without
+                        // it the END marker sits in prompt_toolkit's buffer
+                        // unsubmitted and the worker never closes the frame.
+                        // For that reason the caller's `submit` flag is
+                        // ignored on the suppress_echo path; the framing
+                        // submits every marker for us.
                         let send_correlation_id: Option<Uuid> = if payload.suppress_echo {
                             Some(Uuid::new_v4())
                         } else {
@@ -1263,8 +1259,12 @@ impl SocketServer {
                         };
                         let effective_text = match send_correlation_id {
                             Some(cid) => format!(
-                                "{}{} {}",
-                                WORKER_ECHO_SENTINEL_PREFIX, cid, payload.text
+                                "{}{}\n{}\n{}{}\n",
+                                WORKER_ECHO_SENTINEL_BEGIN,
+                                cid,
+                                payload.text,
+                                WORKER_ECHO_SENTINEL_END,
+                                cid,
                             ),
                             None => payload.text.clone(),
                         };
@@ -1291,7 +1291,10 @@ impl SocketServer {
                             }
                         };
                         let _ = send_ok; // consume
-                        if payload.submit {
+                        // Only the non-framed (Fett-typed style) path honors
+                        // the explicit submit flag — framed sends already
+                        // carry their own Enter via the trailing \n above.
+                        if payload.submit && send_correlation_id.is_none() {
                             let _ = tokio::process::Command::new("tmux")
                                 .args(["send-keys", "-t", &pane_target, "Enter"])
                                 .output()

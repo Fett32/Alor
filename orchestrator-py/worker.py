@@ -32,39 +32,55 @@ from common import (
 DEFAULT_MODEL = os.environ.get("ALOR_WORKER_MODEL", "claude-opus-4-7")
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "worker_prompt.md"
 
-# Echo-guard sentinel. Kept in lockstep with the Rust daemon's
-# `WORKER_ECHO_SENTINEL_PREFIX` (src-tauri/src/wrapper/server.rs). Any stdin
-# line that starts with this prefix originated from a programmatic
-# `cli.agent.send_message` with `suppress_echo: true` — typically the
-# orchestrator asking the worker a question through the tmux path.
+# Echo-guard framing. Kept in lockstep with the Rust daemon's
+# `WORKER_ECHO_SENTINEL_BEGIN` / `_END` (src-tauri/src/wrapper/protocol.rs).
 #
-# On-wire format: `{PREFIX}{correlation_id} {text}` — the daemon stamps a
-# fresh uuid per send so the worker can (a) skip forwarding the line as a
-# `worker.user_input` event (no echo loop), and (b) emit a
-# `worker.orch_response` event carrying the same uuid after the SDK turn
-# completes, so orch matches the reply to its originating send.
+# When the orchestrator calls `cli.agent.send_message` with `suppress_echo:
+# true`, the daemon wraps the payload on-wire as:
 #
-# Kept to printable ASCII so it survives tmux→pty→prompt_toolkit intact;
-# unbound control chars (RS/US) get silently dropped by prompt_toolkit
-# and would break the guard.
-WORKER_ECHO_SENTINEL_PREFIX = "__ALOR_ORCH_ECHO__"
+#     {BEGIN}{correlation_id}\n
+#     <multi-line body>\n
+#     {END}{correlation_id}\n
+#
+# and feeds it to the worker pane via `tmux send-keys -l`, which converts
+# each literal `\n` into a real Enter keystroke. So the worker's
+# `read_line` sees BEGIN, every body line, and END as separate lines —
+# exactly what the state machine in `stdin_loop` needs to (a) suppress
+# per-line `worker.user_input` emission across the whole frame, and
+# (b) dispatch the accumulated body as a single SDK turn. The uuid is
+# echoed back in the subsequent `worker.orch_response` event so the orch
+# can match the reply to its originating send.
+#
+# The uuid in the END marker is what keeps body text containing a
+# stray `{END}…` line from prematurely closing the frame — the uuid is
+# fresh per send, so a real collision would require predicting it.
+#
+# Printable ASCII so tmux → pty → prompt_toolkit passes the bytes
+# through intact; unbound control chars (RS/US) get silently dropped.
+WORKER_ECHO_SENTINEL_BEGIN = "__ALOR_ORCH_ECHO_BEGIN__"
+WORKER_ECHO_SENTINEL_END = "__ALOR_ORCH_ECHO_END__"
 
 
-def parse_sentinel(line: str) -> tuple[str | None, str]:
-    """Extract (correlation_id, text) from a sentinel-prefixed stdin line.
+def parse_frame_marker(raw_line: str) -> tuple[str | None, str | None]:
+    """Classify a raw stdin line as a programmatic frame marker.
 
-    Returns (None, original_line) if the line is not sentinel-prefixed.
-    Returns (corrid, text) when prefixed; `text` may be empty if the
-    daemon sent nothing after the id (defensive — shouldn't happen).
+    Returns:
+        ("begin", uuid) — line is a BEGIN marker with `uuid` trailing.
+        ("end",   uuid) — line is an END marker with `uuid` trailing.
+        (None, None)    — line is not a frame marker.
+
+    Match is anchored at the start and the whole remainder (after trimming
+    trailing whitespace) is treated as the uuid. No validation of uuid
+    shape is done here — the caller enforces an exact-match check against
+    the stashed BEGIN uuid when closing a frame.
     """
-    if not line.startswith(WORKER_ECHO_SENTINEL_PREFIX):
-        return (None, line)
-    rest = line[len(WORKER_ECHO_SENTINEL_PREFIX):]
-    space_idx = rest.find(" ")
-    if space_idx == -1:
-        # No separator — treat whole remainder as the id, empty text.
-        return (rest, "")
-    return (rest[:space_idx], rest[space_idx + 1:])
+    for kind, prefix in (
+        ("begin", WORKER_ECHO_SENTINEL_BEGIN),
+        ("end", WORKER_ECHO_SENTINEL_END),
+    ):
+        if raw_line.startswith(prefix):
+            return (kind, raw_line[len(prefix):].rstrip())
+    return (None, None)
 
 
 def render_prompt(agent_id: str, project: str | None, workdir: str, model: str) -> str:
@@ -236,29 +252,150 @@ async def stdin_loop(
 ) -> None:
     """Let Fett type follow-ups into the worker's tmux pane.
 
-    Fett-typed lines are forwarded to the daemon as `worker.user_input`
-    events so the orchestrator stays aware of follow-ups. Lines prefixed
-    with `WORKER_ECHO_SENTINEL_PREFIX` originated from a programmatic send
-    (orch → tmux send-keys with `suppress_echo: true`); the prefix +
-    embedded correlation_id are extracted and the line is NOT forwarded
-    as `worker.user_input` — avoids an echo loop. Instead, after the SDK
-    turn completes we emit `worker.orch_response` carrying the
-    correlation_id, so the orch can match the reply to its originating
-    send and treat `agent_send_message` as a real query/response channel.
+    Two classes of input arrive on stdin:
+
+    1. Fett-typed lines (unframed). Each line is forwarded to the daemon
+       as a `worker.user_input` event so the orch stays aware of
+       follow-ups, then dispatched to the SDK as its own turn.
+
+    2. Orch-origin programmatic sends, wrapped in BEGIN/END framing
+       (see `WORKER_ECHO_SENTINEL_BEGIN/_END`). The state machine below
+       treats everything between a matching BEGIN/END pair as one atomic
+       send: body lines are accumulated verbatim without per-line
+       forwarding or per-line SDK dispatch, then flushed as a single
+       `client.query` when END arrives. After the SDK turn completes,
+       a `worker.orch_response` event carries the final assistant
+       TextBlock plus the correlation_id from BEGIN, so the orch can
+       match the reply to its originating `agent_send_message` send.
+
+    The framing is what makes multi-line programmatic sends safe —
+    without it, tmux's `send-keys -l` would split the payload across
+    multiple `read_line` calls, only the first line would be
+    sentinel-guarded, and the rest would bounce back as bogus
+    "Fett typed" events.
     """
+    # Framing state. When `in_frame` is True, we are between a BEGIN and
+    # its matching END: every incoming line goes into `frame_buffer`
+    # verbatim (including blanks, leading whitespace, and would-be slash
+    # commands — those are just body text inside a programmatic send).
+    # No SDK dispatch, no event forwarding until the frame closes.
+    in_frame = False
+    frame_uuid: str | None = None
+    frame_buffer: list[str] = []
+    # Captured at BEGIN time so `during_task` reflects when the orch
+    # sent the message, not when we happened to get around to dispatching
+    # it (could differ if a task was mid-flight on `client_lock`).
+    frame_task_id: str | None = None
+
     while not stop.is_set():
         # prompt_toolkit owns the prompt line; patch_stdout keeps streaming
         # task output above it without clobbering the input buffer.
-        line = await read_line(f"{C_CYAN}{agent_id}>{C_RESET} ")
-        if line is None:
+        raw_line = await read_line(f"{C_CYAN}{agent_id}>{C_RESET} ")
+        if raw_line is None:
             stop.set()
             return
-        # Echo-guard: parse sentinel BEFORE .strip() — the prefix must be
-        # anchored at the start of the raw line so leading whitespace in
-        # Fett's typed text can't spoof it.
-        orch_correlation_id, line = parse_sentinel(line)
-        is_programmatic = orch_correlation_id is not None
-        text = line.strip()
+
+        # ---- Inside a programmatic frame: only the matching END closes. ----
+        if in_frame:
+            # Exact END match (prefix + stashed uuid). Deliberately strict:
+            # we do NOT re-parse BEGIN markers inside a frame so the body
+            # can contain arbitrary text (including our own marker strings)
+            # without tripping false boundaries. Only the uuid we issued on
+            # BEGIN can close this frame.
+            expected_end = f"{WORKER_ECHO_SENTINEL_END}{frame_uuid}"
+            if raw_line.rstrip() == expected_end:
+                body = "\n".join(frame_buffer)
+                closed_uuid = frame_uuid
+                closed_task_id = frame_task_id
+                in_frame = False
+                frame_uuid = None
+                frame_buffer = []
+                frame_task_id = None
+
+                # Dispatch the accumulated body as ONE SDK turn, capture the
+                # final assistant TextBlock for the reply.
+                latest: dict[str, str] = {"text": ""}
+
+                def capture_orch_reply(t: str) -> None:
+                    latest["text"] = t
+                    print(t)
+
+                dispatched = False
+                if body.strip():
+                    try:
+                        async with client_lock:
+                            await client.query(body)
+                            await process_response(
+                                client, totals, cost, on_text=capture_orch_reply
+                            )
+                        dispatched = True
+                    except Exception as e:
+                        print(f"{C_RED}[error] {e}{C_RESET}")
+                        # Fall through — still emit orch_response (possibly
+                        # empty) so the orch's await doesn't hang forever.
+                # else: empty-body frame. Still report back so the awaiting
+                # caller gets a prompt timeout-or-empty answer instead of
+                # waiting 60s.
+
+                reply = latest["text"].strip()
+                encoded = reply.encode("utf-8")
+                MAX = 64 * 1024
+                if len(encoded) > MAX:
+                    trimmed = encoded[:MAX]
+                    while trimmed and (trimmed[-1] & 0xC0) == 0x80:
+                        trimmed = trimmed[:-1]
+                    reply = trimmed.decode("utf-8", errors="ignore") + "\n…[truncated]"
+
+                try:
+                    await sock.send_worker_orch_response(
+                        correlation_id=closed_uuid or "",
+                        text=reply,
+                        during_task=closed_task_id is not None,
+                        task_id=closed_task_id,
+                    )
+                except Exception as e:
+                    # Non-fatal — orch will just time out waiting. Worth a
+                    # visible warning though, since this means a tool call
+                    # on the orch side will return a timeout marker.
+                    print(f"{C_RED}[orch_response send failed] {e}{C_RESET}")
+
+                if dispatched:
+                    print_footer(session_start, cost[0], totals)
+                continue
+
+            # Not the matching END — body line. Append verbatim (preserve
+            # blanks / leading whitespace / would-be slash commands).
+            frame_buffer.append(raw_line)
+            continue
+
+        # ---- Not in a frame: classify the line. ----
+        kind, marker_uuid = parse_frame_marker(raw_line)
+        if kind == "begin":
+            if not marker_uuid:
+                # Malformed BEGIN (no uuid). Ignore — don't enter frame
+                # state, because without a uuid we can't match END.
+                print(
+                    f"{C_YELLOW}[warn] BEGIN marker without uuid, ignoring{C_RESET}"
+                )
+                continue
+            in_frame = True
+            frame_uuid = marker_uuid
+            frame_buffer = []
+            frame_task_id = current.get("task_id")
+            continue
+        if kind == "end":
+            # Stray END outside a frame — daemon drift, orphaned marker, or
+            # Fett typing the literal string. Either way, ignore rather than
+            # treat as Fett input (forwarding a random END to the SDK would
+            # just confuse it).
+            print(
+                f"{C_YELLOW}[warn] END marker outside any frame, ignoring: "
+                f"{raw_line[:80]}{C_RESET}"
+            )
+            continue
+
+        # Normal Fett-typed line.
+        text = raw_line.strip()
         if not text:
             continue
         if text in ("/quit", "/exit"):
@@ -278,69 +415,26 @@ async def stdin_loop(
             continue
 
         # Forward Fett-typed lines to the orch as an event so it stays
-        # aware of post-task follow-ups. Skip when the line came from a
-        # programmatic sender (orch itself) — otherwise orch→worker→orch
-        # loops on every reply. The programmatic branch emits
-        # `worker.orch_response` instead (below).
-        if not is_programmatic:
-            task_id = current.get("task_id")
-            try:
-                await sock.send_worker_user_input(
-                    text=text,
-                    during_task=task_id is not None,
-                    task_id=task_id,
-                )
-            except Exception as e:
-                # Non-fatal: keep the local conversation going even if the
-                # daemon is unreachable. The orch just won't see this line.
-                print(f"{C_RED}[forward to daemon failed] {e}{C_RESET}")
-
-        # Capture the final assistant TextBlock so we can forward it back
-        # to the orch as `worker.orch_response`. Mirrors run_task's
-        # "latest TextBlock wins" summary semantics. Only installed for
-        # the programmatic branch — Fett-typed follow-ups aren't matched
-        # to any pending send so there's no reply to report.
-        latest: dict[str, str] = {"text": ""}
-
-        def capture_orch_reply(t: str) -> None:
-            latest["text"] = t
-            print(t)
-
-        on_text = capture_orch_reply if is_programmatic else None
+        # aware of post-task follow-ups. Programmatic sends are handled
+        # in the framed path above and never reach here.
+        task_id = current.get("task_id")
+        try:
+            await sock.send_worker_user_input(
+                text=text,
+                during_task=task_id is not None,
+                task_id=task_id,
+            )
+        except Exception as e:
+            # Non-fatal: keep the local conversation going even if the
+            # daemon is unreachable. The orch just won't see this line.
+            print(f"{C_RED}[forward to daemon failed] {e}{C_RESET}")
 
         try:
             async with client_lock:
                 await client.query(text)
-                await process_response(client, totals, cost, on_text=on_text)
+                await process_response(client, totals, cost, on_text=None)
         except Exception as e:
             print(f"{C_RED}[error] {e}{C_RESET}")
-            # Fall through to footer + (if programmatic) emit an empty
-            # reply so the orch's await doesn't hang forever.
-
-        if is_programmatic:
-            task_id = current.get("task_id")
-            reply = latest["text"].strip()
-            # Cap reply client-side to match the worker summary logic
-            # (64 KiB). Protects the daemon / orch from a runaway turn.
-            encoded = reply.encode("utf-8")
-            MAX = 64 * 1024
-            if len(encoded) > MAX:
-                trimmed = encoded[:MAX]
-                while trimmed and (trimmed[-1] & 0xC0) == 0x80:
-                    trimmed = trimmed[:-1]
-                reply = trimmed.decode("utf-8", errors="ignore") + "\n…[truncated]"
-            try:
-                await sock.send_worker_orch_response(
-                    correlation_id=orch_correlation_id,
-                    text=reply,
-                    during_task=task_id is not None,
-                    task_id=task_id,
-                )
-            except Exception as e:
-                # Non-fatal — orch will just time out waiting. Worth a
-                # visible warning though, since this means a tool call on
-                # the orch side will return a timeout marker.
-                print(f"{C_RED}[orch_response send failed] {e}{C_RESET}")
 
         print_footer(session_start, cost[0], totals)
 
