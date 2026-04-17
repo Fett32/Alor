@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 use tauri::AppHandle;
 use uuid::Uuid;
@@ -292,6 +292,19 @@ struct StateInner {
     agents: HashMap<String, Agent>,
 }
 
+/// On-disk layout of `tasks-archive.json`.  Terminal tasks are swept out of
+/// live state into this file on every daemon startup so the running state
+/// file stays lean.  Schema intentionally matches the format of the existing
+/// hand-curated archive: a `tasks` map keyed by UUID plus an RFC3339
+/// `last_archive_run` timestamp.
+#[derive(Default, Serialize, Deserialize)]
+struct TasksArchive {
+    #[serde(default)]
+    tasks: HashMap<Uuid, Task>,
+    #[serde(default)]
+    last_archive_run: Option<DateTime<Utc>>,
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self::default()
@@ -406,6 +419,125 @@ impl AppState {
                 tracing::warn!("failed to rename session file: {e}");
             }
         }
+    }
+
+    /// Sweep terminal tasks (COMPLETED, CANCELLED, REJECTED, TIMED_OUT, STALE)
+    /// out of live state into `archive_path`.  Leaves ACCEPTED / PENDING /
+    /// BLOCKED / PROPOSED / STAGED / INTERRUPTED / RECOVERING / ASSIGNED
+    /// untouched — those are in-flight or queued.
+    ///
+    /// Idempotent: tasks don't transition out of terminal states (modulo the
+    /// narrow Cancelled → Completed retroactive edge, which is still terminal),
+    /// so re-running can only move more work in, never the same work twice.
+    /// Already-archived UUIDs are overwritten on re-archive, which is fine —
+    /// the rehydrated copy is the same data.
+    ///
+    /// Archive write precedes live-state removal so a mid-operation crash
+    /// leaves the task in both places (recoverable) rather than neither (lost).
+    ///
+    /// Returns the number of tasks moved to the archive on this call.
+    pub fn archive_terminal_tasks(&self, archive_path: &Path) -> usize {
+        // Snapshot terminal tasks under lock without removing yet.
+        let terminal: Vec<(Uuid, Task)> = {
+            let s = self.inner.lock();
+            s.tasks
+                .iter()
+                .filter(|(_, t)| t.state.is_terminal())
+                .map(|(id, t)| (*id, t.clone()))
+                .collect()
+        };
+
+        if terminal.is_empty() {
+            return 0;
+        }
+
+        // Load existing archive (if any).
+        let mut archive: TasksArchive = if archive_path.exists() {
+            match std::fs::read_to_string(archive_path) {
+                Ok(json) => match serde_json::from_str(&json) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to parse {}: {e}; starting a fresh archive",
+                            archive_path.display()
+                        );
+                        TasksArchive::default()
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to read {}: {e}; starting a fresh archive",
+                        archive_path.display()
+                    );
+                    TasksArchive::default()
+                }
+            }
+        } else {
+            TasksArchive::default()
+        };
+
+        let terminal_ids: Vec<Uuid> = terminal.iter().map(|(id, _)| *id).collect();
+        for (id, task) in terminal {
+            archive.tasks.insert(id, task);
+        }
+        archive.last_archive_run = Some(Utc::now());
+
+        // Serialize + atomic write (tmp + fsync + rename), same pattern as save().
+        let json = match serde_json::to_string_pretty(&archive) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("failed to serialize archive: {e}");
+                return 0;
+            }
+        };
+        let tmp_path = archive_path.with_extension("json.tmp");
+        match std::fs::File::create(&tmp_path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(json.as_bytes()) {
+                    tracing::warn!("failed to write temp archive file: {e}");
+                    return 0;
+                }
+                if let Err(e) = f.sync_all() {
+                    tracing::warn!("failed to fsync archive file: {e}");
+                    return 0;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to open temp archive file {}: {e}",
+                    tmp_path.display()
+                );
+                return 0;
+            }
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, archive_path) {
+            tracing::warn!("failed to rename archive file: {e}");
+            return 0;
+        }
+
+        // Archive durable — now drop these from live state.  Re-check is_terminal()
+        // per id in case something mutated between snapshot and now (shouldn't
+        // happen during startup, but the check is cheap).
+        let removed = {
+            let mut s = self.inner.lock();
+            let mut n = 0;
+            for id in &terminal_ids {
+                if let Some(task) = s.tasks.get(id) {
+                    if task.state.is_terminal() {
+                        s.tasks.remove(id);
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        // Persist the shrunken live state.  No event emit here: this runs at
+        // startup before the app handle is wired up, and nothing's listening.
+        self.save();
+
+        removed
     }
 
     // --- tasks ---------------------------------------------------------------
@@ -744,5 +876,103 @@ mod tests {
         t.state = TaskState::Cancelled;
         t.transition(TaskState::Completed).expect("should succeed");
         assert_eq!(t.state, TaskState::Completed);
+    }
+
+    #[test]
+    fn archive_terminal_tasks_sweeps_only_terminal_states_and_is_idempotent() {
+        use std::collections::HashSet;
+
+        // Unique per-test tmp paths so parallel runs don't collide.
+        let nonce = Uuid::new_v4();
+        let tmp_root = std::env::temp_dir();
+        let archive_path = tmp_root.join(format!("alor-test-archive-{nonce}.json"));
+        let state_path = tmp_root.join(format!("alor-test-state-{nonce}.json"));
+        // Belt-and-braces — make sure nothing left over from a prior run.
+        let _ = std::fs::remove_file(&archive_path);
+        let _ = std::fs::remove_file(&state_path);
+
+        let app_state = AppState::with_persistence(state_path.clone());
+
+        // Mix of states: 2 terminal (Completed, Cancelled), 2 non-terminal
+        // (Pending, Accepted). Only the first two should archive.
+        let mk = |state: TaskState| {
+            let mut t = Task::new(format!("{state:?}"), "test");
+            t.state = state;
+            t
+        };
+        let completed = mk(TaskState::Completed);
+        let cancelled = mk(TaskState::Cancelled);
+        let pending = mk(TaskState::Pending);
+        let accepted = mk(TaskState::Accepted);
+        let completed_id = completed.id;
+        let cancelled_id = cancelled.id;
+        let pending_id = pending.id;
+        let accepted_id = accepted.id;
+
+        app_state.add_task(completed);
+        app_state.add_task(cancelled);
+        app_state.add_task(pending);
+        app_state.add_task(accepted);
+        assert_eq!(app_state.all_tasks().len(), 4);
+
+        // First archive sweep: should move the 2 terminal tasks.
+        let moved = app_state.archive_terminal_tasks(&archive_path);
+        assert_eq!(moved, 2, "expected exactly 2 terminal tasks archived");
+
+        let live_ids: HashSet<Uuid> =
+            app_state.all_tasks().into_iter().map(|t| t.id).collect();
+        assert_eq!(live_ids.len(), 2);
+        assert!(live_ids.contains(&pending_id));
+        assert!(live_ids.contains(&accepted_id));
+        assert!(!live_ids.contains(&completed_id));
+        assert!(!live_ids.contains(&cancelled_id));
+
+        // Archive file written with both moved tasks.
+        assert!(archive_path.exists(), "archive file should exist after sweep");
+        let archive_json =
+            std::fs::read_to_string(&archive_path).expect("read archive");
+        let archive: TasksArchive =
+            serde_json::from_str(&archive_json).expect("parse archive");
+        assert_eq!(archive.tasks.len(), 2);
+        assert!(archive.tasks.contains_key(&completed_id));
+        assert!(archive.tasks.contains_key(&cancelled_id));
+        assert!(archive.last_archive_run.is_some());
+        let first_run_ts = archive.last_archive_run;
+
+        // Second sweep: idempotent — nothing left terminal, nothing moves,
+        // archive file untouched (no spurious timestamp bump).
+        let moved_again = app_state.archive_terminal_tasks(&archive_path);
+        assert_eq!(moved_again, 0, "second call must be a no-op");
+        assert_eq!(app_state.all_tasks().len(), 2, "live state unchanged");
+        let archive_json2 =
+            std::fs::read_to_string(&archive_path).expect("read archive");
+        let archive2: TasksArchive =
+            serde_json::from_str(&archive_json2).expect("parse archive");
+        assert_eq!(archive2.tasks.len(), 2);
+        assert_eq!(
+            archive2.last_archive_run, first_run_ts,
+            "timestamp must not bump on a zero-work sweep"
+        );
+
+        // Now flip one of the non-terminal tasks to terminal and sweep again.
+        app_state
+            .transition_task(accepted_id, TaskState::Completed)
+            .expect("Accepted → Completed is legal");
+        let moved_third = app_state.archive_terminal_tasks(&archive_path);
+        assert_eq!(moved_third, 1);
+        let archive3: TasksArchive = serde_json::from_str(
+            &std::fs::read_to_string(&archive_path).expect("read archive"),
+        )
+        .expect("parse archive");
+        assert_eq!(archive3.tasks.len(), 3, "archive grew by one");
+        assert!(archive3.tasks.contains_key(&accepted_id));
+        assert_eq!(app_state.all_tasks().len(), 1);
+        assert_eq!(app_state.all_tasks()[0].id, pending_id);
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&archive_path);
+        let _ = std::fs::remove_file(&state_path);
+        let _ = std::fs::remove_file(state_path.with_extension("json.tmp"));
+        let _ = std::fs::remove_file(archive_path.with_extension("json.tmp"));
     }
 }

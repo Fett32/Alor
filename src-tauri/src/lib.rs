@@ -31,6 +31,25 @@ pub fn run() {
             daemon::state::AppState::new()
         }
     };
+    // Sweep terminal tasks (Completed/Cancelled/Rejected/TimedOut/Stale) out
+    // of live state into tasks-archive.json on every startup.  Idempotent.
+    match daemon::session::tasks_archive_file() {
+        Ok(archive_path) => {
+            let archived = app_state.archive_terminal_tasks(&archive_path);
+            if archived > 0 {
+                tracing::info!(
+                    archived,
+                    path = %archive_path.display(),
+                    "swept terminal tasks into archive"
+                );
+            } else {
+                tracing::debug!("no terminal tasks to archive");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("could not resolve archive path: {e}");
+        }
+    }
     // Load agent configs from ~/.config/alor/agents/*.yaml and register them.
     let agent_configs = match daemon::config::load_agent_configs() {
         Ok(configs) => {

@@ -75,6 +75,13 @@ pub fn session_file() -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join("session.json"))
 }
 
+/// Path to the terminal-task archive file.  Terminal tasks (COMPLETED,
+/// CANCELLED, REJECTED, TIMED_OUT, STALE) are swept out of live state.json
+/// into this file on every daemon startup so the running state stays lean.
+pub fn tasks_archive_file() -> anyhow::Result<PathBuf> {
+    Ok(data_dir()?.join("tasks-archive.json"))
+}
+
 /// Lightweight metadata written to disk so the UI can show "last session" info.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionInfo {
