@@ -130,10 +130,21 @@ pub fn run() {
 
                 // Recovery: identify agents that have existing tmux sessions.
                 // Templates are recipes, not slots — never reclaim them
-                // even if `session_exists` were to misfire.
+                // even if `session_exists` were to misfire.  SDK-runtime
+                // workers also self-heal: their Python process reconnects
+                // to the new daemon socket on its own. Launching an
+                // alor-wrapper for them causes a duplicate registration
+                // collision that the daemon rejects.
                 let mut to_launch = Vec::new();
                 for (id, cfg) in configs_for_launch {
                     if cfg.template {
+                        continue;
+                    }
+                    if cfg.runtime == "claude-sdk" {
+                        tracing::debug!(
+                            agent_id = %id,
+                            "skipping boot reclaim for claude-sdk runtime; worker self-reconnects"
+                        );
                         continue;
                     }
                     let session_name = format!("alor-{}", id);

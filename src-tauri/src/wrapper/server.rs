@@ -1521,6 +1521,7 @@ impl SocketServer {
                 );
             }
             let session_name = format!("alor-{instance_id}");
+
             let mut c = std::process::Command::new("tmux");
             c.args(["new-session", "-d", "-s", &session_name]);
             if let Some(ref wd) = expanded_workdir {
@@ -1576,6 +1577,25 @@ impl SocketServer {
             Ok(child) => {
                 let pid = child.id();
                 info!(agent = %payload.agent, instance_id = %instance_id, pid, "agent spawned via CLI");
+
+                // For claude-sdk runtime, apply session-level mouse + history
+                // AFTER new-session creates the session. Without mouse on, the
+                // nested-tmux setup (alor-main pane running `tmux attach -t
+                // this session`) can't forward wheel events to this session's
+                // own copy-mode, so scrolling shows the outer pane's empty
+                // scrollback instead of the worker's real history. Wrapper-
+                // runtime agents already get this via ensure_session_defaults.
+                if config.runtime == "claude-sdk" {
+                    let session_name = format!("alor-{instance_id}");
+                    let target = format!("={session_name}");
+                    let _ = std::process::Command::new("tmux")
+                        .args(["set-option", "-t", &target, "mouse", "on"])
+                        .output();
+                    let _ = std::process::Command::new("tmux")
+                        .args(["set-option", "-t", &target, "history-limit", "50000"])
+                        .output();
+                }
+
                 {
                     let mut spawned = self.spawned.lock().await;
                     spawned.insert(instance_id.clone(), child);

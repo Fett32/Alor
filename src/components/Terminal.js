@@ -197,6 +197,39 @@ function createTerminal() {
   }, { capture: true });
 
   // -----------------------------------------------------------------------
+  // Wheel events -> tmux SGR mouse escape.
+  // xterm.js by default scrolls its own internal buffer on wheel. With
+  // multiple tmux panes rendered inside one xterm, that shows historical
+  // frames of the WHOLE alor-main terminal (both panes combined), which
+  // is useless. tmux itself handles per-pane scrollback via copy-mode
+  // when it receives mouse wheel escape sequences, so we translate the
+  // wheel event into an SGR mouse report (mode 1006) aimed at the cell
+  // under the cursor and inject it into the PTY.
+  //
+  // `preventDefault` + `stopImmediatePropagation` keep xterm.js from
+  // also scrolling its own buffer on the same event.
+  // -----------------------------------------------------------------------
+  $container.addEventListener("wheel", (e) => {
+    if (!term) return;
+    const rect = $container.getBoundingClientRect();
+    const cols = term.cols || 80;
+    const rows = term.rows || 24;
+    const cellW = rect.width / cols;
+    const cellH = rect.height / rows;
+    const col = Math.max(1, Math.min(cols, Math.floor((e.clientX - rect.left) / cellW) + 1));
+    const row = Math.max(1, Math.min(rows, Math.floor((e.clientY - rect.top) / cellH) + 1));
+    // SGR mouse mode 1006: CSI < button ; col ; row M (press) or m (release).
+    // Wheel up = button 64, wheel down = 65. Scroll events only have press.
+    const button = e.deltaY < 0 ? 64 : 65;
+    const seq = `\x1b[<${button};${col};${row}M`;
+    invoke("terminal_send_keys", { keys: seq }).catch((err) => {
+      console.warn("[Terminal] wheel forward failed:", err);
+    });
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, { capture: true, passive: false });
+
+  // -----------------------------------------------------------------------
   // Key send queue — serialise IPC calls so rapid keypresses are never
   // reordered by the async Tauri bridge. Each send waits for the previous
   // one to complete before writing to the PTY.
