@@ -282,7 +282,7 @@ function buildAgentItem(agent) {
     btnDelete.title = `Permanently remove ${agent.id} from state`;
     btnDelete.addEventListener("click", (e) => {
       e.stopPropagation();
-      if (confirm(`Permanently delete ${agent.id}? This tombstones the row.`)) {
+      if (confirm(`Permanently delete ${agent.id}? This cannot be undone.`)) {
         invoke("delete_agent", { id: agent.id })
           .catch(err => alert(`Failed to delete agent: ${err}`));
       }
