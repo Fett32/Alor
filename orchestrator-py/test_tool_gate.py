@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -44,6 +45,8 @@ from claude_agent_sdk import (  # noqa: E402
 from tool_gate import (  # noqa: E402
     HOST_UI_TOOLS,
     ORCHESTRATOR_AGENT_IDS,
+    WORKER_SPAWN_NAME_PREFIXES,
+    WORKER_SPAWNABLE_TEMPLATES,
     make_gate,
 )
 
@@ -188,6 +191,10 @@ async def test_unknown_role_falls_back_to_worker_message() -> None:
 
 
 async def test_worker_allows_common_tools() -> None:
+    # Tools whose allow is payload-independent — no per-arg gate
+    # checks. agent_spawn / agent_send_message are NOT in this list
+    # because they enforce payload-specific rules; their allow-path
+    # coverage lives in test_worker_allows_the_five_worker_accessible_tools.
     gate = make_gate("worker")
     for name in (
         "Bash",
@@ -199,8 +206,7 @@ async def test_worker_allows_common_tools() -> None:
         "WebFetch",
         "TodoWrite",
         "NotebookEdit",
-        # Worker-accessible Alor MCP tools — should never be gated.
-        "mcp__alor__agent_spawn",
+        # Worker-accessible Alor MCP tools with no payload check.
         "mcp__alor__agent_list",
         "mcp__alor__agent_ensure_running",
         "mcp__alor__agent_kill",
@@ -290,27 +296,26 @@ async def test_worker_denies_orch_only_alor_tools() -> None:
 
 
 async def test_worker_allows_the_five_worker_accessible_tools() -> None:
+    # Each tool gets a minimal valid payload. Some (agent_spawn,
+    # agent_send_message) have additional payload checks in the gate
+    # — those are covered by their own dedicated test functions below.
     gate = make_gate("worker")
-    for bare in (
-        "agent_spawn",
-        "agent_list",
-        "agent_ensure_running",
-        "agent_kill",
-    ):
-        name = f"mcp__alor__{bare}"
-        result = await call_gate(gate, name, {})
+    valid_calls: list[tuple[str, dict[str, Any]]] = [
+        ("mcp__alor__agent_list", {}),
+        ("mcp__alor__agent_ensure_running", {"agent_id": "codex"}),
+        ("mcp__alor__agent_kill", {"instance": "codex-debug-test"}),
+        (
+            "mcp__alor__agent_spawn",
+            {"agent": "claude", "name": "debug-smoke"},
+        ),
+        (
+            "mcp__alor__agent_send_message",
+            {"agent_id": "codex-debug-test", "text": "hi"},
+        ),
+    ]
+    for name, payload in valid_calls:
+        result = await call_gate(gate, name, payload)
         assert_is(f"worker {name} -> Allow", result, PermissionResultAllow)
-    # agent_send_message with a non-orchestrator target allows:
-    result = await call_gate(
-        gate,
-        "mcp__alor__agent_send_message",
-        {"agent_id": "codex-debug-test", "text": "hi"},
-    )
-    assert_is(
-        "worker agent_send_message to non-orch target -> Allow",
-        result,
-        PermissionResultAllow,
-    )
 
 
 async def test_worker_cannot_send_to_orchestrator() -> None:
@@ -340,6 +345,170 @@ async def test_worker_cannot_send_to_orchestrator() -> None:
         )
 
 
+async def test_worker_spawnable_templates_and_prefixes_locked() -> None:
+    # Guard against accidental additions/removals — both sets are
+    # security-relevant; drift should be deliberate and test-visible.
+    assert_eq(
+        "WORKER_SPAWNABLE_TEMPLATES is exactly the locked set",
+        WORKER_SPAWNABLE_TEMPLATES,
+        frozenset({"codex", "gemini", "cursor", "claude"}),
+    )
+    assert_eq(
+        "WORKER_SPAWN_NAME_PREFIXES is exactly (debug-, test-)",
+        WORKER_SPAWN_NAME_PREFIXES,
+        ("debug-", "test-"),
+    )
+
+
+async def test_worker_agent_spawn_allows_generic_templates_with_prefix() -> None:
+    gate = make_gate("worker")
+    happy_paths = [
+        ("codex", "debug-foo"),
+        ("gemini", "test-reconnect"),
+        ("cursor", "debug-"),            # empty suffix still prefix-valid
+        ("claude", "test-deep-nested-1"),
+        ("claude", "debug-outbox-repro"),
+    ]
+    for agent, name in happy_paths:
+        result = await call_gate(
+            gate,
+            "mcp__alor__agent_spawn",
+            {
+                "agent": agent,
+                "name": name,
+                "project": "debug-scratch",
+                "working_dir": "/tmp/debug",
+            },
+        )
+        assert_is(
+            f"worker agent_spawn(agent={agent!r}, name={name!r}) -> Allow",
+            result,
+            PermissionResultAllow,
+        )
+
+
+async def test_worker_agent_spawn_denies_non_template_agents() -> None:
+    gate = make_gate("worker")
+    blocked_agents = [
+        "claude-alor",         # fixed orchestrator slot
+        "cursor-alor",         # fixed slot
+        "claude-mandaspace",   # derived instance id, not a template
+        "",                    # missing
+        "CLAUDE",              # case-sensitive check — uppercase disallowed
+        "nonexistent-name",
+    ]
+    for agent in blocked_agents:
+        result = await call_gate(
+            gate,
+            "mcp__alor__agent_spawn",
+            {"agent": agent, "name": "debug-ok"},
+        )
+        assert_is(
+            f"worker agent_spawn(agent={agent!r}) -> Deny",
+            result,
+            PermissionResultDeny,
+        )
+        # Error should name the rule + list allowed templates so the
+        # LLM can self-correct.
+        assert_eq(
+            f"worker agent_spawn(agent={agent!r}) deny mentions 'generic templates'",
+            "generic templates" in result.message,
+            True,
+        )
+        assert_eq(
+            f"worker agent_spawn(agent={agent!r}) deny lists allowed set",
+            "codex" in result.message
+            and "gemini" in result.message
+            and "cursor" in result.message
+            and "claude" in result.message,
+            True,
+        )
+
+
+async def test_worker_agent_spawn_denies_bad_name_prefix() -> None:
+    gate = make_gate("worker")
+    bad_names = [
+        "foo",
+        "deploy-prod",
+        "alor-test",
+        "debug_foo",        # underscore, not dash — strict prefix
+        "debugfoo",         # no separator
+        "Debug-foo",        # case-sensitive check
+        "TEST-foo",
+        " debug-foo",       # leading whitespace breaks prefix
+        "production",
+    ]
+    for name in bad_names:
+        result = await call_gate(
+            gate,
+            "mcp__alor__agent_spawn",
+            {"agent": "claude", "name": name},
+        )
+        assert_is(
+            f"worker agent_spawn(name={name!r}) -> Deny",
+            result,
+            PermissionResultDeny,
+        )
+        assert_eq(
+            f"worker agent_spawn(name={name!r}) deny names '{name}'",
+            name in result.message,
+            True,
+        )
+        assert_eq(
+            f"worker agent_spawn(name={name!r}) deny mentions debug-/test- prefix",
+            "debug-" in result.message and "test-" in result.message,
+            True,
+        )
+
+
+async def test_worker_agent_spawn_denies_missing_name() -> None:
+    gate = make_gate("worker")
+    missing_name_payloads = [
+        {"agent": "claude"},                            # no name key
+        {"agent": "claude", "name": ""},               # empty string
+        {"agent": "claude", "name": None},             # None
+        {"agent": "claude", "project": "debug-foo"},   # relies on daemon auto-derive
+        {"agent": "claude", "project": "debug-foo", "working_dir": "/tmp/x"},
+    ]
+    for payload in missing_name_payloads:
+        result = await call_gate(gate, "mcp__alor__agent_spawn", payload)
+        assert_is(
+            f"worker agent_spawn({payload}) -> Deny (missing name)",
+            result,
+            PermissionResultDeny,
+        )
+        assert_eq(
+            f"worker agent_spawn({payload}) deny mentions 'explicit name'",
+            "explicit `name`" in result.message or "explicit `name" in result.message,
+            True,
+        )
+        assert_eq(
+            f"worker agent_spawn({payload}) deny says auto-derive disabled",
+            "auto-derivation is disabled" in result.message,
+            True,
+        )
+
+
+async def test_worker_agent_spawn_denial_order_templates_first() -> None:
+    """When both template + name prefix are wrong, the template deny
+    wins — it's the most likely root cause (the LLM picked the wrong
+    slot), so the error should point there first."""
+    gate = make_gate("worker")
+    result = await call_gate(
+        gate,
+        "mcp__alor__agent_spawn",
+        {"agent": "claude-alor", "name": "production"},
+    )
+    assert_is("both-wrong spawn -> Deny", result, PermissionResultDeny)
+    # Template message mentions "generic templates"; name-prefix
+    # message doesn't — so presence of the former confirms order.
+    assert_eq(
+        "both-wrong: template error fires before name-prefix error",
+        "generic templates" in result.message,
+        True,
+    )
+
+
 async def test_orch_unrestricted_on_alor_tools() -> None:
     """Orch role keeps full Alor MCP access — no regression."""
     gate = make_gate("orch")
@@ -359,6 +528,26 @@ async def test_orch_unrestricted_on_alor_tools() -> None:
             gate, name, {"agent_id": "claude-alor", "text": "x"}
         )
         assert_is(f"orch {name} -> Allow", result, PermissionResultAllow)
+
+
+async def test_orch_agent_spawn_ignores_worker_restrictions() -> None:
+    """Orch can spawn anything — the template allowlist, explicit-name
+    requirement, and prefix check only apply to the worker role."""
+    gate = make_gate("orch")
+    orch_spawns = [
+        {"agent": "claude-alor"},                                       # fixed slot
+        {"agent": "cursor-alor", "name": "production-worker"},          # no prefix
+        {"agent": "claude", "project": "mandaspace"},                   # auto-derive
+        {"agent": "claude", "name": "prod-deploy"},                     # non-debug prefix
+        {},                                                             # orch passes raw — daemon validates
+    ]
+    for payload in orch_spawns:
+        result = await call_gate(gate, "mcp__alor__agent_spawn", payload)
+        assert_is(
+            f"orch agent_spawn({payload}) -> Allow (worker rules don't apply)",
+            result,
+            PermissionResultAllow,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +590,14 @@ async def main() -> int:
     await test_worker_denies_orch_only_alor_tools()
     await test_worker_allows_the_five_worker_accessible_tools()
     await test_worker_cannot_send_to_orchestrator()
+    await test_worker_spawnable_templates_and_prefixes_locked()
+    await test_worker_agent_spawn_allows_generic_templates_with_prefix()
+    await test_worker_agent_spawn_denies_non_template_agents()
+    await test_worker_agent_spawn_denies_bad_name_prefix()
+    await test_worker_agent_spawn_denies_missing_name()
+    await test_worker_agent_spawn_denial_order_templates_first()
     await test_orch_unrestricted_on_alor_tools()
+    await test_orch_agent_spawn_ignores_worker_restrictions()
 
     await test_push_notification_not_gated()
     await test_worktree_tools_not_gated()

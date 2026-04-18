@@ -177,7 +177,12 @@ async def agent_ensure_running(args: dict[str, Any]) -> dict[str, Any]:
     "will auto-derive '{agent}-{project}' (e.g. 'claude-mandaspace'). "
     "Pass `project` + `working_dir` to parameterize a template for a "
     "specific project (working_dir may include ~). Fails if the instance "
-    "id is already registered and running.",
+    "id is already registered and running. "
+    "Worker role is restricted: `agent` must be in "
+    "{codex, gemini, cursor, claude} (generic templates only — no fixed "
+    "slots), `name` is required (no auto-derive), and `name` must start "
+    "with 'debug-' or 'test-' so verification instances self-identify as "
+    "throwaway. Orchestrator role is unrestricted.",
     {
         "agent": str,
         "name": str,

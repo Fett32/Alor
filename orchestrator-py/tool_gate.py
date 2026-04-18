@@ -98,6 +98,26 @@ ORCHESTRATOR_AGENT_IDS: frozenset[str] = frozenset(
     }
 )
 
+# Base-template names workers may pass as `agent` to agent_spawn.
+# Restricted to the generic templates (no fixed slots like
+# `claude-alor` / `cursor-alor`) so workers can't accidentally
+# clobber production slot ids. Orch role is unrestricted.
+WORKER_SPAWNABLE_TEMPLATES: frozenset[str] = frozenset(
+    {
+        "codex",
+        "gemini",
+        "cursor",
+        "claude",
+    }
+)
+
+# Required prefixes for the `name` arg on worker-origin agent_spawn.
+# Every worker-spawned instance must self-identify as throwaway so
+# it's obvious at `agent_list` / `state.json` which entries came
+# from debug/verification flows. Case-sensitive — keeps the check
+# predictable and aligns with the lowercase agent-id convention.
+WORKER_SPAWN_NAME_PREFIXES: tuple[str, ...] = ("debug-", "test-")
+
 
 def _strip_mcp_prefix(tool_name: str) -> str:
     """Return the bare Alor tool name if `tool_name` is one of ours,
@@ -126,6 +146,37 @@ def _deny_worker_sends_to_orch(target: str) -> str:
         f"prompt-injection loops. Target a non-orchestrator worker "
         f"instead (use agent_spawn to create a throwaway test "
         f"instance if you don't have one to address)."
+    )
+
+
+def _deny_worker_spawn_template(agent: str) -> str:
+    allowed = ", ".join(sorted(WORKER_SPAWNABLE_TEMPLATES))
+    return (
+        f"Workers may only agent_spawn generic templates. "
+        f"`agent='{agent}'` is not allowed — it's either a fixed "
+        f"production slot (claude-alor / cursor-alor / etc.) or an "
+        f"unknown name. Allowed templates: {{{allowed}}}."
+    )
+
+
+def _deny_worker_spawn_missing_name() -> str:
+    prefixes = " / ".join(WORKER_SPAWN_NAME_PREFIXES)
+    return (
+        f"Workers must pass an explicit `name` to agent_spawn — "
+        f"daemon auto-derivation is disabled for the worker role. "
+        f"Name must start with {prefixes} (e.g. 'debug-foo', "
+        f"'test-reconnect-repro') so debug instances are obvious "
+        f"in agent_list and state.json."
+    )
+
+
+def _deny_worker_spawn_name_prefix(name: str) -> str:
+    prefixes = " / ".join(WORKER_SPAWN_NAME_PREFIXES)
+    return (
+        f"Worker agent_spawn `name='{name}'` is rejected: names must "
+        f"start with {prefixes} so debug/verification instances "
+        f"self-identify as throwaway. Pick something like "
+        f"'debug-{name}' or 'test-{name}'."
     )
 
 
@@ -204,6 +255,29 @@ def make_gate(role: str):
                 if target in ORCHESTRATOR_AGENT_IDS:
                     return PermissionResultDeny(
                         message=_deny_worker_sends_to_orch(target)
+                    )
+
+            # agent_spawn guardrails: workers can only spawn generic
+            # templates (no fixed slots), must pass an explicit
+            # `name`, and that name must be debug-/test- prefixed.
+            # Order matters: invalid agent first (most likely root
+            # cause), then missing name, then bad prefix — keeps the
+            # error message precise about which rule tripped.
+            if bare == "agent_spawn":
+                payload = tool_input or {}
+                agent = payload.get("agent", "")
+                name = payload.get("name") or ""
+                if agent not in WORKER_SPAWNABLE_TEMPLATES:
+                    return PermissionResultDeny(
+                        message=_deny_worker_spawn_template(agent)
+                    )
+                if not name:
+                    return PermissionResultDeny(
+                        message=_deny_worker_spawn_missing_name()
+                    )
+                if not name.startswith(WORKER_SPAWN_NAME_PREFIXES):
+                    return PermissionResultDeny(
+                        message=_deny_worker_spawn_name_prefix(name)
                     )
 
         return PermissionResultAllow()
