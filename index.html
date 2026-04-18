@@ -70,6 +70,13 @@
             <option value="TIMED_OUT">Timed out</option>
           </select>
         </div>
+        <!--
+          Current-category indicator. TaskList.js writes the selected
+          dropdown option's label here on init and on every change so the
+          user doesn't have to re-open the <select> to remember which
+          bucket they're looking at. Purely cosmetic readout.
+        -->
+        <div id="task-category-label" aria-live="polite">Default</div>
         <div id="task-list-scroll">
           <!-- TaskList renders here -->
         </div>

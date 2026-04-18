@@ -89,6 +89,7 @@ const ARCHIVE_AFTER_DAYS = 30;
 let $scroll;
 let $search;
 let $filterSelect;
+let $categoryLabel;
 let $overlay;
 let $titleInput;
 let $descInput;
@@ -106,10 +107,11 @@ let $btnSubmit;
  */
 export function initTaskList() {
   try {
-    $scroll       = document.getElementById("task-list-scroll");
-    $search       = document.getElementById("task-search");
-    $filterSelect = document.getElementById("task-filter-state");
-    $overlay      = document.getElementById("modal-overlay");
+    $scroll        = document.getElementById("task-list-scroll");
+    $search        = document.getElementById("task-search");
+    $filterSelect  = document.getElementById("task-filter-state");
+    $categoryLabel = document.getElementById("task-category-label");
+    $overlay       = document.getElementById("modal-overlay");
     $titleInput   = document.getElementById("modal-title-input");
     $descInput    = document.getElementById("modal-desc-input");
     $agentSelect  = document.getElementById("modal-agent-select");
@@ -151,9 +153,11 @@ export function initTaskList() {
       // <option selected> attribute in index.html already does this for
       // the browser, but reading it here makes the invariant explicit.
       $filterSelect.value = filterState;
+      updateCategoryLabel();
       $filterSelect.addEventListener("change", () => {
         filterState = $filterSelect.value;
         rendered = PAGE_SIZE;
+        updateCategoryLabel();
         renderTasks();
       });
     }
@@ -237,6 +241,22 @@ async function approveTask(id) {
     console.error("[TaskList] approve_task failed:", err);
     alert(`Failed to approve task: ${err}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Category label
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirror the currently-selected dropdown option's label into
+ * #task-category-label. Reads the option text directly so value→label
+ * translation lives in exactly one place (the <select> in index.html) —
+ * renaming a label there auto-propagates here without a code change.
+ */
+function updateCategoryLabel() {
+  if (!$categoryLabel || !$filterSelect) return;
+  const opt = $filterSelect.selectedOptions[0];
+  $categoryLabel.textContent = opt ? opt.text : "";
 }
 
 // ---------------------------------------------------------------------------

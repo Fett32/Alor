@@ -414,6 +414,20 @@ html, body {
 #task-controls select:focus { border-color: var(--border-focus); }
 #task-controls select option { background: var(--bg-panel-alt); }
 
+/*
+ * Current-category readout — the selected dropdown option's label,
+ * mirrored here by TaskList.js so you can see which bucket you're in
+ * without re-opening the <select>. Dim, compact, section-header feel.
+ */
+#task-category-label {
+  color: var(--text-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 6px 14px 2px;
+  flex-shrink: 0;
+}
+
 /* Task list */
 
 #task-list-scroll {
