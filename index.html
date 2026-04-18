@@ -46,13 +46,28 @@
         <div id="task-controls">
           <input id="task-search" type="search" placeholder="Filter…" />
           <select id="task-filter-state">
+            <!--
+              "default" hides {COMPLETED, CANCELLED, REJECTED, TIMED_OUT}
+              so the default view is in-flight + stale work only. Every
+              other state (including terminal) is reachable via an
+              explicit option below so old tasks stay findable.
+              TaskList.js enforces the filter; this list is just labels.
+            -->
+            <option value="default" selected>Default</option>
             <option value="">All</option>
+            <option value="PENDING">Pending</option>
             <option value="ASSIGNED">Assigned</option>
             <option value="ACCEPTED">Accepted</option>
-            <option value="COMPLETED">Completed</option>
             <option value="BLOCKED">Blocked</option>
-            <option value="CANCELLED">Cancelled</option>
+            <option value="PROPOSED">Proposed</option>
+            <option value="STAGED">Staged</option>
+            <option value="INTERRUPTED">Interrupted</option>
+            <option value="RECOVERING">Recovering</option>
             <option value="STALE">Stale</option>
+            <option value="COMPLETED">Completed</option>
+            <option value="CANCELLED">Cancelled</option>
+            <option value="REJECTED">Rejected</option>
+            <option value="TIMED_OUT">Timed out</option>
           </select>
         </div>
         <div id="task-list-scroll">

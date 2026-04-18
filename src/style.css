@@ -523,6 +523,18 @@ html, body {
   margin-top: 20px;
 }
 
+/*
+ * Chunked-render sentinel — an invisible spacer at the end of the
+ * currently-rendered page. TaskList.js attaches an IntersectionObserver
+ * to it; when it scrolls into view the next PAGE_SIZE cards are
+ * appended. Needs non-zero height so the observer fires reliably, but
+ * stays visually inert.
+ */
+.task-load-sentinel {
+  height: 1px;
+  flex-shrink: 0;
+}
+
 /* ── Modals ─────────────────────────────────────────────────────────────── */
 
 .modal-overlay {

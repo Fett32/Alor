@@ -21,14 +21,66 @@ import { listen } from "@tauri-apps/api/event";
 /** @type {Task[]} */
 let tasks = [];
 
-/** Active filter string (state value or ""). */
-let filterState = "";
+/**
+ * Active filter string. Semantics:
+ *   - "default" → hide {COMPLETED, CANCELLED, REJECTED, TIMED_OUT}
+ *     (i.e. show in-flight + stale work only). This is the boot state —
+ *     matches the "Default" <option> in index.html.
+ *   - ""        → show everything ("All").
+ *   - Any SCREAMING_SNAKE_CASE state name → exact-match filter.
+ */
+let filterState = "default";
 
 /** Active search string (lower-cased). */
 let filterSearch = "";
 
 /** Event unlisten handle. */
 let unlistenTasks = null;
+
+// ---------------------------------------------------------------------------
+// Chunked rendering
+// ---------------------------------------------------------------------------
+
+/**
+ * How many cards we append per chunk. DOM-only cost — no token/context
+ * implications (the CLI/MCP surface has its own, tighter cap; see
+ * src-tauri/src/wrapper/protocol.rs::DEFAULT_TASK_LIST_LIMIT). 50 keeps
+ * initial render snappy even with thousands of retained tasks.
+ */
+const PAGE_SIZE = 50;
+
+/** Number of cards currently rendered for the active filter/search. */
+let rendered = PAGE_SIZE;
+
+/** IntersectionObserver that drives "scroll to reveal more". */
+let chunkObserver = null;
+
+/**
+ * States we hide from the "Default" view. Explicit list (rather than
+ * reusing `is_terminal()` semantics from the Rust side) because the
+ * brief wants STALE visible by default even though the Rust enum
+ * treats it as terminal. Keep this in sync with index.html's dropdown
+ * comment.
+ */
+const DEFAULT_HIDDEN_STATES = new Set([
+  "COMPLETED", "CANCELLED", "REJECTED", "TIMED_OUT",
+]);
+
+/**
+ * EXTENSION HOOK: "archive-archive" for long-tail tasks.
+ *
+ * When a category grows to thousands of entries, filter items older
+ * than this threshold into a separate "Archived" bucket (or move them
+ * to a cold-storage file on disk and serve on demand). The UI already
+ * paginates, so the visible cost is bounded — but keeping every task
+ * forever in `state.json` has a filesystem / JSON-parse cost we'll
+ * want to cap eventually.
+ *
+ * Not implemented here; this constant is just the obvious landing
+ * site for the next pass.
+ */
+// eslint-disable-next-line no-unused-vars
+const ARCHIVE_AFTER_DAYS = 30;
 
 // ---------------------------------------------------------------------------
 // DOM refs
@@ -86,13 +138,22 @@ export function initTaskList() {
     if ($search) {
       $search.addEventListener("input", () => {
         filterSearch = $search.value.toLowerCase();
+        // Reset chunk cursor: the filtered set changed, old offset is
+        // meaningless. Without this, filtering to a smaller result set
+        // would still try to render from `rendered` — showing nothing.
+        rendered = PAGE_SIZE;
         renderTasks();
       });
     }
 
     if ($filterSelect) {
+      // Sync initial value with `filterState`'s default ("default"). The
+      // <option selected> attribute in index.html already does this for
+      // the browser, but reading it here makes the invariant explicit.
+      $filterSelect.value = filterState;
       $filterSelect.addEventListener("change", () => {
         filterState = $filterSelect.value;
+        rendered = PAGE_SIZE;
         renderTasks();
       });
     }
@@ -230,7 +291,11 @@ function closeProposalModal() {
 function renderTasks() {
   let visible = tasks;
 
-  if (filterState) {
+  // State filter. "" = All (no filter). "default" = hide the terminal
+  // states DEFAULT_HIDDEN_STATES. Anything else = exact state match.
+  if (filterState === "default") {
+    visible = visible.filter((t) => !DEFAULT_HIDDEN_STATES.has(t.state));
+  } else if (filterState) {
     visible = visible.filter((t) => t.state === filterState);
   }
 
@@ -243,9 +308,12 @@ function renderTasks() {
     );
   }
 
-  // Sort: non-terminal first, then by updated_at descending.
+  // Sort: non-terminal first, then by updated_at descending. Note this
+  // uses the broader "terminal" set (includes STALE) so stale records
+  // sink below live work in the Default view, even though the Default
+  // filter itself keeps STALE visible.
   const terminalStates = new Set([
-    "COMPLETED", "CANCELLED", "REJECTED", "TIMED_OUT",
+    "COMPLETED", "CANCELLED", "REJECTED", "TIMED_OUT", "STALE",
   ]);
 
   visible = [...visible].sort((a, b) => {
@@ -254,6 +322,14 @@ function renderTasks() {
     if (aTerm !== bTerm) return aTerm ? 1 : -1;
     return new Date(b.updated_at) - new Date(a.updated_at);
   });
+
+  // Tear down the previous observer, if any. We re-attach below if the
+  // new result set exceeds one chunk. Without this, filter changes
+  // would leak observers that still reference stale sentinels.
+  if (chunkObserver) {
+    chunkObserver.disconnect();
+    chunkObserver = null;
+  }
 
   $scroll.innerHTML = "";
 
@@ -268,8 +344,34 @@ function renderTasks() {
     return;
   }
 
-  for (const task of visible) {
-    $scroll.appendChild(buildTaskCard(task));
+  // Clamp the chunk cursor — a filter change may have left `rendered`
+  // pointing past the new visible.length.
+  const limit = Math.min(rendered, visible.length);
+  for (let i = 0; i < limit; i++) {
+    $scroll.appendChild(buildTaskCard(visible[i]));
+  }
+
+  // Scroll-load sentinel: when it enters the viewport, bump the cursor
+  // and re-render. IntersectionObserver is used instead of a scroll
+  // handler so we don't fire on every pixel during user scroll.
+  if (limit < visible.length) {
+    const sentinel = document.createElement("div");
+    sentinel.className = "task-load-sentinel";
+    sentinel.setAttribute("aria-hidden", "true");
+    $scroll.appendChild(sentinel);
+
+    chunkObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          rendered += PAGE_SIZE;
+          renderTasks();
+          break;
+        }
+      },
+      { root: $scroll, rootMargin: "200px" },
+    );
+    chunkObserver.observe(sentinel);
   }
 }
 
