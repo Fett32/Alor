@@ -6,6 +6,7 @@ Kept intentionally small — anything specific to a role lives in its own module
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import time
 from typing import Awaitable, Callable
@@ -23,6 +24,8 @@ from claude_agent_sdk import (
 )
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 
 # ---- ANSI colors ------------------------------------------------------------
 
@@ -67,6 +70,95 @@ def print_footer(session_start: float, total_cost_usd: float, totals: dict[str, 
     )
 
 
+# ---- Paste sanitization ----------------------------------------------------
+
+# Paste guard for middle-click / clipboard paste into the TUI.
+#
+# Middle-click on Linux X11 delivers PRIMARY selection bytes straight into
+# the tty as if typed, so without bracketed paste mode each embedded \r in
+# a multi-line clipboard fires accept-line and submits a partial message
+# mid-paste — observed repeatedly by Fett, broke orch sessions.
+#
+# prompt_toolkit's vt100 input enables bracketed paste by default
+# (\e[?2004h) and exposes a Keys.BracketedPaste event carrying the whole
+# paste as event.data. The default handler in
+# prompt_toolkit.key_binding.bindings.basic only normalizes CRLF → LF; we
+# replace it with a fuller sanitize that also strips ANSI, NUL, other C0
+# controls, BOM, and zero-width chars. User bindings are merged LAST in
+# PromptSession's key-binding stack (see shortcuts/prompt.py) and
+# key_processor picks matches[-1], so our handler wins over the default.
+#
+# Bytes that survive sanitization are inserted as a single atomic block
+# via current_buffer.insert_text — never re-tokenized through the keystroke
+# path, which is exactly how the newline-as-submit bug used to happen.
+
+# ANSI escape sequences. Must run before stripping stray \x1b so the full
+# sequence (CSI / OSC / DCS / SOS / PM / APC / single-char) is consumed
+# atomically, not left dangling. The OSC branch accepts either BEL (\x07)
+# or ST (\x1b\\) as the terminator.
+_ANSI_ESC = re.compile(
+    r"""
+    \x1b
+    (?:
+        \[ [0-?]* [ -/]* [@-~]              # CSI: \e[ params inters final
+      | \] [^\x07\x1b]* (?: \x07 | \x1b\\ ) # OSC: \e] ... BEL | ST
+      | [PX^_] [^\x1b]* \x1b\\              # DCS/SOS/PM/APC: ... ST
+      | [@-_]                               # \e followed by single byte
+    )
+    """,
+    re.VERBOSE,
+)
+
+# C0 control bytes to strip. Preserves tab (\x09) and LF (\x0a); CR
+# (\x0d) is normalized to LF upstream of this regex so never reaches it.
+_CTRL_BYTES = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Zero-width chars + BOM. Common junk from browser / word-processor
+# clipboards — invisible on paste but bloats the buffer and confuses
+# downstream text handling.
+_ZERO_WIDTH = re.compile(r"[\u200B\u200C\u200D\u2060\uFEFF]")
+
+
+def sanitize_paste(text: str) -> str:
+    """Scrub clipboard text before it enters the input buffer.
+
+    Order matters: strip ANSI sequences first so stray \\x1b bytes from
+    malformed sequences are handled by the follow-up replace.
+
+    - ANSI CSI / OSC / DCS / etc. sequences: stripped.
+    - Stray \\x1b bytes (bytes that didn't form a valid escape): stripped.
+    - CRLF / lone CR: normalized to LF.
+    - NUL + other C0 controls (except tab + LF): stripped.
+    - Zero-width chars + BOM: stripped.
+    - LF preserved — lands as a literal newline in the buffer but does
+      NOT trigger submit (accept-line only fires on an actual Enter
+      keypress outside the paste event), so multi-line pastes stay atomic
+      and the user decides when to submit.
+    """
+    text = _ANSI_ESC.sub("", text)
+    text = text.replace("\x1b", "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _CTRL_BYTES.sub("", text)
+    text = _ZERO_WIDTH.sub("", text)
+    return text
+
+
+def _build_paste_guard() -> KeyBindings:
+    """KeyBindings registering a paste-guard for Keys.BracketedPaste.
+
+    Overrides prompt_toolkit's default BracketedPaste handler. Sanitizes
+    the full paste atomically and inserts as one buffer block.
+    """
+    kb = KeyBindings()
+
+    @kb.add(Keys.BracketedPaste)
+    def _(event):
+        # event.data is the full paste content between \e[200~ / \e[201~.
+        event.current_buffer.insert_text(sanitize_paste(event.data))
+
+    return kb
+
+
 # ---- stdin ------------------------------------------------------------------
 
 # One PromptSession per process.  Holds history, key bindings, rendering
@@ -77,7 +169,9 @@ _session: PromptSession | None = None
 def _get_session() -> PromptSession:
     global _session
     if _session is None:
-        _session = PromptSession()
+        # Paste guard is installed as user key_bindings so it overrides the
+        # default BracketedPaste handler (which only normalizes CRLF).
+        _session = PromptSession(key_bindings=_build_paste_guard())
     return _session
 
 
