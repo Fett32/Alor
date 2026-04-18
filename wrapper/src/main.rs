@@ -290,18 +290,28 @@ async fn run_main() -> Result<()> {
     // freshly_created is always false).
     //
     //   1. Trust-ack polling — ALWAYS runs when the runtime has
-    //      prompt_acks entries. Loop captures the pane every 500ms;
+    //      trust_prompts entries. Loop captures the pane every 500ms;
     //      on a hint match, sends the paired ack key and keeps
     //      polling so a follow-up prompt (codex update → trust) gets
     //      picked up. Fast-exits after 4 consecutive no-hit polls
     //      (~2s of stable pane) so idle sessions aren't penalized.
-    //      Hard cap at 30 polls (~15s) for pathological slow boots.
+    //      Hard cap at 60 polls (~30s) for pathological slow boots
+    //      plus multi-stage prompt chains (codex update dismissal,
+    //      trust-dialog render, trust ack).
     //
     //   2. Briefing injection — STILL runs only on fresh sessions
     //      with --startup-file. Unchanged.
-    let prompts = kind.prompt_acks();
+
+    // Boot grace for freshly-created sessions only: give the CLI a
+    // moment to start rendering its initial screen before the first
+    // poll. Re-spawns inherit a populated pane; no grace needed.
+    if freshly_created {
+        sleep(Duration::from_secs(3)).await;
+    }
+
+    let prompts = kind.trust_prompts();
     if !prompts.is_empty() {
-        const MAX_POLLS: u32 = 30;            // 30 × 500ms = 15s max
+        const MAX_POLLS: u32 = 60;            // 60 × 500ms = 30s max
         const STABLE_THRESHOLD: u32 = 4;      // 4 polls (~2s) with no hit → done
         let mut no_hit_streak: u32 = 0;
         let mut acked_any = false;

@@ -64,9 +64,9 @@ impl AgentKind {
     /// Kept as substrings (not regex) so lookups stay `str::contains`
     /// cheap and the match is robust to minor TUI layout changes.
     /// Previous `trust_prompt_hints()` + `trust_ack_key()` methods
-    /// are subsumed here: they couldn't represent per-prompt ack keys,
-    /// which broke for multi-stage runtimes like codex.
-    pub fn prompt_acks(&self) -> &'static [(&'static str, &'static str)] {
+    /// were subsumed here: they couldn't represent per-prompt ack
+    /// keys, which broke for multi-stage runtimes like codex.
+    pub fn trust_prompts(&self) -> &'static [(&'static str, &'static str)] {
         match self {
             // Claude Code's trust dialog opens with
             //   "Quick safety check: Is this a project you created or one you trust?"
@@ -208,15 +208,15 @@ mod tests {
         assert!(matches!(AgentKind::from_name("weird-unknown"), AgentKind::Default));
     }
 
-    // ---- prompt_acks per-kind ----
+    // ---- trust_prompts per-kind ----
 
     #[test]
-    fn prompt_acks_per_kind() {
+    fn trust_prompts_per_kind() {
         // ClaudeCode: single distinctive intro line. Unused in practice
         // (claude yamls are claude-sdk runtime) but future-proofs a
         // hypothetical wrapper-runtime claude slot.
         assert_eq!(
-            AgentKind::ClaudeCode.prompt_acks(),
+            AgentKind::ClaudeCode.trust_prompts(),
             &[("Quick safety check", "1")]
         );
 
@@ -225,7 +225,7 @@ mod tests {
         // Yes, continue). Order matters — the wrapper polls through
         // them as the CLI renders them sequentially.
         assert_eq!(
-            AgentKind::Codex.prompt_acks(),
+            AgentKind::Codex.trust_prompts(),
             &[
                 ("Update available!", "3"),
                 ("Do you trust the contents", "1"),
@@ -234,14 +234,14 @@ mod tests {
         // Explicit ordering assertion — the update prompt MUST come
         // first so we never accidentally ack the trust prompt with
         // "3" (which would map to a non-existent option).
-        let codex_prompts = AgentKind::Codex.prompt_acks();
+        let codex_prompts = AgentKind::Codex.trust_prompts();
         assert_eq!(codex_prompts.len(), 2);
         assert_eq!(codex_prompts[0].0, "Update available!");
         assert_eq!(codex_prompts[1].0, "Do you trust the contents");
 
         // Gemini: distinctive "Trusting a folder" intro, ack "1".
         assert_eq!(
-            AgentKind::Gemini.prompt_acks(),
+            AgentKind::Gemini.trust_prompts(),
             &[("Trusting a folder", "1")]
         );
 
@@ -249,7 +249,7 @@ mod tests {
         // Confirmed via live probe in /tmp and $HOME — cursor
         // re-prompts every session, doesn't persist trust state.
         assert_eq!(
-            AgentKind::Cursor.prompt_acks(),
+            AgentKind::Cursor.trust_prompts(),
             &[("Workspace Trust Required", "a")]
         );
 
@@ -257,7 +257,7 @@ mod tests {
         // unknown runtimes — we'd rather a new CLI hang once at its
         // trust dialog than splat unrelated keystrokes into its pane.
         assert_eq!(
-            AgentKind::Default.prompt_acks(),
+            AgentKind::Default.trust_prompts(),
             &[] as &[(&str, &str)]
         );
     }
