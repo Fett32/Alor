@@ -152,12 +152,33 @@ impl PaneManager {
                 .output()
                 .await;
 
-            // Single click inside copy-mode → cancel (exits copy-mode,
-            // selection disappears, user can type again immediately).
+            // Single click (tap, no drag) inside copy-mode → cancel
+            // on MOUSE-UP. Exits copy-mode, user can type again.
+            //
+            // Rebinding MouseUp1Pane (and NOT MouseDown1Pane) is what
+            // makes drag-select work in a scrolled-up pane. tmux
+            // distinguishes tap from drag natively: a completed tap
+            // fires `MouseUp1Pane`, a drag fires `MouseDragEnd1Pane`
+            // (caught above) and never fires MouseUp. A prior version
+            // of this code bound `cancel` to MouseDown, which snapped
+            // the viewport to the bottom the instant the user pressed
+            // the button, killing drag-select before it began.
+            //
+            // `unbind-key -T <table> MouseDown1Pane` clears the prior
+            // binding on tmux servers that predate this change — a
+            // fresh Alor start against a long-running tmux would
+            // otherwise inherit the old behavior.
+            let _ = Command::new("tmux")
+                .args([
+                    "unbind-key", "-T", table,
+                    "MouseDown1Pane",
+                ])
+                .output()
+                .await;
             let _ = Command::new("tmux")
                 .args([
                     "bind-key", "-T", table,
-                    "MouseDown1Pane",
+                    "MouseUp1Pane",
                     "send-keys", "-X", "cancel",
                 ])
                 .output()
