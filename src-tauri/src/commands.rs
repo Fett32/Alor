@@ -110,6 +110,17 @@ pub async fn assign_task(
 }
 
 /// Cancel a task by UUID string.
+///
+/// Accepts any current state:
+///   - Non-terminal (Pending/Assigned/Accepted/…) → normal cancel edge.
+///   - STALE / COMPLETED / REJECTED / TIMED_OUT → user-initiated
+///     finalize-from-terminal; state machine allows it as bookkeeping
+///     (see `TaskState::can_transition_to`). The UI surfaces a confirm
+///     prompt before firing this RPC so the user acknowledges they're
+///     re-labeling an already-done task.
+///   - CANCELLED → no-op, returns the task unchanged. Matches the
+///     "double-click shouldn't error" contract enforced in
+///     `AppState::transition_task`.
 #[tauri::command]
 pub fn cancel_task(state: State<'_, AppState>, id: String) -> Result<Task, String> {
     let uuid = Uuid::parse_str(&id).map_err(err)?;

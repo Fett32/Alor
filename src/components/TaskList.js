@@ -67,6 +67,18 @@ const DEFAULT_HIDDEN_STATES = new Set([
 ]);
 
 /**
+ * All terminal states, matching the Rust `TaskState::is_terminal()`
+ * classification. Used to gate the cancel confirmation prompt —
+ * cancelling a terminal task is a bookkeeping re-label (allowed by
+ * the state machine; see src-tauri/src/daemon/state.rs) so we ask
+ * the user to acknowledge before firing the RPC. STALE is included
+ * even though it stays visible in the Default view.
+ */
+const TERMINAL_STATES = new Set([
+  "COMPLETED", "CANCELLED", "REJECTED", "TIMED_OUT", "STALE",
+]);
+
+/**
  * EXTENSION HOOK: "archive-archive" for long-tail tasks.
  *
  * When a category grows to thousands of entries, filter items older
@@ -219,6 +231,20 @@ async function handleSubmit() {
 }
 
 async function cancelTask(id) {
+  // Terminal-state cancels are a re-label, not a work abort — ask for
+  // explicit confirmation so the user doesn't accidentally collapse a
+  // Completed / Rejected / Timed-out record to Cancelled. Non-terminal
+  // tasks cancel immediately (the normal flow — no nag). Cancel button
+  // isn't rendered at all for already-CANCELLED cards so this branch
+  // won't fire for those.
+  const task = tasks.find((t) => t.id === id);
+  if (task && TERMINAL_STATES.has(task.state)) {
+    const label = labelForState(task.state) || task.state;
+    if (!confirm(`This task is already ${label}. Cancel anyway?`)) {
+      return;
+    }
+  }
+
   try {
     const updated = await invoke("cancel_task", { id });
     const idx = tasks.findIndex((t) => t.id === id);
@@ -228,6 +254,20 @@ async function cancelTask(id) {
     console.error("[TaskList] cancel_task failed:", err);
     alert(`Failed to cancel task: ${err}`);
   }
+}
+
+/**
+ * Look up the user-facing label for a state value by reading the
+ * matching <option> text from #task-filter-state. Mirrors the idiom
+ * used by updateCategoryLabel so "Timed out" etc. stays consistent.
+ * Returns null if the state isn't in the dropdown.
+ */
+function labelForState(state) {
+  if (!$filterSelect) return null;
+  for (const opt of $filterSelect.options) {
+    if (opt.value === state) return opt.text;
+  }
+  return null;
 }
 
 async function approveTask(id) {
@@ -427,16 +467,20 @@ function buildTaskCard(task) {
 
   metaEl.append(badge, agentSpan, timeSpan);
 
-  // Actions: Cancel for active tasks, Review for PROPOSED
-  const terminalStates = new Set([
-    "COMPLETED", "CANCELLED", "REJECTED", "TIMED_OUT",
-  ]);
+  // Actions:
+  //   - Review: only for PROPOSED.
+  //   - Cancel: every state except CANCELLED. Terminal non-Cancelled
+  //     states (Stale/Completed/Rejected/TimedOut) get it too so the
+  //     user can tidy them up; cancelTask() surfaces a confirm prompt
+  //     before firing the RPC on those.
+  const hasReview = task.state === "PROPOSED";
+  const hasCancel = task.state !== "CANCELLED";
 
-  if (!terminalStates.has(task.state)) {
+  if (hasReview || hasCancel) {
     const actions = document.createElement("div");
     actions.className = "task-actions";
 
-    if (task.state === "PROPOSED") {
+    if (hasReview) {
       const btnReview = document.createElement("button");
       btnReview.className = "review";
       btnReview.textContent = "Review";
@@ -444,11 +488,14 @@ function buildTaskCard(task) {
       actions.appendChild(btnReview);
     }
 
-    const btnCancel = document.createElement("button");
-    btnCancel.className = "cancel";
-    btnCancel.textContent = "Cancel";
-    btnCancel.addEventListener("click", () => cancelTask(task.id));
-    actions.appendChild(btnCancel);
+    if (hasCancel) {
+      const btnCancel = document.createElement("button");
+      btnCancel.className = "cancel";
+      btnCancel.textContent = "Cancel";
+      btnCancel.addEventListener("click", () => cancelTask(task.id));
+      actions.appendChild(btnCancel);
+    }
+
     card.append(titleEl, metaEl, actions);
   } else {
     card.append(titleEl, metaEl);

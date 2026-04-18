@@ -59,13 +59,31 @@ impl TaskState {
     /// Validate whether a transition from `self` to `next` is legal.
     pub fn can_transition_to(&self, next: &TaskState) -> bool {
         use TaskState::*;
-        // Narrow edge: retroactively close out a Cancelled task as Completed
-        // (bookkeeping — "I cancelled this, but it was actually done").
-        // Cancelled remains terminal for `is_terminal()` purposes so
-        // `agent_active_task_count` and `transition_task`'s assigned_to-clear
-        // semantics are unchanged.
-        if matches!((self, next), (Cancelled, Completed)) {
-            return true;
+        // Narrow terminal-bookkeeping edges. None of these resume work;
+        // they just re-label the final state so the user / orchestrator
+        // can tidy up a completed run without fighting the state
+        // machine.
+        //   - Cancelled -> Completed: "I cancelled this, but it was
+        //     actually done" (retroactive close-out; pre-existing).
+        //   - {Stale, Completed, Rejected, TimedOut} -> Cancelled:
+        //     user-initiated finalize from the Tauri UI. STALE is the
+        //     motivating case (stale tasks don't resume, user wants
+        //     them off the board); the other three are symmetric and
+        //     harmless — cancelling a completed/rejected/timed-out
+        //     task just collapses its label to "cancelled" for
+        //     filtering purposes.
+        //     Cancelled -> Cancelled is handled as a no-op in
+        //     `transition_task` (not here) so double-clicks don't
+        //     surface as errors.
+        // Terminal classification (is_terminal / assigned_to clear /
+        // agent_active_task_count) is unchanged by any of these edges.
+        match (self, next) {
+            (Cancelled, Completed) => return true,
+            (Stale, Cancelled)
+            | (Completed, Cancelled)
+            | (Rejected, Cancelled)
+            | (TimedOut, Cancelled) => return true,
+            _ => {}
         }
         if self.is_terminal() {
             return false;
@@ -648,6 +666,20 @@ impl AppState {
     /// Transition a task to a new state.  Returns the updated task on success.
     pub fn transition_task(&self, id: Uuid, next: TaskState) -> anyhow::Result<Task> {
         let is_completing = next == TaskState::Completed;
+        // Cancel-on-Cancelled is a no-op, not an error. Lets the UI /
+        // CLI hit Cancel on an already-cancelled task (double click,
+        // race with a background sweep, etc.) without surfacing a
+        // scary "illegal transition" error. Consistent with the
+        // rest of the user-initiated finalize-from-terminal semantics
+        // in `TaskState::can_transition_to`.
+        {
+            let s = self.inner.lock();
+            if let Some(task) = s.tasks.get(&id) {
+                if task.state == TaskState::Cancelled && next == TaskState::Cancelled {
+                    return Ok(task.clone());
+                }
+            }
+        }
         let mut s = self.inner.lock();
         let task = s
             .tasks
@@ -945,16 +977,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cancelled_to_completed_is_legal_retroactive_closeout() {
+    fn terminal_bookkeeping_edges_are_legal() {
         // Cancelled is still terminal for counting/assigned_to semantics …
         assert!(TaskState::Cancelled.is_terminal());
         // … but the narrow retroactive-closeout edge is allowed.
         assert!(TaskState::Cancelled.can_transition_to(&TaskState::Completed));
-        // Other terminal states remain fully terminal.
+
+        // User-initiated finalize-from-terminal: the UI lets the user
+        // cancel any terminal card (with a confirm prompt); the state
+        // machine must accept those transitions.
+        assert!(TaskState::Stale.can_transition_to(&TaskState::Cancelled));
+        assert!(TaskState::Completed.can_transition_to(&TaskState::Cancelled));
+        assert!(TaskState::Rejected.can_transition_to(&TaskState::Cancelled));
+        assert!(TaskState::TimedOut.can_transition_to(&TaskState::Cancelled));
+
+        // Cancelled -> Cancelled is NOT a legal state-machine edge
+        // (can_transition_to stays false); transition_task short-
+        // circuits it as a no-op before ever calling the state
+        // machine. See `cancel_on_already_cancelled_is_noop`.
+        assert!(!TaskState::Cancelled.can_transition_to(&TaskState::Cancelled));
+
+        // Resume-style transitions out of terminal states remain
+        // forbidden — the only escape hatches are the two bookkeeping
+        // edges above.
         assert!(!TaskState::Cancelled.can_transition_to(&TaskState::Pending));
         assert!(!TaskState::Cancelled.can_transition_to(&TaskState::Assigned));
-        assert!(!TaskState::Completed.can_transition_to(&TaskState::Cancelled));
+        assert!(!TaskState::Completed.can_transition_to(&TaskState::Accepted));
         assert!(!TaskState::Rejected.can_transition_to(&TaskState::Completed));
+        assert!(!TaskState::Stale.can_transition_to(&TaskState::Accepted));
     }
 
     #[test]
@@ -963,6 +1013,39 @@ mod tests {
         t.state = TaskState::Cancelled;
         t.transition(TaskState::Completed).expect("should succeed");
         assert_eq!(t.state, TaskState::Completed);
+    }
+
+    #[test]
+    fn task_transition_stale_to_cancelled_actually_applies() {
+        let mut t = Task::new("stale", "clean up a stale task");
+        t.state = TaskState::Stale;
+        t.transition(TaskState::Cancelled).expect("should succeed");
+        assert_eq!(t.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn cancel_on_already_cancelled_is_noop() {
+        // Unique per-test tmp path so parallel runs don't collide.
+        let nonce = Uuid::new_v4();
+        let state_path = std::env::temp_dir().join(format!("alor-test-cxl-{nonce}.json"));
+        let _ = std::fs::remove_file(&state_path);
+
+        let app_state = AppState::with_persistence(state_path.clone());
+        let mut t = Task::new("already cancelled", "idempotent-cancel test");
+        t.state = TaskState::Cancelled;
+        let id = t.id;
+        let original_updated_at = t.updated_at;
+        app_state.add_task(t);
+
+        // Re-cancelling should succeed (no error) and not mutate the
+        // task — specifically, updated_at must not advance.
+        let out = app_state
+            .transition_task(id, TaskState::Cancelled)
+            .expect("cancel-on-cancelled should be a no-op, not an error");
+        assert_eq!(out.state, TaskState::Cancelled);
+        assert_eq!(out.updated_at, original_updated_at, "no-op must not bump updated_at");
+
+        let _ = std::fs::remove_file(&state_path);
     }
 
     #[test]
