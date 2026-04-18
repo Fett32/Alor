@@ -39,8 +39,54 @@ async function loadSessionMeta() {
 // Boot
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Spawn-workspace setting
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire up the header "Spawn ws" input. Loads the current value from the
+ * Rust settings, saves on blur or Enter. Takes effect on next Alor
+ * launch — a Sway `assign [app_id="alor"] workspace <value>` rule is
+ * registered at startup so the window appears directly on the target
+ * workspace without flicker or focus steal.
+ *
+ * Empty value = falls through to default Tauri/Wayland behavior.
+ */
+async function wireSpawnWorkspace() {
+  const $input = document.getElementById("spawn-workspace");
+  if (!$input) return;
+
+  try {
+    const s = await invoke("get_settings");
+    $input.value = s?.spawn_workspace ?? "";
+  } catch (err) {
+    console.warn("[settings] load failed:", err);
+  }
+
+  const save = async () => {
+    const value = $input.value.trim();
+    try {
+      await invoke("set_settings", {
+        settings: { spawn_workspace: value || null },
+      });
+    } catch (err) {
+      console.error("[settings] save failed:", err);
+    }
+  };
+
+  $input.addEventListener("blur", save);
+  $input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      save();
+      $input.blur();
+    }
+  });
+}
+
 async function init() {
   await loadSessionMeta();
+  await wireSpawnWorkspace();
   initAgentPanel();
   initTaskList();
   await initTerminal();

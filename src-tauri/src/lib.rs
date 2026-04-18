@@ -24,6 +24,18 @@ pub fn run() {
         eprintln!("alor: failed to create runtime dirs: {e}");
     }
 
+    // Sway workspace placement must happen BEFORE Tauri creates the
+    // main window — `assign` is a pre-map rule, so registering it here
+    // means the wayland surface appears directly on the target
+    // workspace with no flicker and no focus steal. Empty / unset
+    // setting = falls through to default Tauri/Wayland behavior.
+    let settings = daemon::settings::AlorSettings::load();
+    if let Some(ref ws) = settings.spawn_workspace {
+        if !ws.trim().is_empty() {
+            apply_sway_workspace_placement(ws.trim());
+        }
+    }
+
     let app_state = match daemon::session::data_dir() {
         Ok(dir) => daemon::state::AppState::with_persistence(dir.join("state.json")),
         Err(e) => {
@@ -305,9 +317,73 @@ pub fn run() {
             commands::pane_hide,
             commands::pane_list,
             commands::pane_rebalance,
+            commands::get_settings,
+            commands::set_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error running alor");
+}
+
+/// Register a Sway `assign` rule that places the Alor main window on
+/// the configured workspace. Called at startup before Tauri creates
+/// any windows.
+///
+/// `assign` fires pre-map, so the wayland surface appears directly on
+/// the target workspace — no flicker (unlike `for_window ... move`
+/// which fires post-map), and Sway doesn't switch focus to that
+/// workspace if it isn't already current.
+///
+/// Non-fatal on every failure path: if swaymsg isn't in PATH, isn't on
+/// Sway, or rejects the criteria, we log and continue. Startup must
+/// never block on compositor availability.
+///
+/// Users who prefer pure-Sway-config can skip this setting entirely and
+/// add one of the following to their sway config instead:
+///
+/// ```text
+/// assign [app_id="alor"] workspace 5
+/// # or, for post-map movement + no focus steal:
+/// for_window [app_id="alor"] move container to workspace 5
+/// no_focus [app_id="alor"]
+/// ```
+///
+/// Both are equivalent / better than what this function installs — the
+/// function exists so Alor ships with a built-in path that doesn't
+/// require editing the compositor's config.
+fn apply_sway_workspace_placement(workspace: &str) {
+    // Reject shell-meta and criteria-breaking characters. Sway
+    // workspace names in practice are numeric or simple identifiers;
+    // restricting to this set keeps the swaymsg payload safe from
+    // injection via a poisoned settings.yaml.
+    if workspace.is_empty()
+        || !workspace
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':'))
+    {
+        tracing::warn!(
+            workspace,
+            "spawn_workspace has unsafe characters; skipping assign rule"
+        );
+        return;
+    }
+    let cmd = format!(r#"assign [app_id="alor"] workspace {workspace}"#);
+    match std::process::Command::new("swaymsg").arg(&cmd).output() {
+        Ok(out) if out.status.success() => {
+            tracing::info!(workspace, "registered sway assign rule for alor");
+        }
+        Ok(out) => {
+            tracing::warn!(
+                exit = ?out.status.code(),
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "swaymsg assign rule registration failed"
+            );
+        }
+        Err(e) => {
+            // swaymsg missing, not on Sway, etc. Debug-level: common
+            // and benign on non-Sway sessions.
+            tracing::debug!("swaymsg unavailable, skipping placement: {e}");
+        }
+    }
 }
 
 /// Send a desktop notification via notify-send.

@@ -4,6 +4,7 @@
 /// All commands receive the shared AppState via Tauri's managed state.
 
 use crate::daemon::session::SessionInfo;
+use crate::daemon::settings::AlorSettings;
 use crate::daemon::state::{Agent, AppState, Task, TaskState};
 use crate::terminal::bridge::TerminalBridge;
 use crate::terminal::pane_manager::PaneManager;
@@ -498,4 +499,22 @@ pub async fn pane_list(
 pub async fn pane_rebalance(pm: State<'_, PaneManager>) -> Result<(), String> {
     pm.rebalance().await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+/// Return the current AlorSettings. Falls through to defaults if the
+/// settings file is missing or unreadable (load() logs internally).
+#[tauri::command]
+pub fn get_settings() -> Result<AlorSettings, String> {
+    Ok(AlorSettings::load())
+}
+
+/// Persist the provided AlorSettings to ~/.config/alor/settings.yaml.
+/// Takes effect on next Alor launch (no reactive-apply for v1).
+#[tauri::command]
+pub fn set_settings(settings: AlorSettings) -> Result<(), String> {
+    settings.save().map_err(err)
 }

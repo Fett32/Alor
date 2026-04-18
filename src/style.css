@@ -107,6 +107,32 @@ html, body {
   transition: all 0.15s;
 }
 
+.hdr-input {
+  margin-left: auto;
+  width: 110px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+
+.hdr-input:focus {
+  color: var(--text);
+  border-color: rgba(124, 111, 247, 0.5);
+  background: rgba(124, 111, 247, 0.06);
+}
+
+/* Right-align the input cluster by pulling the first btn left of it
+ * back to normal spacing — `margin-left: auto` on the input pushes
+ * everything after it to the right. */
+.hdr-input + .btn-header {
+  margin-left: 12px;
+}
+
 .btn-header {
   background: rgba(124, 111, 247, 0.1);
   border: 1px solid rgba(124, 111, 247, 0.3);
