@@ -38,15 +38,36 @@ impl AgentKind {
             AgentKind::Gemini => r"^\s*>\s+(Type your message|$)",
             // Cursor uses an alt-screen TUI with no traditional trailing
             // prompt. Closest stable signal is the persistent
-            // "Composer <model>" footer line. Live-probe during
-            // consolidation task showed this line present in idle state.
-            // KNOWN SOFT SPOT: if `Composer` also renders during
-            // generation (unconfirmed in prod), idle detection could
-            // false-fire mid-task and emit a premature task-complete.
-            // Worth revisiting once cursor workers see real traffic;
-            // the first agent to hit this will surface it.
+            // "Composer <model>" footer line. Live-probe captured it
+            // in both idle and mid-generation states — the footer
+            // alone is a necessary but NOT sufficient idle signal.
+            // See `active_pattern()` for the complementary guard.
             AgentKind::Cursor => r"^\s*Composer\s",
             AgentKind::Default => r"^[\$>\+]\s*$",
+        }
+    }
+
+    /// Runtime-specific "actively generating" anti-pattern. When any
+    /// line in the idle-detection window matches this, the runtime is
+    /// NOT idle even if the main `pattern()` does — covers the case
+    /// where a runtime's idle footer stays visible throughout
+    /// generation.
+    ///
+    /// Cursor: live-probe captured `ctrl+c to stop` in the right-
+    /// aligned input hint during every mid-generation sample
+    /// (Composing / Thinking / tool-use phases) and absent in every
+    /// idle sample. Without this guard the `Composer <model>` footer
+    /// would false-fire mid-task and emit a premature task-complete.
+    /// Probe captures saved to session history during this change's
+    /// recon: 1 idle + 12 mid-gen samples confirmed the split.
+    ///
+    /// Other runtimes: None — their `pattern()` already encodes a
+    /// bottom-anchored shell prompt that naturally disappears during
+    /// streaming output, so no additional anti-pattern is needed.
+    fn active_pattern(&self) -> Option<&str> {
+        match self {
+            AgentKind::Cursor => Some(r"ctrl\+c to stop"),
+            _ => None,
         }
     }
 
@@ -116,17 +137,37 @@ impl AgentKind {
 /// Compiled idle-pattern detector.
 pub struct IdleDetector {
     re: Regex,
+    /// Compiled from `AgentKind::active_pattern()`. When Some, the
+    /// detector reports NOT-idle whenever any scanned line matches
+    /// this regex — overrides a `re` match. See cursor case in
+    /// `active_pattern()` for the motivating example.
+    active_re: Option<Regex>,
 }
 
 impl IdleDetector {
     pub fn new(kind: &AgentKind) -> Self {
         let re = Regex::new(kind.pattern())
             .unwrap_or_else(|_| Regex::new(r"^[\$>]\s*$").unwrap());
-        IdleDetector { re }
+        // Silently skip a malformed active_pattern — a regex error
+        // here shouldn't crash the wrapper, and the worst outcome is
+        // reverting to pre-guard behavior (potential false-fire,
+        // loud-test-visible).
+        let active_re = kind.active_pattern().and_then(|p| Regex::new(p).ok());
+        IdleDetector { re, active_re }
     }
 
-    /// Returns true if any of the provided lines match the idle pattern.
+    /// Returns true if any of the provided lines match the idle pattern
+    /// AND no line matches the runtime's active-generation anti-
+    /// pattern (if it has one). The anti-pattern check wins — it's a
+    /// hard "definitely not idle" signal.
     pub fn is_idle(&self, lines: &[String]) -> bool {
+        if let Some(ref active) = self.active_re {
+            // Don't trim — active markers can appear anywhere on the
+            // line (e.g. cursor's right-aligned `ctrl+c to stop` hint).
+            if lines.iter().any(|l| active.is_match(l)) {
+                return false;
+            }
+        }
         lines.iter().any(|l| self.re.is_match(l.trim_end()))
     }
 
@@ -178,12 +219,67 @@ mod tests {
         // Persistent footer line captured from live cursor-agent probe.
         assert!(d.is_idle(&lines(&["  Composer 2 Fast"])));
         assert!(d.is_idle(&lines(&["Composer auto"])));
+        // Full tail-5 window captured from wrapper-equivalent
+        // `tmux capture-pane -S -50` when cursor is idle post-startup.
+        // Input line shows the fresh placeholder, NO ctrl+c hint.
+        assert!(d.is_idle(&lines(&[
+            "  → Plan, search, build anything",
+            "",
+            "",
+            "  Composer 2 Fast",
+            "  /tmp/alor-cursor-probe",
+        ])));
         // Must not false-match arbitrary text even if "Composer" appears
         // mid-line (word-start anchored via `^\s*`).
         assert!(!d.is_idle(&lines(&["Running Composer 2 Fast now"])));
         assert!(!d.is_idle(&lines(&["$ "])));
         // Still rejects non-cursor idle prompts.
         assert!(!d.is_idle(&lines(&["codex> "])));
+    }
+
+    #[test]
+    fn cursor_active_generation_blocks_idle_fire() {
+        // Regression test for the residual risk flagged in 9c863aa8.
+        // Captured tail-5 from a live cursor-agent mid-generation
+        // sample via the exact wrapper command
+        // (`tmux capture-pane -p -t '=<session>:' -S -50`) — verbatim.
+        //
+        // BOTH the `Composer 2 Fast` footer AND the `ctrl+c to stop`
+        // right-aligned input hint are present in this window. Before
+        // the active_pattern guard, the detector fired idle on this
+        // state and would have emitted a premature task.complete.
+        // With the guard, `ctrl+c to stop` blocks the idle fire.
+        let d = IdleDetector::new(&AgentKind::Cursor);
+        let midgen_tail = lines(&[
+            "  → Add a follow-up                                                                    ctrl+c to stop",
+            "",
+            "",
+            "  Composer 2 Fast",
+            "  /tmp/alor-cursor-probe",
+        ]);
+        assert!(
+            !d.is_idle(&midgen_tail),
+            "mid-generation tail must NOT be classified as idle (Composer footer + ctrl+c to stop hint both present)"
+        );
+
+        // Also verify the other mid-gen variants captured during the
+        // probe: percentage-in-footer post-first-gen, Thinking spinner
+        // earlier, etc. All share the `ctrl+c to stop` marker.
+        let midgen_tail_with_pct = lines(&[
+            "  → Add a follow-up                                                                    ctrl+c to stop",
+            "",
+            "",
+            "  Composer 2 Fast · 3.9%",
+            "  /tmp/alor-cursor-probe",
+        ]);
+        assert!(
+            !d.is_idle(&midgen_tail_with_pct),
+            "mid-gen with context-% footer must NOT be idle"
+        );
+
+        // Degenerate case: Composer alone is still idle — the guard
+        // only fires when ctrl+c-to-stop is actually present.
+        assert!(d.is_idle(&lines(&["  Composer 2 Fast"])));
     }
 
     #[test]
