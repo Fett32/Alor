@@ -73,12 +73,42 @@ async def task_get(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "task_list",
-    "List all tasks. Prefer task_get by id when you already have one.",
-    {},
+    "List tasks, paginated. Defaults to non-terminal "
+    "(Pending/Assigned/Accepted/Blocked/Proposed/Staged/Interrupted/"
+    "Recovering) so the response stays lean. Pass state='completed' / "
+    "'cancelled' / 'stale' / 'all' / or a specific SCREAMING_SNAKE_CASE "
+    "state name to query terminal tasks. Responses are capped "
+    "server-side (default 20 tasks/page) to keep orch context under "
+    "budget; response includes total/returned/offset/has_more — "
+    "paginate by re-calling with offset += returned while has_more is "
+    "true. Prefer task_get by id when you already have one.",
+    {"state": str, "limit": int, "offset": int},
 )
 async def task_list(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        return _ok(await daemon.task_list())
+        # Accept either "completed" or "COMPLETED" from the LLM — normalize
+        # non-sentinel values to uppercase so they match the server-side
+        # SCREAMING_SNAKE_CASE state names. Sentinels ("default" / "all")
+        # stay lowercase for the server's match arms.
+        raw = (args.get("state") or "").strip() or "default"
+        lower = raw.lower()
+        state = lower if lower in ("default", "all") else raw.upper()
+
+        # `limit`/`offset` are optional. Missing/non-numeric → let the
+        # server default kick in (limit=20). Explicit `limit=0` means
+        # "no cap" and flows through untouched.
+        def _as_int(v: Any) -> int | None:
+            if v is None or v == "":
+                return None
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
+        limit = _as_int(args.get("limit"))
+        offset = _as_int(args.get("offset")) or 0
+
+        return _ok(await daemon.task_list(state=state, limit=limit, offset=offset))
     except Exception as e:
         return _err(str(e))
 

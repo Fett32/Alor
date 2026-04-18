@@ -16,7 +16,7 @@ use crate::terminal::pane_manager::PaneManager;
 use crate::wrapper::protocol::{
     CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliDelete, CliKill, CliMemoryGet,
     CliProjectGet, CliProjectSave, CliSpawn, CliTaskCancel, CliTaskCreate,
-    CliTaskComplete as CliTaskCompletePayload, CliTaskGet, Envelope, TaskAccept, TaskAssign,
+    CliTaskComplete as CliTaskCompletePayload, CliTaskGet, CliTaskList, Envelope, TaskAccept, TaskAssign,
     TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WorkerFrameWedged,
     WorkerOrchResponse, WorkerUserInput, WrapperError, WrapperRegister, MSG_CLI_AGENT_ENSURE_RUNNING,
     MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_DELETE, MSG_CLI_ERROR,
@@ -586,8 +586,72 @@ impl SocketServer {
             }
 
             MSG_CLI_TASK_LIST => {
-                let tasks = self.app_state.all_tasks();
-                match Envelope::new(MSG_CLI_RESPONSE, json!({"tasks": tasks})) {
+                // Optional state_filter on the payload. Missing payload or
+                // `None` / "default" → hide terminal tasks (Completed /
+                // Cancelled / Rejected / TimedOut / Stale) so the orch's
+                // runtime context stays lean. "all" → no filtering. Any
+                // other value → exact state match (SCREAMING_SNAKE_CASE).
+                //
+                // Pagination: `limit` defaults to DEFAULT_TASK_LIST_LIMIT
+                // (20 — sized to keep responses under the 25k-token orch
+                // ceiling at typical task sizes). `limit=0` disables
+                // capping for callers that explicitly want the whole
+                // filtered set. `offset` defaults to 0.
+                //
+                // Sort before paginating so pages are stable across
+                // calls: non-terminal first, then updated_at desc.
+                // Matches the UI ordering so page 0 here = same tasks
+                // the orch sees "at the top" of the UI.
+                let payload: CliTaskList = env.decode_payload().unwrap_or_default();
+                let mut tasks = self.app_state.all_tasks();
+                let filter = payload.state_filter.as_deref().unwrap_or("default");
+                match filter {
+                    "all" => {}
+                    "default" => tasks.retain(|t| !t.state.is_terminal()),
+                    state_name => {
+                        tasks.retain(|t| {
+                            // Compare serialized form so callers can pass
+                            // "COMPLETED" etc. without needing the Rust enum.
+                            serde_json::to_value(&t.state)
+                                .ok()
+                                .and_then(|v| v.as_str().map(str::to_string))
+                                == Some(state_name.to_string())
+                        });
+                    }
+                }
+
+                tasks.sort_by(|a, b| {
+                    let a_term = a.state.is_terminal();
+                    let b_term = b.state.is_terminal();
+                    a_term.cmp(&b_term).then(b.updated_at.cmp(&a.updated_at))
+                });
+
+                let total = tasks.len() as u32;
+                let offset = payload.offset.unwrap_or(0);
+                let limit = payload
+                    .limit
+                    .unwrap_or(crate::wrapper::protocol::DEFAULT_TASK_LIST_LIMIT);
+
+                let start = (offset as usize).min(tasks.len());
+                let end = if limit == 0 {
+                    tasks.len()
+                } else {
+                    (start + limit as usize).min(tasks.len())
+                };
+                let page: Vec<_> = tasks[start..end].to_vec();
+                let returned = page.len() as u32;
+                let has_more = (start + page.len()) < tasks.len();
+
+                match Envelope::new(
+                    MSG_CLI_RESPONSE,
+                    json!({
+                        "tasks": page,
+                        "total": total,
+                        "returned": returned,
+                        "offset": offset,
+                        "has_more": has_more,
+                    }),
+                ) {
                     Ok(mut e) => {
                         e.correlation_id = correlation_id;
                         e

@@ -169,8 +169,39 @@ async def task_get(task_id: str) -> dict[str, Any]:
     return await _one_shot("cli.task.get", {"task_id": task_id})
 
 
-async def task_list() -> dict[str, Any]:
-    return await _one_shot("cli.task.list")
+async def task_list(
+    state: str = "default",
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List tasks, filtered by state, paginated.
+
+    `state` values:
+      - "default" (default) → non-terminal tasks only (hides Completed /
+        Cancelled / Rejected / TimedOut / Stale). Keeps the orch's MCP
+        task_list output lean.
+      - "all" → every task in state.json.
+      - Any SCREAMING_SNAKE_CASE state name ("COMPLETED", "CANCELLED",
+        "STALE", etc.) → only tasks in that exact state.
+
+    `limit` / `offset` paginate the filtered result. `limit=None` falls
+    through to the server default (20 — sized to keep responses under
+    the 25k-token orch-context ceiling at typical task sizes; see
+    src-tauri/src/wrapper/protocol.rs::DEFAULT_TASK_LIST_LIMIT). Pass
+    `limit=0` to disable capping (use sparingly).
+
+    Response shape: `{tasks: [...], total: N, returned: M, offset: O,
+    has_more: bool}`. Callers paginate by re-calling with `offset +=
+    returned` while `has_more` is true.
+
+    Server-side filter + pagination via the `state_filter` / `limit` /
+    `offset` payload fields on `cli.task.list` (see
+    src-tauri/src/wrapper/protocol.rs::CliTaskList).
+    """
+    payload: dict[str, Any] = {"state_filter": state, "offset": offset}
+    if limit is not None:
+        payload["limit"] = limit
+    return await _one_shot("cli.task.list", payload)
 
 
 async def task_cancel(task_id: str) -> dict[str, Any]:

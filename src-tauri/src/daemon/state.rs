@@ -421,21 +421,11 @@ impl AppState {
         }
     }
 
-    /// Sweep terminal tasks (COMPLETED, CANCELLED, REJECTED, TIMED_OUT, STALE)
-    /// out of live state into `archive_path`.  Leaves ACCEPTED / PENDING /
-    /// BLOCKED / PROPOSED / STAGED / INTERRUPTED / RECOVERING / ASSIGNED
-    /// untouched — those are in-flight or queued.
-    ///
-    /// Idempotent: tasks don't transition out of terminal states (modulo the
-    /// narrow Cancelled → Completed retroactive edge, which is still terminal),
-    /// so re-running can only move more work in, never the same work twice.
-    /// Already-archived UUIDs are overwritten on re-archive, which is fine —
-    /// the rehydrated copy is the same data.
-    ///
-    /// Archive write precedes live-state removal so a mid-operation crash
-    /// leaves the task in both places (recoverable) rather than neither (lost).
-    ///
-    /// Returns the number of tasks moved to the archive on this call.
+    /// Sweep terminal tasks out of live state into `archive_path`. Kept
+    /// here for future reuse by a capped auto-archive pass (not wired up
+    /// yet — b4102e92 accepts unbounded state.json growth for now).
+    /// Marked `#[allow(dead_code)]` so `cargo check` stays clean.
+    #[allow(dead_code)]
     pub fn archive_terminal_tasks(&self, archive_path: &Path) -> usize {
         // Snapshot terminal tasks under lock without removing yet.
         let terminal: Vec<(Uuid, Task)> = {
@@ -538,6 +528,103 @@ impl AppState {
         self.save();
 
         removed
+    }
+
+    /// One-shot migration: absorb the legacy `tasks-archive.json` into
+    /// live state. After b4102e92 we stopped pruning terminal tasks on
+    /// boot, so the archive file's accumulated records need to come back
+    /// into `state.json` to be queryable via `task_get` /
+    /// `task_list(state=...)`.
+    ///
+    /// Runs at startup in `lib.rs` before the Tauri builder. Idempotent:
+    /// on first run renames the archive to `<path>.migrated` so
+    /// subsequent boots skip. If the `.migrated` file exists OR the
+    /// archive file doesn't exist, this is a no-op.
+    ///
+    /// Merge policy: `or_insert` — if an archive task's id already
+    /// exists in live state, live state wins. Guards against the
+    /// pathological case where a task was archived then re-created
+    /// with the same id (shouldn't happen; UUIDs).
+    ///
+    /// Returns the number of tasks rehydrated. Errors during load or
+    /// rename are logged, NOT fatal — startup must not block on
+    /// migration glitches.
+    pub fn migrate_archive(&self, archive_path: &Path) -> usize {
+        if !archive_path.exists() {
+            return 0;
+        }
+        let migrated_marker = archive_path.with_extension("json.migrated");
+        if migrated_marker.exists() {
+            tracing::debug!(
+                path = %migrated_marker.display(),
+                "archive already migrated; skipping"
+            );
+            return 0;
+        }
+
+        let archive: TasksArchive = match std::fs::read_to_string(archive_path) {
+            Ok(json) => match serde_json::from_str(&json) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to parse {}: {e}; skipping archive migration",
+                        archive_path.display()
+                    );
+                    return 0;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "failed to read {}: {e}; skipping archive migration",
+                    archive_path.display()
+                );
+                return 0;
+            }
+        };
+
+        if archive.tasks.is_empty() {
+            // Empty archive: still rename so we don't re-check on every boot.
+            if let Err(e) = std::fs::rename(archive_path, &migrated_marker) {
+                tracing::warn!("failed to rename empty archive file: {e}");
+            }
+            return 0;
+        }
+
+        let merged_count = {
+            let mut s = self.inner.lock();
+            let mut n = 0;
+            for (id, task) in archive.tasks {
+                // or_insert: live state wins on any collision. Safer than
+                // `insert` which would overwrite a live active-task record
+                // with a stale archived copy.
+                if !s.tasks.contains_key(&id) {
+                    s.tasks.insert(id, task);
+                    n += 1;
+                }
+            }
+            n
+        };
+
+        // Persist the merged live state before renaming the archive — if
+        // the rename fails after save, next boot re-merges idempotently
+        // (contains_key skips duplicates). If save fails, next boot
+        // retries the whole migration.
+        self.save();
+
+        if let Err(e) = std::fs::rename(archive_path, &migrated_marker) {
+            tracing::warn!(
+                "merged archive into live state but failed to rename {}: {e}",
+                archive_path.display()
+            );
+        } else {
+            tracing::info!(
+                migrated = merged_count,
+                marker = %migrated_marker.display(),
+                "migrated archive into live state"
+            );
+        }
+
+        merged_count
     }
 
     // --- tasks ---------------------------------------------------------------

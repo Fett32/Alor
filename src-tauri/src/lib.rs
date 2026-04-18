@@ -43,19 +43,26 @@ pub fn run() {
             daemon::state::AppState::new()
         }
     };
-    // Sweep terminal tasks (Completed/Cancelled/Rejected/TimedOut/Stale) out
-    // of live state into tasks-archive.json on every startup.  Idempotent.
+    // One-shot archive migration: rehydrate legacy tasks-archive.json into
+    // live state, then rename the archive → `.migrated` so subsequent
+    // boots skip. After b4102e92 terminal tasks stay in state.json
+    // permanently (see migrate_archive docstring for rationale). If no
+    // archive file exists or it's already been migrated, this is a no-op.
+    //
+    // Previously this site ran `archive_terminal_tasks` on every boot,
+    // which pruned terminal tasks out of live state. That pruning is
+    // intentionally removed so Completed/Cancelled records stay
+    // queryable via task_get / task_list(state="completed") without an
+    // extra file-lookup path.
     match daemon::session::tasks_archive_file() {
         Ok(archive_path) => {
-            let archived = app_state.archive_terminal_tasks(&archive_path);
-            if archived > 0 {
+            let migrated = app_state.migrate_archive(&archive_path);
+            if migrated > 0 {
                 tracing::info!(
-                    archived,
+                    migrated,
                     path = %archive_path.display(),
-                    "swept terminal tasks into archive"
+                    "rehydrated archive into live state"
                 );
-            } else {
-                tracing::debug!("no terminal tasks to archive");
             }
         }
         Err(e) => {

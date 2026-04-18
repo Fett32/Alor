@@ -348,6 +348,50 @@ pub struct CliTaskGet {
     pub task_id: Uuid,
 }
 
+/// Payload for `cli.task.list`.
+///
+/// `state_filter` narrows the response:
+///   - `None` or `"default"` → non-terminal tasks only (hides Completed /
+///     Cancelled / Rejected / TimedOut / Stale). This is what the
+///     orchestrator's MCP `task_list` tool passes by default so terminal
+///     records don't bloat its runtime context.
+///   - `"all"` → everything, including terminal.
+///   - A SCREAMING_SNAKE_CASE state name (`"COMPLETED"`, `"CANCELLED"`,
+///     `"STALE"`, etc.) → only tasks in that exact state.
+///
+/// `limit` / `offset` paginate the filtered result:
+///   - `limit = None` → server default `DEFAULT_TASK_LIST_LIMIT` (20).
+///     Sized off a 79-task sample: avg task serializes to ~4 KB / ~1.1k
+///     tokens, so 20 tasks ≈ 22k tokens — under the 25k-token Write-tool
+///     rule-of-thumb ceiling Fett uses for lean tool output. p90 tasks
+///     are ~2.3k tokens; the worst page is still bounded.
+///   - `offset = None` → 0.
+///   - Pass `limit = 0` for "no limit" (returns whole filtered set; only
+///     use this when you've already counted and know it's safe).
+///
+/// Response (`CliTaskListResponse`) includes `{tasks, total, returned,
+/// offset, has_more}` so callers can paginate without a second RPC to
+/// count.
+///
+/// The frontend's `get_tasks` Tauri command is a separate path and still
+/// returns the full live set (filtering + chunking happen client-side in
+/// TaskList.js for snappy dropdown toggles). Pagination caps only apply
+/// to the CLI/MCP surface — the orchestrator-facing one where context
+/// blowup is the real cost.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CliTaskList {
+    #[serde(default)]
+    pub state_filter: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+/// Default `limit` for `cli.task.list` when the caller doesn't specify
+/// one. See `CliTaskList` docstring for the sizing rationale.
+pub const DEFAULT_TASK_LIST_LIMIT: u32 = 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliAssign {
     pub task_id: Uuid,
