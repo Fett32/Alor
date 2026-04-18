@@ -93,10 +93,32 @@ export function initAgentPanel() {
 
     // Initial fetch + listen for push updates from backend.
     fetchAgents();
+    // Safety-net: ask the daemon to reconcile alor-main panes on boot.
+    // Addresses the class of bug where an agent is connected in state
+    // but its pane is missing from the main terminal view — sidebar
+    // row shows green + kill works, but the agent's pane never made
+    // it into alor-main (e.g. wrapper.register's add_agent_pane
+    // failed silently during an earlier daemon session). The daemon
+    // also runs this at startup; calling from the UI covers the case
+    // where the frontend is re-launched against an already-running
+    // daemon. See src-tauri/src/terminal/pane_manager.rs::reconcile_panes.
+    invoke("pane_reconcile").catch((err) => {
+      console.warn("[AgentPanel] pane_reconcile failed:", err);
+    });
+
     listen("agents-changed", () => fetchAgents()).then((fn) => {
       unlistenAgents = fn;
     });
-    listen("agent.connected", () => fetchAgents());
+    // On a fresh connection, run a reconcile pass after the refresh
+    // lands — catches the exact repro from task 1ed52762 where a
+    // newly-spawned cursor agent reaches connected=true in state but
+    // doesn't show up in the main terminal view.
+    listen("agent.connected", () => {
+      fetchAgents();
+      invoke("pane_reconcile").catch((err) => {
+        console.warn("[AgentPanel] pane_reconcile after connect failed:", err);
+      });
+    });
     listen("agent.disconnected", () => fetchAgents());
   } catch (err) {
     console.error("[AgentPanel] init failed:", err);

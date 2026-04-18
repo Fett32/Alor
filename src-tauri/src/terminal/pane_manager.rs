@@ -415,6 +415,87 @@ impl PaneManager {
         self.panes.lock().await.keys().cloned().collect()
     }
 
+    /// Reconcile the alor-main pane layout against live agent state.
+    ///
+    /// Iterates every connected agent and, for each whose tmux session
+    /// actually exists, ensures a pane attaching to it is present in
+    /// alor-main. `add_agent_pane` is idempotent, so agents that
+    /// already have a pane are no-ops.
+    ///
+    /// Motivating bug (task 883bdc60 / re-dispatch 1ed52762): an agent
+    /// could reach `connected: true` in state with a healthy tmux
+    /// session but NOT be rendered as a pane in alor-main — so Fett
+    /// saw the green status dot and kill button in the sidebar, but
+    /// the agent's terminal never appeared in the main view. Root
+    /// cause is likely one of:
+    ///   * `add_agent_pane` failed silently during `wrapper.register`
+    ///     (line 260 of server.rs — only logged `warn`, not
+    ///     propagated).
+    ///   * The daemon restarted before the pane was added, and
+    ///     `scan_existing_panes` on the next boot couldn't find the
+    ///     pane because it was never created.
+    ///   * A race where the wrapper connected before
+    ///     `ensure_main_session` finished.
+    /// Reconciliation is the safety net: whatever class of failure led
+    /// to the miss, one scan fixes it.
+    ///
+    /// Does NOT touch agent state. If a connected agent's tmux session
+    /// is gone (a zombie where only the wrapper process remains), this
+    /// logs a warning and skips — leaving the decision of whether to
+    /// flip `connected` back to `false` to higher-level paths.
+    pub async fn reconcile_panes(&self, state: &crate::daemon::state::AppState) {
+        let agents = state.all_agents();
+        let mut added = 0usize;
+        let mut skipped_zombie = 0usize;
+        for agent in agents {
+            if !agent.connected {
+                continue;
+            }
+            let session_name = agent
+                .tmux_session
+                .clone()
+                .unwrap_or_else(|| format!("alor-{}", agent.id));
+            if !self.session_exists(&session_name).await {
+                tracing::warn!(
+                    agent_id = %agent.id,
+                    session = %session_name,
+                    "reconcile_panes: agent marked connected but tmux session is gone; skipping"
+                );
+                skipped_zombie += 1;
+                continue;
+            }
+            // Quick win: if we already track a pane, no-op silently.
+            {
+                let panes = self.panes.lock().await;
+                if panes.contains_key(&agent.id) {
+                    continue;
+                }
+            }
+            match self.add_agent_pane(&agent.id).await {
+                Ok(()) => {
+                    tracing::info!(
+                        agent_id = %agent.id,
+                        "reconcile_panes: added missing pane for connected agent"
+                    );
+                    added += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = %agent.id,
+                        "reconcile_panes: add_agent_pane failed: {e:#}"
+                    );
+                }
+            }
+        }
+        if added > 0 || skipped_zombie > 0 {
+            tracing::info!(
+                added,
+                skipped_zombie,
+                "reconcile_panes complete"
+            );
+        }
+    }
+
     /// Clear all tracked panes from the in-memory map.
     pub async fn clear_all_panes(&self) {
         self.panes.lock().await.clear();

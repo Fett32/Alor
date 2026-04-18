@@ -300,6 +300,33 @@ pub fn run() {
                 }
             });
 
+            // Pane reconciliation: safety-net sweep that adds a pane in
+            // alor-main for every connected agent that somehow lacks one
+            // (e.g. wrapper.register's add_agent_pane failed silently, or
+            // a prior daemon crashed between scan and register). Fires a
+            // few seconds after startup to give the recovery thread's
+            // wrappers time to reconnect + register. See
+            // PaneManager::reconcile_panes for the motivating bug
+            // (task 1ed52762 — connected cursor agent not in main view).
+            let pm_reconcile_boot = pane_manager.clone();
+            let app_state_reconcile_boot = app_state.clone();
+            tauri::async_runtime::spawn(async move {
+                // Delay is empirical: yaml-slot wrappers typically
+                // register within ~500ms, but trust-prompt-dependent
+                // runtimes (cursor, codex) can take 1-2s extra for their
+                // auto-ack polling loop to fire. 3s is a comfortable
+                // cushion; a second pass at 15s catches late wakers
+                // without running forever.
+                tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+                pm_reconcile_boot
+                    .reconcile_panes(&app_state_reconcile_boot)
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(12_000)).await;
+                pm_reconcile_boot
+                    .reconcile_panes(&app_state_reconcile_boot)
+                    .await;
+            });
+
             // Start PTY relay for alor-main.
             // The relay spawns `tmux attach` in a real PTY and reads its output.
             // We need a short delay to ensure alor-main exists first.
@@ -415,6 +442,7 @@ pub fn run() {
             commands::pane_hide,
             commands::pane_list,
             commands::pane_rebalance,
+            commands::pane_reconcile,
             commands::get_settings,
             commands::set_settings,
         ])

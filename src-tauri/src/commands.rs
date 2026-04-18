@@ -512,6 +512,26 @@ pub async fn pane_rebalance(pm: State<'_, PaneManager>) -> Result<(), String> {
     Ok(())
 }
 
+/// Safety-net reconciliation: ensures every connected agent has a pane
+/// in alor-main, adding any that are missing. Idempotent; fast on the
+/// happy path (just a map lookup per agent). Exposed so the frontend
+/// can invoke it on init and after agents-changed events — the UI-side
+/// equivalent of the startup sweep in lib.rs.
+///
+/// Motivating bug: an agent could end up `connected: true` without
+/// being visible as a pane in alor-main (see
+/// `PaneManager::reconcile_panes` docstring for the failure classes).
+/// The sidebar row + kill button would appear (those read from state
+/// directly), but the big terminal view stayed blank for that agent.
+#[tauri::command]
+pub async fn pane_reconcile(
+    state: State<'_, AppState>,
+    pm: State<'_, PaneManager>,
+) -> Result<(), String> {
+    pm.reconcile_panes(&state).await;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
