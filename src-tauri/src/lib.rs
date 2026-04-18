@@ -305,11 +305,13 @@ pub fn run() {
             // (e.g. wrapper.register's add_agent_pane failed silently, or
             // a prior daemon crashed between scan and register). Fires a
             // few seconds after startup to give the recovery thread's
-            // wrappers time to reconnect + register. See
+            // wrappers time to reconnect + register. Also auto-clears
+            // zombies (state=connected but tmux session gone). See
             // PaneManager::reconcile_panes for the motivating bug
             // (task 1ed52762 — connected cursor agent not in main view).
             let pm_reconcile_boot = pane_manager.clone();
             let app_state_reconcile_boot = app_state.clone();
+            let socket_server_reconcile_boot = socket_server.clone();
             tauri::async_runtime::spawn(async move {
                 // Delay is empirical: yaml-slot wrappers typically
                 // register within ~500ms, but trust-prompt-dependent
@@ -317,14 +319,28 @@ pub fn run() {
                 // auto-ack polling loop to fire. 3s is a comfortable
                 // cushion; a second pass at 15s catches late wakers
                 // without running forever.
+                //
+                // Zombie auto-clear safety: `state.connected` only
+                // flips to true in wrapper.register, which always runs
+                // after the wrapper's synchronous `tmux new-session -d`
+                // in ensure_session. So if reconcile sees
+                // connected=true with no session at t+3s, the session
+                // really is gone (died between register and scan) —
+                // never a startup race. Safe to auto-flip.
+                let run_once = || async {
+                    let report = pm_reconcile_boot
+                        .reconcile_panes(&app_state_reconcile_boot)
+                        .await;
+                    for zombie_id in &report.zombies {
+                        socket_server_reconcile_boot
+                            .mark_agent_zombie(zombie_id)
+                            .await;
+                    }
+                };
                 tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
-                pm_reconcile_boot
-                    .reconcile_panes(&app_state_reconcile_boot)
-                    .await;
+                run_once().await;
                 tokio::time::sleep(std::time::Duration::from_millis(12_000)).await;
-                pm_reconcile_boot
-                    .reconcile_panes(&app_state_reconcile_boot)
-                    .await;
+                run_once().await;
             });
 
             // Start PTY relay for alor-main.

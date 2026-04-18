@@ -57,6 +57,22 @@ pub struct PaneManager {
     panes: Arc<Mutex<HashMap<String, PaneInfo>>>,
 }
 
+/// Summary returned by `PaneManager::reconcile_panes`. Callers use
+/// this to take follow-up action on zombies (flip their `connected`
+/// state via `SocketServer::mark_agent_zombie`). Kept as a data-only
+/// struct so the caller owns the state-mutation + event-broadcast
+/// concerns — `PaneManager` stays free of socket / server
+/// dependencies.
+#[derive(Debug, Default)]
+pub struct ReconcileReport {
+    /// Agent IDs that got a fresh pane during this sweep.
+    pub added: Vec<String>,
+    /// Agent IDs in the zombie state (state says connected=true,
+    /// tmux session is gone). Caller should flip these to
+    /// disconnected so the UI reflects reality.
+    pub zombies: Vec<String>,
+}
+
 impl PaneManager {
     pub fn new() -> Self {
         Self::default()
@@ -500,14 +516,18 @@ impl PaneManager {
     /// Reconciliation is the safety net: whatever class of failure led
     /// to the miss, one scan fixes it.
     ///
-    /// Does NOT touch agent state. If a connected agent's tmux session
-    /// is gone (a zombie where only the wrapper process remains), this
-    /// logs a warning and skips — leaving the decision of whether to
-    /// flip `connected` back to `false` to higher-level paths.
-    pub async fn reconcile_panes(&self, state: &crate::daemon::state::AppState) {
+    /// Zombies: an agent marked `connected: true` whose tmux session
+    /// has disappeared. Returned in `ReconcileReport.zombies` so the
+    /// caller can flip `connected` to `false` via SocketServer. Does
+    /// NOT touch agent state directly — that concern belongs to the
+    /// server layer (which also handles the `agent.disconnected`
+    /// broadcast).
+    pub async fn reconcile_panes(
+        &self,
+        state: &crate::daemon::state::AppState,
+    ) -> ReconcileReport {
+        let mut report = ReconcileReport::default();
         let agents = state.all_agents();
-        let mut added = 0usize;
-        let mut skipped_zombie = 0usize;
         for agent in agents {
             if !agent.connected {
                 continue;
@@ -520,9 +540,9 @@ impl PaneManager {
                 tracing::warn!(
                     agent_id = %agent.id,
                     session = %session_name,
-                    "reconcile_panes: agent marked connected but tmux session is gone; skipping"
+                    "reconcile_panes: zombie detected (connected but tmux session gone); caller will auto-clear"
                 );
-                skipped_zombie += 1;
+                report.zombies.push(agent.id.clone());
                 continue;
             }
             // Quick win: if we already track a pane, no-op silently.
@@ -538,7 +558,7 @@ impl PaneManager {
                         agent_id = %agent.id,
                         "reconcile_panes: added missing pane for connected agent"
                     );
-                    added += 1;
+                    report.added.push(agent.id.clone());
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -548,13 +568,14 @@ impl PaneManager {
                 }
             }
         }
-        if added > 0 || skipped_zombie > 0 {
+        if !report.added.is_empty() || !report.zombies.is_empty() {
             tracing::info!(
-                added,
-                skipped_zombie,
+                added = report.added.len(),
+                zombies = report.zombies.len(),
                 "reconcile_panes complete"
             );
         }
+        report
     }
 
     /// Clear all tracked panes from the in-memory map.
@@ -875,6 +896,120 @@ mod tests {
         // Very high pane id nothing else is likely using. `list-panes -t
         // %999999` returns "can't find pane" with exit 1.
         assert!(!pm.pane_exists("%999999").await);
+    }
+
+    #[tokio::test]
+    async fn reconcile_panes_reports_zombie_for_connected_agent_without_session() {
+        // Regression test for the auto-flip followup. Agent is marked
+        // connected=true in state with a tmux_session name that doesn't
+        // exist. reconcile_panes should surface the agent_id in
+        // `report.zombies`, and leave agent state untouched (state
+        // mutation is the caller's job — e.g. SocketServer::mark_agent_zombie).
+        if !tmux_available().await {
+            eprintln!("tmux not available, skipping");
+            return;
+        }
+
+        let state = crate::daemon::state::AppState::new();
+        // set_agent_connected auto-registers on first call, setting
+        // tmux_session = Some(alor-<id>). The id below is deliberately
+        // unique + unlikely-to-exist so session_exists returns false.
+        let zombie_id = format!(
+            "pm-zombie-test-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        state
+            .set_agent_connected(&zombie_id, true)
+            .expect("set_agent_connected");
+        assert!(state.get_agent(&zombie_id).unwrap().connected);
+
+        let pm = PaneManager::new();
+        let report = pm.reconcile_panes(&state).await;
+
+        assert!(
+            report.zombies.iter().any(|z| z == &zombie_id),
+            "reconcile_panes should report the zombie agent_id; got {:?}",
+            report.zombies
+        );
+        // PaneManager does NOT mutate state — caller owns that.
+        assert!(
+            state.get_agent(&zombie_id).unwrap().connected,
+            "reconcile_panes must not flip state directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_panes_omits_zombie_when_session_exists() {
+        // Inverse case: agent is connected AND its tmux session exists.
+        // Should NOT appear in report.zombies even if no pane is in the
+        // map (the layout code will try to add one — we just assert
+        // zombies is empty here).
+        if !tmux_available().await {
+            eprintln!("tmux not available, skipping");
+            return;
+        }
+
+        let state = crate::daemon::state::AppState::new();
+        let alive_id = format!(
+            "pm-alive-test-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        // Create the matching tmux session so session_exists returns true.
+        let session = format!("alor-{alive_id}");
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, "sleep", "300"])
+            .output()
+            .await
+            .ok()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("failed to create test session, skipping");
+            return;
+        }
+
+        state
+            .set_agent_connected(&alive_id, true)
+            .expect("set_agent_connected");
+
+        let pm = PaneManager::new();
+        let report = pm.reconcile_panes(&state).await;
+
+        assert!(
+            !report.zombies.iter().any(|z| z == &alive_id),
+            "alive agent must not appear in zombies; got {:?}",
+            report.zombies
+        );
+
+        // Cleanup.
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &format!("={session}")])
+            .output()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_panes_skips_disconnected_agents_entirely() {
+        // A disconnected agent (state=false) with no tmux session must
+        // not show up as a zombie — zombies are the "connected but
+        // actually gone" subset, not every missing-session row.
+        let state = crate::daemon::state::AppState::new();
+        let disc_id = format!(
+            "pm-disc-test-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        // Flip on then off to register the agent with connected=false.
+        state.set_agent_connected(&disc_id, true).unwrap();
+        state.set_agent_connected(&disc_id, false).unwrap();
+        assert!(!state.get_agent(&disc_id).unwrap().connected);
+
+        let pm = PaneManager::new();
+        let report = pm.reconcile_panes(&state).await;
+
+        assert!(
+            !report.zombies.iter().any(|z| z == &disc_id),
+            "disconnected agents must not appear as zombies"
+        );
     }
 
     #[tokio::test]

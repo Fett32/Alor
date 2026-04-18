@@ -1965,6 +1965,44 @@ impl SocketServer {
         self.writers.lock().await.contains_key(agent_id)
     }
 
+    /// Mark an agent as a zombie: flip `connected` to false in state
+    /// and broadcast the disconnect event. Called by
+    /// `PaneManager::reconcile_panes` callers after it detects that
+    /// an agent's tmux session has disappeared while state still
+    /// thinks it's connected.
+    ///
+    /// Deliberately does NOT remove the agent from the `writers` map.
+    /// The zombie wrapper process may still have a live daemon socket
+    /// — we want to reach it (e.g. to send SHUTDOWN via kill_agent)
+    /// even after flagging the UI state as disconnected. Writers get
+    /// cleaned up by the normal socket-drop path (see the read-loop
+    /// cleanup at line 317) when the wrapper actually dies.
+    ///
+    /// The `reason` field on the broadcast distinguishes this from a
+    /// normal socket-drop disconnect so CLI event subscribers can
+    /// branch if they care.
+    pub async fn mark_agent_zombie(&self, agent_id: &str) {
+        if let Err(e) = self.app_state.set_agent_connected(agent_id, false) {
+            warn!(
+                agent_id,
+                "mark_agent_zombie: set_agent_connected(false) failed: {e:#}"
+            );
+            return;
+        }
+        info!(
+            agent_id,
+            "reconcile_panes: zombie auto-cleared (connected -> false)"
+        );
+        self.broadcast_event(
+            "agent.disconnected",
+            json!({
+                "agent_id": agent_id,
+                "reason": "zombie_auto_cleared",
+            }),
+        )
+        .await;
+    }
+
 }
 
 fn cli_error(correlation_id: Uuid, message: &str) -> Envelope {
