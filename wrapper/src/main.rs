@@ -123,6 +123,7 @@ fn ensure_session(
     let command = explicit_command.unwrap_or(match kind {
         AgentKind::ClaudeCode => "claude",
         AgentKind::Codex => "codex",
+        AgentKind::Gemini => "gemini",
         _ => "bash",
     });
     info!(session, command, "creating new tmux session");
