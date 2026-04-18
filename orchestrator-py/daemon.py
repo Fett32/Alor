@@ -422,7 +422,18 @@ async def agent_spawn(
     role: str | None = None,
     project: str | None = None,
     working_dir: str | None = None,
+    spawned_by_task: str | None = None,
 ) -> dict[str, Any]:
+    """Spawn a new agent instance.
+
+    `spawned_by_task`: optional task UUID. Workers that spawn
+    sibling instances mid-task should pass their current task_id so
+    the daemon can warn at task-completion time if the instance
+    wasn't explicitly killed (see
+    src-tauri/src/daemon/state.rs::record_task_spawn +
+    transition_task warning path). Orchestrator calls leave this
+    unset — orch-initiated spawns aren't scoped to a single task.
+    """
     payload: dict[str, Any] = {"agent": agent}
     if name:
         payload["name"] = name
@@ -432,6 +443,8 @@ async def agent_spawn(
         payload["project"] = project
     if working_dir:
         payload["working_dir"] = working_dir
+    if spawned_by_task:
+        payload["spawned_by_task"] = spawned_by_task
     return await _one_shot("cli.spawn", payload)
 
 

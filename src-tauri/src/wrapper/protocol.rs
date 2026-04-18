@@ -430,6 +430,13 @@ pub struct CliSpawn {
     /// Used when spawning an instance from a template.
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Task UUID that initiated this spawn. Set by workers that call
+    /// `agent_spawn` mid-task so the daemon can warn at task-completion
+    /// time if the instance wasn't explicitly killed. Orch-originated
+    /// spawns leave this None (they're not tied to a single task).
+    /// See AppState::record_task_spawn / transition_task warning path.
+    #[serde(default)]
+    pub spawned_by_task: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,11 +7,46 @@ No Read/Edit/Bash/Grep — the router role is enforced by tool absence.
 from __future__ import annotations
 
 import json
+from contextvars import ContextVar
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 import daemon
+
+# Worker-role task context. Set by the worker's run_task loop before
+# SDK tool invocations and cleared on task exit. `agent_spawn` reads
+# this and passes it through as `spawned_by_task` on the underlying
+# cli.spawn RPC so the daemon can warn at task-completion time if the
+# worker forgot to agent_kill a sibling instance it spawned.
+#
+# Using a ContextVar (not a module-level mutable) is the safe choice
+# even though workers process one task at a time — contextvars
+# survive `asyncio.create_task` correctly and don't leak across
+# nested awaits the way a bare module global can.
+_current_task_id: ContextVar[str | None] = ContextVar(
+    "alor_current_task_id", default=None
+)
+
+
+def set_current_task(task_id: str | None) -> None:
+    """Set the current task_id (for workers entering run_task).
+
+    Pass None on task exit to clear. Safe to call from anywhere; the
+    value is threaded through the ContextVar so nested async work
+    sees the same task id.
+    """
+    _current_task_id.set(task_id)
+
+
+def current_task_id() -> str | None:
+    """Return the current task_id, or None if no task is active.
+
+    Orchestrator never sets this so orch-initiated agent_spawn calls
+    get `spawned_by_task=None` — correct, since they aren't scoped
+    to a single task.
+    """
+    return _current_task_id.get()
 
 
 def _ok(value: Any) -> dict[str, Any]:
@@ -193,6 +228,10 @@ async def agent_ensure_running(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def agent_spawn(args: dict[str, Any]) -> dict[str, Any]:
     try:
+        # Thread the current worker task id (set by worker.run_task via
+        # set_current_task) down to the daemon so it can track which
+        # task spawned which instance. Orchestrator calls have no task
+        # context and pass None → daemon treats the spawn as untracked.
         return _ok(
             await daemon.agent_spawn(
                 agent=args["agent"],
@@ -200,6 +239,7 @@ async def agent_spawn(args: dict[str, Any]) -> dict[str, Any]:
                 role=args.get("role") or None,
                 project=args.get("project") or None,
                 working_dir=args.get("working_dir") or None,
+                spawned_by_task=current_task_id(),
             )
         )
     except Exception as e:

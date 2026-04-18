@@ -151,6 +151,12 @@ async def run_task(
     # `during_task: true` and the task id. Cleared in `finally` so post-task
     # stdin fires with `during_task: false`.
     current["task_id"] = task_id or None
+    # Also publish to the tools ContextVar so the agent_spawn MCP tool
+    # can tag cli.spawn payloads with `spawned_by_task`. Daemon uses
+    # that to warn at task-completion time if worker-spawned instances
+    # weren't explicitly killed. Cleared in `finally` so post-task
+    # orchestrator spawns (if any) stay untagged.
+    tools.set_current_task(task_id or None)
     try:
         try:
             async with client_lock:
@@ -168,6 +174,7 @@ async def run_task(
         print_footer(session_start, cost[0], totals)
     finally:
         current["task_id"] = None
+        tools.set_current_task(None)
 
     summary = latest["text"].strip() or None
     # Cap summary client-side too so we don't blow through the daemon's

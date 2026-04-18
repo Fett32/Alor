@@ -1003,6 +1003,11 @@ impl SocketServer {
                             );
                         }
 
+                        // Clear any worker-task spawn tracking so
+                        // transition_task doesn't warn about this
+                        // instance — it was explicitly released.
+                        self.app_state.clear_task_spawn(&payload.instance);
+
                         info!(instance = %payload.instance, "agent tombstoned via CLI");
                         self.broadcast_event(
                             "agent.deleted",
@@ -1045,6 +1050,13 @@ impl SocketServer {
                         let _ = std::process::Command::new("tmux")
                             .args(["kill-session", "-t", &tmux_session])
                             .output();
+
+                        // Also clear any worker-task spawn tracking —
+                        // cli.kill is the worker-facing release path
+                        // (agent_kill tool → cli.kill). Without this
+                        // the completion-time warning would fire for
+                        // instances the worker explicitly killed.
+                        self.app_state.clear_task_spawn(&payload.instance);
 
                         let msg = if killed_child {
                             format!("killed process and tmux session for {}", payload.instance)
@@ -1232,6 +1244,7 @@ impl SocketServer {
                                 role: None,
                                 project: None,
                                 working_dir: None,
+                                spawned_by_task: None,
                             }
                         } else if let Some(existing) = self.app_state.get_agent(&payload.agent_id) {
                             match existing.template.as_deref() {
@@ -1247,6 +1260,7 @@ impl SocketServer {
                                         role: None,
                                         project: existing.project.clone(),
                                         working_dir: existing.working_dir.clone(),
+                                        spawned_by_task: None,
                                     }
                                 }
                                 _ => {
@@ -1834,6 +1848,14 @@ impl SocketServer {
                 {
                     let mut spawned = self.spawned.lock().await;
                     spawned.insert(instance_id.clone(), child);
+                }
+                // If the caller tagged this spawn with a task_id
+                // (worker calling agent_spawn mid-task — see
+                // orchestrator-py/tools.py::agent_spawn), record the
+                // pairing so transition_task can warn if the worker
+                // forgets to kill the instance before completing.
+                if let Some(task_id) = payload.spawned_by_task {
+                    self.app_state.record_task_spawn(task_id, &instance_id);
                 }
                 self.broadcast_event(
                     "agent.spawned",

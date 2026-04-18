@@ -317,6 +317,7 @@ impl Agent {
 // AppState — Tauri managed state
 // ---------------------------------------------------------------------------
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -325,6 +326,23 @@ pub struct AppState {
     save_path: Arc<Option<PathBuf>>,
     /// App handle for emitting push events to the frontend.
     app_handle: Arc<Mutex<Option<AppHandle>>>,
+    /// Tracks agent instances spawned by a specific task so we can
+    /// warn on terminal transition if any weren't cleaned up.
+    ///
+    /// Lifecycle:
+    ///   - `cli.spawn` with `spawned_by_task = Some(tid)` inserts the
+    ///     new instance_id into `task_spawns[tid]`.
+    ///   - `cli.delete` removes the instance_id from every entry —
+    ///     an explicit kill clears the tracking.
+    ///   - `transition_task` to a terminal state drains the entry
+    ///     for that task_id; any survivors become the warning
+    ///     appended to the task's `summary`.
+    ///
+    /// Deliberately NOT persisted to state.json: it's debug
+    /// scaffolding that only makes sense for in-flight tasks. A
+    /// daemon reboot drops the tracking along with the task context
+    /// that gives it meaning.
+    task_spawns: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
 }
 
 impl Default for AppState {
@@ -333,6 +351,7 @@ impl Default for AppState {
             inner: Arc::new(Mutex::new(StateInner::default())),
             save_path: Arc::new(None),
             app_handle: Arc::new(Mutex::new(None)),
+            task_spawns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -425,6 +444,7 @@ impl AppState {
             inner: Arc::new(Mutex::new(inner)),
             save_path: Arc::new(Some(path)),
             app_handle: Arc::new(Mutex::new(None)),
+            task_spawns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -696,6 +716,68 @@ impl AppState {
         self.inner.lock().tasks.values().cloned().collect()
     }
 
+    // --- task-spawn tracking -------------------------------------------------
+    //
+    // Workers can `agent_spawn` sibling instances during a task (for
+    // live verification, debug reproducibility, etc.). To avoid
+    // resource leaks where a worker forgets to `agent_kill` before
+    // completing, we track (task_id, instance_id) here and emit a
+    // warning on terminal transition. See `transition_task` for the
+    // emit path.
+
+    /// Record that `instance_id` was spawned on behalf of `task_id`.
+    /// Idempotent — re-recording the same pair is a no-op (HashSet).
+    pub fn record_task_spawn(&self, task_id: Uuid, instance_id: impl Into<String>) {
+        self.task_spawns
+            .lock()
+            .entry(task_id)
+            .or_default()
+            .insert(instance_id.into());
+    }
+
+    /// Remove `instance_id` from every task's spawn set. Called when
+    /// `cli.delete` (explicit kill) runs — marks the instance as
+    /// cleanly released so the completion-time warning stays silent.
+    /// Does NOT fire on disconnect: a dead pane isn't the same as an
+    /// intentional kill.
+    pub fn clear_task_spawn(&self, instance_id: &str) {
+        let mut guard = self.task_spawns.lock();
+        for set in guard.values_mut() {
+            set.remove(instance_id);
+        }
+        // Drop empty entries so `pending_spawns_for_task` stays sparse.
+        guard.retain(|_, set| !set.is_empty());
+    }
+
+    /// Inspect (without draining) the spawn set for `task_id`.
+    /// Primarily for tests and diagnostics.
+    pub fn pending_spawns_for_task(&self, task_id: Uuid) -> Vec<String> {
+        self.task_spawns
+            .lock()
+            .get(&task_id)
+            .map(|s| {
+                let mut v: Vec<String> = s.iter().cloned().collect();
+                v.sort(); // stable order for tests / warning message
+                v
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drain and return the spawn set for `task_id`. Used by
+    /// `transition_task` on terminal transitions — the tracking is
+    /// scoped to the task's in-flight lifetime.
+    pub fn take_pending_spawns_for_task(&self, task_id: Uuid) -> Vec<String> {
+        self.task_spawns
+            .lock()
+            .remove(&task_id)
+            .map(|s| {
+                let mut v: Vec<String> = s.into_iter().collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default()
+    }
+
     /// Transition a task to a new state.  Returns the updated task on success.
     pub fn transition_task(&self, id: Uuid, next: TaskState) -> anyhow::Result<Task> {
         let is_completing = next == TaskState::Completed;
@@ -724,12 +806,62 @@ impl AppState {
         if task.state.is_terminal() {
             task.assigned_to = None;
         }
+
+        // Terminal transition: surface any agent instances the worker
+        // spawned but didn't explicitly kill. Appends to `summary` so
+        // the warning is visible via task_get and in the task-list UI.
+        // Don't auto-kill — the worker may have intentionally left
+        // instances alive (e.g. for follow-up debugging).
+        let terminal_leak: Option<Vec<String>> = if task.state.is_terminal() {
+            // Drain inline under the same lock-free window (we already
+            // dropped `s` below for save/event emission). We own
+            // task_spawns separately so taking it here is safe.
+            let leaked = self.take_pending_spawns_for_task(id);
+            if leaked.is_empty() {
+                None
+            } else {
+                let warning = format!(
+                    "[ALERT] {} agent instance(s) spawned by this task \
+                     were not explicitly killed: {}. Call agent_kill on \
+                     each before completing — or confirm they're meant \
+                     to outlive the task.",
+                    leaked.len(),
+                    leaked.join(", "),
+                );
+                task.summary = Some(match task.summary.take() {
+                    Some(existing) if !existing.is_empty() => {
+                        format!("{existing}\n\n{warning}")
+                    }
+                    _ => warning,
+                });
+                tracing::warn!(
+                    task_id = %id,
+                    leaked = ?leaked,
+                    "task completed with unreleased worker spawns"
+                );
+                Some(leaked)
+            }
+        } else {
+            None
+        };
+
         let result = task.clone();
         drop(s);
         self.save();
         self.emit_event("tasks-changed");
         if is_completing {
             self.emit_event_with("task-completed", result.title.clone());
+        }
+        // Emit a dedicated event if we appended a leak warning so the
+        // UI / orch can surface it distinctly if it wants to.
+        if let Some(leaked) = terminal_leak {
+            self.emit_event_with(
+                "task-spawn-leak",
+                serde_json::json!({
+                    "task_id": id.to_string(),
+                    "instances": leaked,
+                }),
+            );
         }
         Ok(result)
     }
@@ -1095,6 +1227,206 @@ mod tests {
         t.state = TaskState::Stale;
         t.transition(TaskState::Cancelled).expect("should succeed");
         assert_eq!(t.state, TaskState::Cancelled);
+    }
+
+    // --- task-spawn warning tests -----------------------------------------
+
+    /// Helper: fresh AppState with a state-persistence path under tempdir.
+    /// Per-test nonce avoids parallel-run collisions.
+    fn fresh_state() -> (AppState, PathBuf) {
+        let nonce = Uuid::new_v4();
+        let state_path = std::env::temp_dir().join(format!("alor-test-spawn-{nonce}.json"));
+        let _ = std::fs::remove_file(&state_path);
+        (AppState::with_persistence(state_path.clone()), state_path)
+    }
+
+    /// Helper: put an Accepted task into state so transition_task
+    /// can move it to Completed/Cancelled.
+    fn seed_accepted_task(app: &AppState) -> Uuid {
+        let mut t = Task::new("spawn-leak test", "desc");
+        t.state = TaskState::Accepted;
+        let id = t.id;
+        app.add_task(t);
+        id
+    }
+
+    #[test]
+    fn task_spawn_tracking_round_trips() {
+        let (app, state_path) = fresh_state();
+        let tid = Uuid::new_v4();
+
+        assert!(app.pending_spawns_for_task(tid).is_empty());
+
+        app.record_task_spawn(tid, "codex-debug-a");
+        app.record_task_spawn(tid, "claude-debug-b");
+        // Idempotent re-record is a no-op.
+        app.record_task_spawn(tid, "codex-debug-a");
+        assert_eq!(
+            app.pending_spawns_for_task(tid),
+            vec!["claude-debug-b".to_string(), "codex-debug-a".to_string()],
+        );
+
+        // clear_task_spawn by instance removes it from every task set.
+        app.clear_task_spawn("codex-debug-a");
+        assert_eq!(
+            app.pending_spawns_for_task(tid),
+            vec!["claude-debug-b".to_string()],
+        );
+
+        // Draining removes the entry entirely.
+        let drained = app.take_pending_spawns_for_task(tid);
+        assert_eq!(drained, vec!["claude-debug-b".to_string()]);
+        assert!(app.pending_spawns_for_task(tid).is_empty());
+
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn transition_to_completed_with_no_spawns_does_not_warn() {
+        let (app, state_path) = fresh_state();
+        let id = seed_accepted_task(&app);
+
+        let out = app
+            .transition_task(id, TaskState::Completed)
+            .expect("transition");
+        assert_eq!(out.state, TaskState::Completed);
+        assert!(
+            out.summary.is_none() || !out.summary.as_deref().unwrap().contains("[ALERT]"),
+            "summary should be untouched when there are no tracked spawns; got {:?}",
+            out.summary
+        );
+
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn transition_to_completed_warns_on_leaked_spawn() {
+        // "spawn-only" case: worker spawned but never killed.
+        let (app, state_path) = fresh_state();
+        let id = seed_accepted_task(&app);
+
+        app.record_task_spawn(id, "codex-debug-leaked");
+
+        let out = app
+            .transition_task(id, TaskState::Completed)
+            .expect("transition");
+        let summary = out.summary.expect("warning should populate summary");
+        assert!(summary.contains("[ALERT]"), "summary missing alert marker: {summary}");
+        assert!(
+            summary.contains("codex-debug-leaked"),
+            "summary should name the leaked instance: {summary}"
+        );
+        assert!(
+            summary.contains("agent_kill"),
+            "summary should point at the cleanup tool: {summary}"
+        );
+        // Tracking was drained.
+        assert!(app.pending_spawns_for_task(id).is_empty());
+
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn transition_to_completed_with_cleanly_killed_spawns_does_not_warn() {
+        // "clean spawn+kill" case: worker spawned and explicitly killed.
+        let (app, state_path) = fresh_state();
+        let id = seed_accepted_task(&app);
+
+        app.record_task_spawn(id, "codex-debug-cleaned");
+        // Simulate the cli.delete/cli.kill path clearing the tracking.
+        app.clear_task_spawn("codex-debug-cleaned");
+
+        let out = app
+            .transition_task(id, TaskState::Completed)
+            .expect("transition");
+        assert!(
+            out.summary.is_none(),
+            "no warning expected; got summary: {:?}",
+            out.summary
+        );
+
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn transition_to_completed_multi_spawn_partial_kill_warns_on_remainder() {
+        // "multi-spawn partial kill" case: three spawns, one killed,
+        // warning should list the two survivors in stable order.
+        let (app, state_path) = fresh_state();
+        let id = seed_accepted_task(&app);
+
+        app.record_task_spawn(id, "codex-debug-a");
+        app.record_task_spawn(id, "claude-debug-b");
+        app.record_task_spawn(id, "gemini-debug-c");
+        // Kill one.
+        app.clear_task_spawn("claude-debug-b");
+
+        let out = app
+            .transition_task(id, TaskState::Completed)
+            .expect("transition");
+        let summary = out.summary.expect("warning should populate summary");
+        // Survivors present.
+        assert!(summary.contains("codex-debug-a"), "missing 'a': {summary}");
+        assert!(summary.contains("gemini-debug-c"), "missing 'c': {summary}");
+        // Killed one absent.
+        assert!(
+            !summary.contains("claude-debug-b"),
+            "killed instance should not appear: {summary}"
+        );
+        // Count is the survivor count.
+        assert!(
+            summary.contains("2 agent instance"),
+            "count should be 2: {summary}"
+        );
+
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn transition_to_cancelled_also_triggers_leak_warning() {
+        // Terminal != just Completed — a cancelled task with leaked
+        // spawns should also surface the warning.
+        let (app, state_path) = fresh_state();
+        let id = seed_accepted_task(&app);
+
+        app.record_task_spawn(id, "codex-debug-x");
+
+        let out = app
+            .transition_task(id, TaskState::Cancelled)
+            .expect("transition");
+        let summary = out.summary.expect("warning should populate summary");
+        assert!(summary.contains("codex-debug-x"));
+        assert!(summary.contains("[ALERT]"));
+
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn leak_warning_appends_to_existing_summary() {
+        // If the worker sent a real summary and there's ALSO a leak,
+        // the warning should append rather than replace.
+        let (app, state_path) = fresh_state();
+
+        let mut t = Task::new("worker summary preserved", "desc");
+        t.state = TaskState::Accepted;
+        t.summary = Some("Real worker summary text goes here.".to_string());
+        let id = t.id;
+        app.add_task(t);
+
+        app.record_task_spawn(id, "codex-debug-leak");
+        let out = app
+            .transition_task(id, TaskState::Completed)
+            .expect("transition");
+        let summary = out.summary.expect("summary");
+        assert!(
+            summary.starts_with("Real worker summary text goes here."),
+            "worker summary must survive: {summary}"
+        );
+        assert!(summary.contains("[ALERT]"), "warning must append: {summary}");
+        // Two sections separated by blank line.
+        assert!(summary.contains("\n\n[ALERT]"));
+
+        let _ = std::fs::remove_file(&state_path);
     }
 
     #[test]
