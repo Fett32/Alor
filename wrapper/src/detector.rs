@@ -85,11 +85,15 @@ impl AgentKind {
     /// hints — the caller never reaches this for them.
     pub fn trust_ack_key(&self) -> &'static str {
         match self {
-            AgentKind::ClaudeCode => "1", // unused; empty hints
+            AgentKind::ClaudeCode => "1",
             AgentKind::Codex => "1",
             AgentKind::Gemini => "1",
             AgentKind::Cursor => "a",
-            AgentKind::Default => "", // unused; empty hints
+            // Default's hints are empty so this value is unreachable
+            // at runtime; locked to the no-op empty string anyway so
+            // a future hint addition has to make an explicit ack-key
+            // choice, not inherit a stale "1".
+            AgentKind::Default => "",
         }
     }
 }
