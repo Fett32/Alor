@@ -16,7 +16,11 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-const MAIN_SESSION: &str = "alor-main";
+/// Default tmux session name that PaneManager manages. Production
+/// uses this via `PaneManager::new()`; tests can pick a disposable
+/// name via `PaneManager::with_main_session` so the real alor-main
+/// session stays untouched during `cargo test`.
+pub const DEFAULT_MAIN_SESSION: &str = "alor-main";
 /// Maximum right-side columns before we start stacking more aggressively.
 const MAX_RIGHT_COLUMNS: usize = 3;
 
@@ -51,10 +55,21 @@ struct PaneInfo {
 // PaneManager
 // ---------------------------------------------------------------------------
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct PaneManager {
     /// Maps agent_id to pane info
     panes: Arc<Mutex<HashMap<String, PaneInfo>>>,
+    /// Name of the tmux session this manager lays panes into.
+    /// Normally `DEFAULT_MAIN_SESSION` ("alor-main"); integration
+    /// tests override with a disposable name to avoid clobbering
+    /// the production session that hosts Alor's own UI.
+    main_session: String,
+}
+
+impl Default for PaneManager {
+    fn default() -> Self {
+        Self::with_main_session(DEFAULT_MAIN_SESSION)
+    }
 }
 
 /// Summary returned by `PaneManager::reconcile_panes`. Callers use
@@ -76,6 +91,16 @@ pub struct ReconcileReport {
 impl PaneManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a PaneManager that manages a non-default tmux session
+    /// name. Intended for integration tests that need isolation from
+    /// a running Alor's `alor-main`; production code uses `new()`.
+    pub fn with_main_session(main_session: impl Into<String>) -> Self {
+        Self {
+            panes: Arc::new(Mutex::new(HashMap::new())),
+            main_session: main_session.into(),
+        }
     }
 
     /// Public wrapper around the internal `rebalance_layout` so the UI can
@@ -144,13 +169,13 @@ impl PaneManager {
         // mouse on: scroll, click-to-focus, drag borders to resize, drag body
         // to select (enters copy-mode).
         let _ = Command::new("tmux")
-            .args(["set-option", "-t", MAIN_SESSION, "mouse", "on"])
+            .args(["set-option", "-t", &self.main_session, "mouse", "on"])
             .output()
             .await;
 
         // Larger scrollback than default 2000.
         let _ = Command::new("tmux")
-            .args(["set-option", "-t", MAIN_SESSION, "history-limit", "50000"])
+            .args(["set-option", "-t", &self.main_session, "history-limit", "50000"])
             .output()
             .await;
 
@@ -205,7 +230,7 @@ impl PaneManager {
         // against the dark background. Matches the UI accent.
         let _ = Command::new("tmux")
             .args([
-                "set-option", "-t", MAIN_SESSION,
+                "set-option", "-t", &self.main_session,
                 "mode-style", "bg=#3d3580,fg=#ffffff",
             ])
             .output()
@@ -220,8 +245,8 @@ impl PaneManager {
     /// Ensure alor-main exists. Creates it if needed.
     /// Called once at startup.
     pub async fn ensure_main_session(&self) -> Result<()> {
-        if self.session_exists(MAIN_SESSION).await {
-            tracing::info!("reusing existing {MAIN_SESSION} session");
+        if self.session_exists(&self.main_session).await {
+            tracing::info!(session = %self.main_session, "reusing existing session");
             // Ensure session options/bindings are set (may have been lost if
             // the session predates the current mouse config).
             self.apply_tmux_mouse_config().await;
@@ -232,7 +257,7 @@ impl PaneManager {
         // Create with a placeholder — first real agent pane will replace it.
         let output = Command::new("tmux")
             .args([
-                "new-session", "-d", "-s", MAIN_SESSION,
+                "new-session", "-d", "-s", &self.main_session,
                 "-x", "200", "-y", "50",
             ])
             .output()
@@ -252,13 +277,13 @@ impl PaneManager {
         // Put a status message in the initial pane.
         let _ = Command::new("tmux")
             .args([
-                "send-keys", "-t", MAIN_SESSION,
+                "send-keys", "-t", &self.main_session,
                 "echo 'Alor — waiting for agents...'", "Enter",
             ])
             .output()
             .await;
 
-        tracing::info!("created {MAIN_SESSION} session");
+        tracing::info!(session = %self.main_session, "created session");
         Ok(())
     }
 
@@ -323,7 +348,7 @@ impl PaneManager {
                 tracing::debug!(
                     agent_id,
                     pane_id = %info.pane_id,
-                    "agent already has a pane in {MAIN_SESSION}"
+                    "agent already has a pane"
                 );
                 return Ok(());
             }
@@ -366,14 +391,14 @@ impl PaneManager {
         let (pane_id, column) = if pane_count <= 1 && panes.is_empty() {
             // First real agent — use the existing initial pane.
             let _ = Command::new("tmux")
-                .args(["send-keys", "-t", &format!("{MAIN_SESSION}:0.0"), "C-c"])
+                .args(["send-keys", "-t", &format!("{}:0.0", self.main_session), "C-c"])
                 .output()
                 .await;
 
             let output = Command::new("tmux")
                 .args([
                     "respawn-pane", "-k",
-                    "-t", &format!("{MAIN_SESSION}:0.0"),
+                    "-t", &format!("{}:0.0", self.main_session),
                     &attach_cmd,
                 ])
                 .output()
@@ -387,7 +412,7 @@ impl PaneManager {
                 );
             }
 
-            let pid = self.get_pane_id(MAIN_SESSION, 0).await
+            let pid = self.get_pane_id(&self.main_session, 0).await
                 .unwrap_or_else(|| "%0".to_string());
             let col = if is_orchestrator { None } else { Some(0) };
             (pid, col)
@@ -395,19 +420,19 @@ impl PaneManager {
         } else if is_orchestrator {
             // Orchestrator always gets a new column on the left via -h split,
             // then we swap it to pane 0.
-            let pid = self.split_horizontal(MAIN_SESSION, &attach_cmd).await?;
+            let pid = self.split_horizontal(&self.main_session, &attach_cmd).await?;
             // Swap to position 0 so it's on the left.
             let _ = Command::new("tmux")
-                .args(["swap-pane", "-s", &pid, "-t", &format!("{MAIN_SESSION}:0.0")])
+                .args(["swap-pane", "-s", &pid, "-t", &format!("{}:0.0", self.main_session)])
                 .output()
                 .await;
-            let pid = self.get_pane_id(MAIN_SESSION, 0).await
+            let pid = self.get_pane_id(&self.main_session, 0).await
                 .unwrap_or(pid);
             (pid, None)
 
         } else if num_columns < MAX_RIGHT_COLUMNS {
             // Room for a new column — split horizontally (new column to the right).
-            let pid = self.split_horizontal(MAIN_SESSION, &attach_cmd).await?;
+            let pid = self.split_horizontal(&self.main_session, &attach_cmd).await?;
             let col = max_column.map_or(0, |m| m + 1);
             (pid, Some(col))
 
@@ -419,7 +444,7 @@ impl PaneManager {
 
             let split_target = column_panes.get(&target_col)
                 .cloned()
-                .unwrap_or_else(|| format!("{MAIN_SESSION}:0.1"));
+                .unwrap_or_else(|| format!("{}:0.1", self.main_session));
 
             let pid = self.split_vertical(&split_target, &attach_cmd).await?;
             (pid, Some(target_col))
@@ -428,7 +453,7 @@ impl PaneManager {
         // Rebalance: orchestrator gets left column, right side evens out.
         self.rebalance_layout().await;
 
-        tracing::info!(agent_id, pane_id = %pane_id, column = ?column, "added agent pane to {MAIN_SESSION}");
+        tracing::info!(agent_id, pane_id = %pane_id, column = ?column, "added agent pane");
 
         panes.insert(agent_id.to_string(), PaneInfo {
             pane_id,
@@ -483,7 +508,7 @@ impl PaneManager {
 
         panes.remove(agent_id);
 
-        tracing::info!(agent_id, "removed agent pane from {MAIN_SESSION}");
+        tracing::info!(agent_id, "removed agent pane");
         Ok(())
     }
 
@@ -671,7 +696,7 @@ impl PaneManager {
     async fn rebalance_layout(&self) {
         // Step 1: main-vertical sets the overall shape.
         let _ = Command::new("tmux")
-            .args(["select-layout", "-t", MAIN_SESSION, "main-vertical"])
+            .args(["select-layout", "-t", &self.main_session, "main-vertical"])
             .output()
             .await;
 
@@ -681,7 +706,7 @@ impl PaneManager {
         // the same layout with -E (spread evenly) which makes it a custom
         // layout internally.
         let _ = Command::new("tmux")
-            .args(["select-layout", "-t", MAIN_SESSION, "-E"])
+            .args(["select-layout", "-t", &self.main_session, "-E"])
             .output()
             .await;
     }
@@ -689,7 +714,7 @@ impl PaneManager {
     /// Count current panes in alor-main.
     async fn count_panes(&self) -> usize {
         let output = Command::new("tmux")
-            .args(["list-panes", "-t", MAIN_SESSION, "-F", "#{pane_id}"])
+            .args(["list-panes", "-t", &self.main_session, "-F", "#{pane_id}"])
             .output()
             .await;
 
@@ -724,7 +749,7 @@ impl PaneManager {
     async fn scan_existing_panes(&self) {
         let output = Command::new("tmux")
             .args([
-                "list-panes", "-t", MAIN_SESSION,
+                "list-panes", "-t", &self.main_session,
                 "-F", "#{pane_id} #{pane_start_command}",
             ])
             .output()
@@ -783,7 +808,7 @@ impl PaneManager {
             }
         }
 
-        tracing::info!(count = panes.len(), "scanned existing panes in {MAIN_SESSION}");
+        tracing::info!(count = panes.len(), "scanned existing panes");
     }
 
     /// Check if a tmux session exists.
@@ -896,6 +921,161 @@ mod tests {
         // Very high pane id nothing else is likely using. `list-panes -t
         // %999999` returns "can't find pane" with exit 1.
         assert!(!pm.pane_exists("%999999").await);
+    }
+
+    /// End-to-end repro of the original bug (task 883bdc60 / 1ed52762):
+    /// wrapper.register's `add_agent_pane` silently failed, leaving an
+    /// agent in state=connected without a pane in alor-main. Reconcile
+    /// must self-heal by adding the missing pane.
+    ///
+    /// Uses a disposable alor-main-like session via
+    /// `PaneManager::with_main_session` so the real alor-main hosting
+    /// the running Alor (and thus this test process) stays untouched.
+    #[tokio::test]
+    async fn reconcile_panes_adds_missing_pane_for_connected_agent_with_live_session() {
+        if !tmux_available().await {
+            eprintln!("tmux not available, skipping");
+            return;
+        }
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let main_session = format!("alor-test-reconcile-{nonce}");
+        let agent_id = format!("test-agent-{nonce}");
+        let agent_session = format!("alor-{agent_id}");
+
+        // 1. Create the disposable main session (placeholder pane only).
+        let pm = PaneManager::with_main_session(&main_session);
+        pm.ensure_main_session()
+            .await
+            .expect("ensure main session");
+        // Give tmux a moment to finish setting options on new-session.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            pm.session_exists(&main_session).await,
+            "test main session must exist after ensure_main_session"
+        );
+
+        // 2. Create the agent's own tmux session. Something long-running
+        //    inside so it stays alive past the test tick.
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", &agent_session, "sleep", "300"])
+            .output()
+            .await
+            .ok()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            kill_session(&main_session).await;
+            panic!("failed to create agent session {agent_session}");
+        }
+
+        // 3. Register the agent as connected in AppState with the right
+        //    tmux_session (matching the session we just created).
+        //    set_agent_connected auto-registers with a default tmux_session
+        //    = Some("alor-<id>") which matches our naming, good.
+        let state = crate::daemon::state::AppState::new();
+        state
+            .set_agent_connected(&agent_id, true)
+            .expect("set_agent_connected");
+        let stored = state.get_agent(&agent_id).expect("agent present");
+        assert!(stored.connected);
+        assert_eq!(
+            stored.tmux_session.as_deref(),
+            Some(agent_session.as_str()),
+            "auto-registered tmux_session should match expected alor-<id> naming"
+        );
+
+        // 4. Simulate the silent-failure repro: `wrapper.register` ran,
+        //    set agent.connected=true, but `add_agent_pane` was NOT
+        //    called (e.g. the call silently errored and only logged
+        //    warn). The panes map is empty for this agent.
+        assert!(
+            pm.visible_agents().await.iter().all(|v| v != &agent_id),
+            "pre-reconcile: agent must not yet be a visible pane"
+        );
+
+        // 5. Reconcile. Must add the missing pane and report it.
+        let report = pm.reconcile_panes(&state).await;
+
+        assert!(
+            report.added.iter().any(|id| id == &agent_id),
+            "reconcile should report `{agent_id}` as added; got {:?}",
+            report.added
+        );
+        assert!(
+            report.zombies.is_empty(),
+            "agent session IS alive, so it must not be a zombie; got {:?}",
+            report.zombies
+        );
+        assert!(
+            pm.visible_agents().await.iter().any(|v| v == &agent_id),
+            "post-reconcile: agent must now be a visible pane"
+        );
+
+        // 6. Cleanup disposable sessions.
+        kill_session(&main_session).await;
+        kill_session(&agent_session).await;
+    }
+
+    /// End-to-end of the zombie auto-clear path: reconcile reports
+    /// the zombie, the caller-equivalent state mutation flips connected
+    /// to false. Mirrors what lib.rs startup + the pane_reconcile
+    /// Tauri command do (they loop over report.zombies and call
+    /// `SocketServer::mark_agent_zombie`, which delegates to
+    /// `AppState::set_agent_connected(false)`). This test drives that
+    /// composition directly since PaneManager doesn't depend on
+    /// SocketServer.
+    #[tokio::test]
+    async fn reconcile_panes_zombie_auto_clear_flips_state() {
+        if !tmux_available().await {
+            eprintln!("tmux not available, skipping");
+            return;
+        }
+
+        let state = crate::daemon::state::AppState::new();
+        let zombie_id = format!(
+            "test-zombie-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        // Connected, but the default tmux_session "alor-<id>" won't
+        // exist because we never create it. Classic zombie state.
+        state
+            .set_agent_connected(&zombie_id, true)
+            .expect("set_agent_connected");
+        assert!(
+            state.get_agent(&zombie_id).unwrap().connected,
+            "pre-reconcile: state says connected"
+        );
+
+        // PaneManager detection.
+        let pm = PaneManager::new();
+        let report = pm.reconcile_panes(&state).await;
+        assert!(
+            report.zombies.iter().any(|z| z == &zombie_id),
+            "reconcile must flag the zombie agent; got {:?}",
+            report.zombies
+        );
+        // PaneManager itself doesn't mutate state (separation of concerns).
+        assert!(
+            state.get_agent(&zombie_id).unwrap().connected,
+            "PaneManager must not mutate state directly"
+        );
+
+        // Caller-equivalent follow-up: state flip. Production does this
+        // through SocketServer::mark_agent_zombie, which invokes the
+        // same AppState method + broadcasts. Broadcast side is covered
+        // in wrapper::server::tests.
+        for id in &report.zombies {
+            state
+                .set_agent_connected(id, false)
+                .expect("caller state flip");
+        }
+
+        // Post-condition: the zombie is now marked disconnected, UI
+        // will re-fetch on agents-changed and render the correct state.
+        assert!(
+            !state.get_agent(&zombie_id).unwrap().connected,
+            "post-reconcile + caller flip: state must reflect reality"
+        );
     }
 
     #[tokio::test]

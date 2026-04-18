@@ -2268,4 +2268,67 @@ mod tests {
         let t = server.app_state.get_task(id).expect("present");
         assert_eq!(t.state, TaskState::Accepted);
     }
+
+    #[tokio::test]
+    async fn mark_agent_zombie_flips_state_and_preserves_writers() {
+        // Verifies the zombie auto-clear state mutation end-to-end:
+        // `SocketServer::mark_agent_zombie(id)` flips
+        // `state.connected` from true → false for the given agent
+        // without touching the `writers` map. The latter matters
+        // because a zombie wrapper's daemon socket may still be
+        // alive (process lingering with dead tmux session), and
+        // we want to keep it reachable for SHUTDOWN until the
+        // socket actually drops.
+        let server = server_for_test();
+        let zombie_id = "test-zombie-mark";
+        server
+            .app_state
+            .set_agent_connected(zombie_id, true)
+            .expect("seed connected");
+        assert!(
+            server.app_state.get_agent(zombie_id).unwrap().connected
+        );
+
+        // `is_connected` reads the writers map — empty in server_for_test
+        // so false before and after. We just want to confirm the flip
+        // doesn't fail and doesn't somehow inject a phantom writer.
+        assert!(!server.is_connected(zombie_id).await);
+
+        server.mark_agent_zombie(zombie_id).await;
+
+        assert!(
+            !server.app_state.get_agent(zombie_id).unwrap().connected,
+            "mark_agent_zombie must flip connected → false"
+        );
+        // Writers untouched.
+        assert!(
+            !server.is_connected(zombie_id).await,
+            "mark_agent_zombie must not add the agent to writers"
+        );
+
+        // Idempotent: calling again on an already-disconnected agent
+        // must not panic. `set_agent_connected(false, false)` is a
+        // no-op on an already-false flag.
+        server.mark_agent_zombie(zombie_id).await;
+        assert!(!server.app_state.get_agent(zombie_id).unwrap().connected);
+    }
+
+    #[tokio::test]
+    async fn mark_agent_zombie_noop_for_unknown_agent() {
+        // Defensive: if the caller asks us to zombie-clear an agent
+        // that was never registered in state, we auto-register it
+        // (via set_agent_connected's fallback path) with
+        // connected=false. Safe — an agent_id showing up in
+        // report.zombies for a state that's already been cleaned is
+        // a race we want to tolerate rather than panic on.
+        let server = server_for_test();
+        server.mark_agent_zombie("never-heard-of-this-one").await;
+        // set_agent_connected auto-registers — confirm it did, with
+        // connected=false.
+        let a = server
+            .app_state
+            .get_agent("never-heard-of-this-one")
+            .expect("auto-registered after set_agent_connected");
+        assert!(!a.connected);
+    }
 }
