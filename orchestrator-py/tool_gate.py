@@ -24,6 +24,17 @@ Scope of the gate:
 - EnterWorktree / ExitWorktree: not UI-dependent but mutate the
   Claude Code CLI's session state (cwd + git worktree); failure
   class is different, pending separate investigation. NOT gated.
+
+Role-based Alor-MCP gating (worker only):
+- Worker builds its MCP server from tools.WORKER_ACCESSIBLE_TOOLS,
+  so the task_* / project_* / memory_get tools are structurally
+  absent. This gate is a belt-and-braces second line: it denies
+  those by name if a worker-role call ever reaches the hook,
+  catching copy/paste or future-refactor regressions where someone
+  builds the full server for a worker by mistake.
+- agent_send_message has an additional payload check: workers
+  must not target an orchestrator agent_id (prevents worker →
+  orchestrator prompt injection loops).
 """
 
 from __future__ import annotations
@@ -47,6 +58,75 @@ HOST_UI_TOOLS: frozenset[str] = frozenset(
         "ExitPlanMode",
     }
 )
+
+
+# MCP prefix for Alor's own tool names. Keep in sync with
+# tools.MCP_SERVER_NAME — not imported to avoid a circular import
+# (tools.py doesn't need tool_gate, and tool_gate is called from
+# worker.py and main.py both of which import tools too).
+_ALOR_MCP_PREFIX = "mcp__alor__"
+
+# Alor MCP tool names workers must NOT invoke. Filtering at the
+# MCP-server level (tools._tools_for_role) is the primary defense;
+# this set is the call-time second line in case the full server
+# gets loaded for a worker by mistake. Keep in sync with the
+# inverse of tools.WORKER_ACCESSIBLE_TOOLS.
+_WORKER_DENIED_ALOR_TOOLS: frozenset[str] = frozenset(
+    {
+        "task_create",
+        "task_assign",
+        "task_cancel",
+        "task_get",
+        "task_list",
+        "project_get",
+        "project_list",
+        "memory_get",
+    }
+)
+
+# Agent IDs treated as orchestrator-authority. A worker-origin
+# agent_send_message to any of these is denied — prevents a worker
+# from injecting prompts into the orch's live SDK session.
+# `claude-alor` is the fixed orchestrator-role slot per the Alor
+# memory-hub docs; the other two are defensive aliases so a future
+# rename doesn't silently open the hole.
+ORCHESTRATOR_AGENT_IDS: frozenset[str] = frozenset(
+    {
+        "orch",
+        "orchestrator",
+        "claude-alor",
+    }
+)
+
+
+def _strip_mcp_prefix(tool_name: str) -> str:
+    """Return the bare Alor tool name if `tool_name` is one of ours,
+    else return the input unchanged."""
+    if tool_name.startswith(_ALOR_MCP_PREFIX):
+        return tool_name[len(_ALOR_MCP_PREFIX):]
+    return tool_name
+
+
+def _deny_worker_orch_only(tool_name: str) -> str:
+    return (
+        f"Tool '{tool_name}' is orchestrator-only. Workers have a "
+        f"restricted Alor-MCP surface (agent_spawn, agent_list, "
+        f"agent_ensure_running, agent_send_message, agent_kill) "
+        f"for end-to-end live verification. Task lifecycle, project "
+        f"profiles, and Memory Hub are curated by the orchestrator; "
+        f"if you need one of those, report via task.blocked or your "
+        f"final summary so the orch can act on it."
+    )
+
+
+def _deny_worker_sends_to_orch(target: str) -> str:
+    return (
+        f"Workers may not agent_send_message to orchestrator "
+        f"agent_id '{target}'. This prevents worker → orchestrator "
+        f"prompt-injection loops. Target a non-orchestrator worker "
+        f"instead (use agent_spawn to create a throwaway test "
+        f"instance if you don't have one to address)."
+    )
 
 
 # Worker context: the SDK worker is running inside a tmux pane that
@@ -88,15 +168,44 @@ def make_gate(role: str):
     structured escape valves rather than "just ask directly",
     which only works for the orch).
     """
-    msg = _DENIAL_MSG_ORCH if role == "orch" else _DENIAL_MSG_WORKER
+    host_ui_msg = _DENIAL_MSG_ORCH if role == "orch" else _DENIAL_MSG_WORKER
+    # `is_worker` also catches unknown roles (matches _DENIAL_MSG_WORKER
+    # fallback above — same "safer default" principle).
+    is_worker = role != "orch"
 
     async def gate(
         tool_name: str,
         tool_input: dict[str, Any],
         _context: ToolPermissionContext,
     ):
+        # Host-UI tools (AskUserQuestion / EnterPlanMode /
+        # ExitPlanMode): always denied in the SDK runtime regardless
+        # of role — the permission component they need doesn't exist.
         if tool_name in HOST_UI_TOOLS:
-            return PermissionResultDeny(message=msg)
+            return PermissionResultDeny(message=host_ui_msg)
+
+        # Worker-role extra restrictions on the Alor MCP surface.
+        # Orch role is unchanged from before.
+        if is_worker:
+            bare = _strip_mcp_prefix(tool_name)
+
+            # Orch-only Alor tools — deny at call-time as a second
+            # line alongside tools._tools_for_role filtering.
+            if bare in _WORKER_DENIED_ALOR_TOOLS:
+                return PermissionResultDeny(
+                    message=_deny_worker_orch_only(bare)
+                )
+
+            # agent_send_message → orchestrator is a worker →
+            # orchestrator prompt injection vector. Deny based on
+            # the payload's agent_id.
+            if bare == "agent_send_message":
+                target = (tool_input or {}).get("agent_id", "")
+                if target in ORCHESTRATOR_AGENT_IDS:
+                    return PermissionResultDeny(
+                        message=_deny_worker_sends_to_orch(target)
+                    )
+
         return PermissionResultAllow()
 
     return gate

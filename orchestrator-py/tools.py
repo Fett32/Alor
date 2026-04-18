@@ -311,11 +311,62 @@ ALL_TOOLS = [
 
 MCP_SERVER_NAME = "alor"
 
+# Tool names workers are allowed to invoke. Everything else in
+# ALL_TOOLS is orchestrator-only and gets filtered out by
+# build_server(role="worker"). The intent is end-to-end live
+# verification: a worker should be able to spawn a throwaway
+# instance, poll its state, message it, and clean up — all without
+# orchestrator involvement. Task lifecycle (task_*), project
+# profiles (project_*), and memory (memory_*) remain orch-only
+# because those are curation / routing / assignment decisions that
+# belong to the orchestrator role by design.
+#
+# Defense-in-depth: tool_gate.make_gate("worker") ALSO denies the
+# orch-only tools at call-time, so even if a worker somehow loaded
+# the full server (copy-paste, future refactor) the gate surfaces
+# a typed error rather than letting the call through.
+WORKER_ACCESSIBLE_TOOLS: frozenset[str] = frozenset(
+    {
+        "agent_spawn",
+        "agent_list",
+        "agent_ensure_running",
+        "agent_send_message",
+        "agent_kill",
+    }
+)
 
-def build_server():
-    return create_sdk_mcp_server(name=MCP_SERVER_NAME, tools=ALL_TOOLS)
+
+def _tools_for_role(role: str):
+    """Filter ALL_TOOLS by caller role.
+
+    role:
+      - "orch"   → every tool (current orchestrator behaviour).
+      - "worker" → WORKER_ACCESSIBLE_TOOLS subset only.
+      - anything else → worker (safer default; matches
+        tool_gate.make_gate's fallback).
+    """
+    if role == "orch":
+        return list(ALL_TOOLS)
+    return [t for t in ALL_TOOLS if t.name in WORKER_ACCESSIBLE_TOOLS]
 
 
-def allowed_tool_names() -> list[str]:
-    """List of MCP-qualified tool names for ClaudeAgentOptions.allowed_tools."""
-    return [f"mcp__{MCP_SERVER_NAME}__{t.name}" for t in ALL_TOOLS]
+def build_server(role: str = "orch"):
+    """Build the Alor MCP server for the given role.
+
+    Default is "orch" for backwards compatibility with callers that
+    predate the worker-side surface.
+    """
+    return create_sdk_mcp_server(
+        name=MCP_SERVER_NAME, tools=_tools_for_role(role)
+    )
+
+
+def allowed_tool_names(role: str = "orch") -> list[str]:
+    """MCP-qualified tool names for ClaudeAgentOptions.allowed_tools.
+
+    Matches the tool set returned by `build_server(role)` so the
+    allow-list and the server surface stay in sync.
+    """
+    return [
+        f"mcp__{MCP_SERVER_NAME}__{t.name}" for t in _tools_for_role(role)
+    ]

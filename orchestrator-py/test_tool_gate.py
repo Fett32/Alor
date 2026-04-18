@@ -41,7 +41,11 @@ from claude_agent_sdk import (  # noqa: E402
     PermissionResultDeny,
 )
 
-from tool_gate import HOST_UI_TOOLS, make_gate  # noqa: E402
+from tool_gate import (  # noqa: E402
+    HOST_UI_TOOLS,
+    ORCHESTRATOR_AGENT_IDS,
+    make_gate,
+)
 
 
 def assert_eq(label: str, got, want) -> None:
@@ -195,10 +199,12 @@ async def test_worker_allows_common_tools() -> None:
         "WebFetch",
         "TodoWrite",
         "NotebookEdit",
-        # Alor's own MCP tools — should never be gated.
-        "mcp__alor__task_create",
-        "mcp__alor__agent_send_message",
-        # Made-up name — anything not in HOST_UI_TOOLS is allow.
+        # Worker-accessible Alor MCP tools — should never be gated.
+        "mcp__alor__agent_spawn",
+        "mcp__alor__agent_list",
+        "mcp__alor__agent_ensure_running",
+        "mcp__alor__agent_kill",
+        # Made-up name — anything unknown is allow by default.
         "some_future_tool_nobody_has_heard_of_yet",
     ):
         result = await call_gate(gate, name, {"x": 1})
@@ -208,7 +214,21 @@ async def test_worker_allows_common_tools() -> None:
 
 async def test_orch_allows_common_tools() -> None:
     gate = make_gate("orch")
-    for name in ("Bash", "Read", "Edit", "Write", "Grep", "Glob"):
+    for name in (
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "Grep",
+        "Glob",
+        # Orch sees every Alor MCP tool.
+        "mcp__alor__task_create",
+        "mcp__alor__task_assign",
+        "mcp__alor__task_cancel",
+        "mcp__alor__project_get",
+        "mcp__alor__memory_get",
+        "mcp__alor__agent_send_message",
+    ):
         result = await call_gate(gate, name, {})
         assert_is(f"orch {name} -> Allow", result, PermissionResultAllow)
 
@@ -224,6 +244,126 @@ async def test_push_notification_not_gated() -> None:
     gate = make_gate("worker")
     result = await call_gate(gate, "PushNotification", {"message": "x", "status": "proactive"})
     assert_is("PushNotification -> Allow (not gated)", result, PermissionResultAllow)
+
+
+# ---------------------------------------------------------------------------
+# Worker-role Alor MCP restrictions
+# ---------------------------------------------------------------------------
+
+
+async def test_worker_denies_orch_only_alor_tools() -> None:
+    """Worker gate must deny task_*/project_*/memory_* by name.
+
+    These are blocked structurally by tools.build_server("worker")
+    filtering them out, but the gate is belt-and-braces — a copy/paste
+    regression that loaded the full server for a worker shouldn't
+    actually let the tool execute.
+    """
+    gate = make_gate("worker")
+    for bare in (
+        "task_create",
+        "task_assign",
+        "task_cancel",
+        "task_get",
+        "task_list",
+        "project_get",
+        "project_list",
+        "memory_get",
+    ):
+        # Both the qualified MCP name and the bare name should deny —
+        # the gate strips the prefix before looking up.
+        for name in (f"mcp__alor__{bare}", bare):
+            result = await call_gate(gate, name, {})
+            assert_is(
+                f"worker {name} -> Deny (orch-only)", result, PermissionResultDeny
+            )
+            assert_eq(
+                f"worker {name} deny mentions '{bare}'",
+                bare in result.message,
+                True,
+            )
+            assert_eq(
+                f"worker {name} deny mentions orch-only nature",
+                "orchestrator-only" in result.message,
+                True,
+            )
+
+
+async def test_worker_allows_the_five_worker_accessible_tools() -> None:
+    gate = make_gate("worker")
+    for bare in (
+        "agent_spawn",
+        "agent_list",
+        "agent_ensure_running",
+        "agent_kill",
+    ):
+        name = f"mcp__alor__{bare}"
+        result = await call_gate(gate, name, {})
+        assert_is(f"worker {name} -> Allow", result, PermissionResultAllow)
+    # agent_send_message with a non-orchestrator target allows:
+    result = await call_gate(
+        gate,
+        "mcp__alor__agent_send_message",
+        {"agent_id": "codex-debug-test", "text": "hi"},
+    )
+    assert_is(
+        "worker agent_send_message to non-orch target -> Allow",
+        result,
+        PermissionResultAllow,
+    )
+
+
+async def test_worker_cannot_send_to_orchestrator() -> None:
+    """Worker-origin agent_send_message to any orchestrator agent_id
+    is denied so workers can't inject prompts into the orch's SDK."""
+    gate = make_gate("worker")
+    for orch_id in ORCHESTRATOR_AGENT_IDS:
+        result = await call_gate(
+            gate,
+            "mcp__alor__agent_send_message",
+            {"agent_id": orch_id, "text": "poisoned prompt"},
+        )
+        assert_is(
+            f"worker send_message -> {orch_id}: Deny",
+            result,
+            PermissionResultDeny,
+        )
+        assert_eq(
+            f"worker send_message deny names target '{orch_id}'",
+            orch_id in result.message,
+            True,
+        )
+        assert_eq(
+            f"worker send_message deny mentions injection risk",
+            "injection" in result.message.lower(),
+            True,
+        )
+
+
+async def test_orch_unrestricted_on_alor_tools() -> None:
+    """Orch role keeps full Alor MCP access — no regression."""
+    gate = make_gate("orch")
+    for bare in (
+        "task_create",
+        "task_assign",
+        "task_cancel",
+        "agent_spawn",
+        "agent_send_message",
+        "project_get",
+        "memory_get",
+    ):
+        name = f"mcp__alor__{bare}"
+        # Orch role: agent_send_message to orch-self is allowed
+        # (orch can address its own slot; nothing to prevent).
+        result = await call_gate(
+            gate, name, {"agent_id": "claude-alor", "text": "x"}
+        )
+        assert_is(f"orch {name} -> Allow", result, PermissionResultAllow)
+
+
+# ---------------------------------------------------------------------------
+# PushNotification / Worktree tools (unchanged behavior)
+# ---------------------------------------------------------------------------
 
 
 async def test_worktree_tools_not_gated() -> None:
@@ -257,6 +397,11 @@ async def main() -> int:
 
     await test_worker_allows_common_tools()
     await test_orch_allows_common_tools()
+
+    await test_worker_denies_orch_only_alor_tools()
+    await test_worker_allows_the_five_worker_accessible_tools()
+    await test_worker_cannot_send_to_orchestrator()
+    await test_orch_unrestricted_on_alor_tools()
 
     await test_push_notification_not_gated()
     await test_worktree_tools_not_gated()

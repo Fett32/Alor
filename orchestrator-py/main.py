@@ -190,11 +190,15 @@ async def main() -> int:
     system_prompt = load_system_prompt()
     model = DEFAULT_MODEL
 
-    alor_server = tools.build_server()
+    # Orchestrator sees the full Alor MCP surface (13 tools). Workers
+    # get a restricted subset; see tools.WORKER_ACCESSIBLE_TOOLS and
+    # worker.py. Role is passed explicitly even though "orch" is the
+    # default so the split is visible at this call site.
+    alor_server = tools.build_server("orch")
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         mcp_servers={"alor": alor_server},
-        allowed_tools=tools.allowed_tool_names(),
+        allowed_tools=tools.allowed_tool_names("orch"),
         disallowed_tools=["ToolSearch"],
         model=model,
         setting_sources=[],

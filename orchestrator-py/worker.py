@@ -35,6 +35,7 @@ from common import (
     C_BLUE, C_CYAN, C_DIM, C_GREEN, C_RED, C_RESET, C_YELLOW,
     banner, print_footer, process_response, read_line,
 )
+import tools
 from tool_gate import make_gate
 
 DEFAULT_MODEL = os.environ.get("ALOR_WORKER_MODEL", "claude-opus-4-7[1m]")
@@ -541,17 +542,26 @@ async def main() -> int:
 
     system_prompt = render_prompt(args.agent_id, args.project, workdir, args.model)
 
+    # Worker-restricted Alor MCP surface: agent_spawn, agent_list,
+    # agent_ensure_running, agent_send_message, agent_kill. Lets a
+    # worker do end-to-end live verification (spawn test instance →
+    # poll state → message it → clean up) without routing through
+    # the orchestrator. Task lifecycle, project profiles, and Memory
+    # Hub remain orch-only — filtered out by tools.build_server("worker")
+    # and double-denied by make_gate("worker") for defense-in-depth.
+    alor_server = tools.build_server("worker")
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=args.model,
         setting_sources=["project"],   # picks up project-level CLAUDE.md
         permission_mode="bypassPermissions",
         cwd=workdir,
+        mcp_servers={tools.MCP_SERVER_NAME: alor_server},
+        allowed_tools=tools.allowed_tool_names("worker"),
         # Deny host-UI-dependent tools (AskUserQuestion, EnterPlanMode,
         # ExitPlanMode) with a typed message pointing at task.blocked /
-        # final summary. See tool_gate.py — without this, the worker
-        # would hit an opaque `"Answer questions?"` tool_result error
-        # and plow past the ask-user moment blind.
+        # final summary. Also denies worker-role attempts at orch-only
+        # Alor tools + worker→orch agent_send_message. See tool_gate.py.
         can_use_tool=make_gate("worker"),
     )
 
