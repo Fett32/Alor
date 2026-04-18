@@ -4,11 +4,22 @@ mod tray;
 mod wrapper;
 mod terminal;
 
+// Narrow public surface for integration tests under `src-tauri/tests/`.
+// Keeping the modules themselves private (the norm for a Tauri app
+// binary crate) and re-exporting only the types the integration
+// suite needs keeps the public API intentional: if something isn't
+// listed below, it's crate-internal and can change without breaking
+// external callers. Production consumers (`main.rs` + Tauri-managed
+// state) still reach these via their module paths.
+pub use daemon::state::AppState;
+pub use terminal::pane_manager::{
+    PaneManager, ReconcileReport, DEFAULT_MAIN_SESSION,
+};
+pub use wrapper::server::SocketServer;
+
 use tauri::{Emitter, Listener, Manager, WindowEvent};
 use terminal::bridge::TerminalBridge;
-use terminal::pane_manager::PaneManager;
 use tracing_subscriber::{fmt, EnvFilter};
-use wrapper::server::SocketServer;
 
 pub fn run() {
     // Init tracing: ALOR_LOG=debug or default info
