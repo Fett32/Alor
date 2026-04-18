@@ -28,6 +28,7 @@ from common import (
     C_BLUE, C_CYAN, C_DIM, C_GREEN, C_RED, C_RESET, C_YELLOW,
     banner, print_footer, process_response, read_line,
 )
+from tool_gate import make_gate
 
 DEFAULT_MODEL = os.environ.get("ALOR_WORKER_MODEL", "claude-opus-4-7[1m]")
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "worker_prompt.md"
@@ -539,6 +540,12 @@ async def main() -> int:
         setting_sources=["project"],   # picks up project-level CLAUDE.md
         permission_mode="bypassPermissions",
         cwd=workdir,
+        # Deny host-UI-dependent tools (AskUserQuestion, EnterPlanMode,
+        # ExitPlanMode) with a typed message pointing at task.blocked /
+        # final summary. See tool_gate.py — without this, the worker
+        # would hit an opaque `"Answer questions?"` tool_result error
+        # and plow past the ask-user moment blind.
+        can_use_tool=make_gate("worker"),
     )
 
     banner(

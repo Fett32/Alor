@@ -23,6 +23,7 @@ from common import (
     C_CYAN, C_DIM, C_RED, C_RESET,
     banner, print_footer, process_response, read_line,
 )
+from tool_gate import make_gate
 
 DEFAULT_MODEL = os.environ.get("ALOR_ORCHESTRATOR_MODEL", "claude-opus-4-7[1m]")
 PROMPT_PATH = Path(os.environ["HOME"]) / ".config" / "alor" / "orchestrator_prompt.md"
@@ -188,6 +189,12 @@ async def main() -> int:
         setting_sources=[],
         permission_mode="bypassPermissions",
         cwd=os.path.expanduser("~/Projects/Alor"),
+        # Deny host-UI-dependent tools (AskUserQuestion, EnterPlanMode,
+        # ExitPlanMode) with a typed message pointing at assistant-text
+        # prompting. See tool_gate.py — Fett reads the orch conversation
+        # live, so the orch can just ask directly instead of invoking
+        # a CC-TUI-only tool that silently drops.
+        can_use_tool=make_gate("orch"),
     )
 
     banner(
