@@ -152,22 +152,28 @@ pub fn run() {
             // Auto-launch wrappers for agents with autolaunch: true OR existing sessions.
             let configs_for_launch = agent_configs;
             let pm_recovery = pane_manager.clone();
+            let app_state_recovery = app_state.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(300));
 
-                // Kill stale wrapper processes from previous daemon runs
+                // Kill stale wrapper processes from previous daemon runs.
+                // The saved PID file at this point may include both
+                // yaml-slot wrappers AND template-instance wrappers from
+                // the previous boot (see second-pass save below).
                 daemon::session::kill_stale_wrappers();
                 std::thread::sleep(std::time::Duration::from_millis(200));
 
-                // Recovery: identify agents that have existing tmux sessions.
+                // ---- Pass 1: yaml-registered fixed slots ----
+                //
+                // Identify agents that have existing tmux sessions.
                 // Templates are recipes, not slots — never reclaim them
                 // even if `session_exists` were to misfire.  SDK-runtime
                 // workers also self-heal: their Python process reconnects
                 // to the new daemon socket on its own. Launching an
                 // alor-wrapper for them causes a duplicate registration
                 // collision that the daemon rejects.
-                let mut to_launch = Vec::new();
-                for (id, cfg) in configs_for_launch {
+                let mut yaml_to_launch = Vec::new();
+                for (id, cfg) in &configs_for_launch {
                     if cfg.template {
                         continue;
                     }
@@ -185,13 +191,98 @@ pub fn run() {
                         if exists {
                             tracing::info!(agent_id = %id, "reclaiming existing tmux session");
                         }
-                        to_launch.push((id, cfg));
+                        yaml_to_launch.push((id.clone(), cfg.clone()));
                     }
                 }
 
-                let mut children = daemon::config::launch_wrappers(&to_launch);
+                let mut children = daemon::config::launch_wrappers(&yaml_to_launch);
 
-                // Record child PIDs so next daemon startup can kill them.
+                // ---- Pass 2: wrapper-runtime template-spawned instances ----
+                //
+                // Template instances (e.g. `codex-alor`, `gemini-mandaforge`)
+                // live only in state.json with a `template` back-reference
+                // — they have no yaml of their own. The yaml loop above
+                // skips them. Daemon-spawned Child processes die on restart;
+                // tmux sessions survive (tmux is its own daemon). This pass
+                // relaunches the alor-wrapper so it reconnects to the
+                // orphaned tmux session and re-registers with the daemon.
+                //
+                // claude-sdk template instances are skipped for the same
+                // reason as in pass 1: the python worker self-reconnects
+                // via its own socket path.
+                //
+                // Reclaim policy: if the tmux session is gone, we treat
+                // that as user-intentional (explicit `tmux kill-session`
+                // or `kill_agent`) and do NOT resurrect — matches the
+                // fixed-slot behavior where a killed session stays dead
+                // until explicitly ensured-running.
+                //
+                // TEST_PLAN for post-restart verification:
+                //   Pre-restart:
+                //     agent_spawn(agent="codex", project="alor",
+                //                 working_dir="~/Projects/Alor")
+                //     - confirm state.json has codex-alor with
+                //       template=Some("codex")
+                //     - confirm wrapper is running, codex-alor shows
+                //       connected=true in agent_list
+                //   Restart Alor.
+                //   Post-restart:
+                //     - confirm wrapper for codex-alor auto-spawns
+                //       (no manual agent_ensure_running)
+                //     - confirm agent_list still shows codex-alor
+                //       connected=true within ~5s of restart
+                //     - bonus: kill wrapper PID while keeping tmux
+                //       session alive, restart again, verify next
+                //       startup reclaims it again
+                let mut tmpl_to_launch = Vec::new();
+                for agent in app_state_recovery.all_agents() {
+                    let template_id = match agent.template.as_deref() {
+                        Some(t) => t,
+                        None => continue, // fixed-slot descendant; pass 1 handled it
+                    };
+                    let tmpl_cfg = match configs_for_launch.iter().find(|(id, _)| id == template_id) {
+                        Some((_, cfg)) => cfg,
+                        None => {
+                            tracing::warn!(
+                                agent_id = %agent.id,
+                                template = %template_id,
+                                "template-backed instance references a missing template; skipping reclaim"
+                            );
+                            continue;
+                        }
+                    };
+                    if tmpl_cfg.runtime == "claude-sdk" {
+                        tracing::debug!(
+                            agent_id = %agent.id,
+                            "skipping reclaim for claude-sdk template instance"
+                        );
+                        continue;
+                    }
+                    let session_name = format!("alor-{}", agent.id);
+                    let exists = tauri::async_runtime::block_on(pm_recovery.session_exists(&session_name));
+                    if !exists {
+                        // User killed the session; don't resurrect.
+                        continue;
+                    }
+                    // Clone the template config and overlay the instance's
+                    // persisted working_dir so the wrapper launches with
+                    // the right cwd — the instance was parameterized
+                    // specifically for that project.
+                    let mut effective = tmpl_cfg.clone();
+                    if let Some(wd) = agent.working_dir.clone() {
+                        effective.working_dir = Some(wd);
+                    }
+                    tracing::info!(
+                        agent_id = %agent.id,
+                        template = %template_id,
+                        "reclaiming wrapper-runtime template instance"
+                    );
+                    tmpl_to_launch.push((agent.id.clone(), effective));
+                }
+                children.extend(daemon::config::launch_wrappers(&tmpl_to_launch));
+
+                // Record all child PIDs (yaml + template-instance) so
+                // next daemon startup can kill them.
                 let pids: Vec<u32> = children.iter().map(|(_, c)| c.id()).collect();
                 if let Err(e) = daemon::session::save_wrapper_pids(&pids) {
                     tracing::warn!("failed to save wrapper PIDs: {e}");
