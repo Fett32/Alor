@@ -178,8 +178,19 @@ class AgentClient:
         try:
             self._writer.write(frame)
             await self._writer.drain()
-        except (BrokenPipeError, ConnectionResetError, ConnectionError) as e:
+        except OSError as e:
             # Socket died. Stash and let the reconnect path replay.
+            #
+            # OSError is the common parent of every transport failure
+            # Python raises on a dead Unix socket:
+            #   - BrokenPipeError / ConnectionResetError / ConnectionError
+            #     (previous narrow tuple — all subclasses of OSError).
+            #   - Plain `OSError(errno=EPIPE/EBADF/ENOTCONN/EIO/...)` —
+            #     the variants that slipped through the narrow tuple
+            #     during a daemon reboot and dropped the frame on the
+            #     floor without queuing.
+            # Not broadening to `Exception`: real programming bugs
+            # (KeyError, TypeError, etc.) should still surface.
             print(
                 f"[agent_client] send {kind} failed ({e!r}); "
                 f"queued ({len(frame)} bytes, {self.pending_count() + 1} pending)",
@@ -203,7 +214,10 @@ class AgentClient:
             try:
                 self._writer.write(frame)
                 await self._writer.drain()
-            except (BrokenPipeError, ConnectionResetError, ConnectionError) as e:
+            except OSError as e:
+                # Same rationale as `send` — catch the OSError family
+                # (covers ConnectionError subclasses and plain errno
+                # variants), leave real programming bugs to propagate.
                 print(
                     f"[agent_client] flush stalled after {sent} frame(s) "
                     f"({e!r}); {self.pending_count()} still queued",

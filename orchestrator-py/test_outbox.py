@@ -63,18 +63,26 @@ class DeadWriterOnDrain:
     """StreamWriter that accepts writes but fails on drain.
 
     Mimics the real failure shape: asyncio buffers the write and surfaces
-    the dead socket on the subsequent drain(). `exc_cls` is instantiable
-    with a single string message.
+    the dead socket on the subsequent drain(). Either pass `exc_cls` for
+    a simple no-arg exception, or `exc_factory` for a parameterized one
+    (e.g. `lambda: OSError(errno.EPIPE, "broken pipe")`).
     """
 
-    def __init__(self, exc_cls: type[BaseException] = BrokenPipeError) -> None:
+    def __init__(
+        self,
+        exc_cls: type[BaseException] = BrokenPipeError,
+        exc_factory: Any = None,
+    ) -> None:
         self.writes: list[bytes] = []
         self._exc_cls = exc_cls
+        self._exc_factory = exc_factory
 
     def write(self, frame: bytes) -> None:
         self.writes.append(frame)
 
     async def drain(self) -> None:
+        if self._exc_factory is not None:
+            raise self._exc_factory()
         raise self._exc_cls("simulated dead socket")
 
     def close(self) -> None:
@@ -184,6 +192,7 @@ async def test_send_before_connect_enqueues() -> None:
 
 
 async def test_all_exception_types_caught() -> None:
+    # ConnectionError family — the original narrow catch.
     for exc_cls in (BrokenPipeError, ConnectionResetError, ConnectionError):
         w = DeadWriterOnDrain(exc_cls)
         sock = make_client(w)
@@ -192,6 +201,29 @@ async def test_all_exception_types_caught() -> None:
             f"exc {exc_cls.__name__}: pending_count",
             sock.pending_count(),
             1,
+        )
+
+    # Plain OSError variants. Regression test for the dropped-completion
+    # bug: during a daemon reboot, drain() can raise a bare OSError
+    # (not a ConnectionError subclass) with any of these errnos, and
+    # the old narrow catch let the frame escape unqueued.
+    import errno
+
+    for eno in (errno.EPIPE, errno.EBADF, errno.ENOTCONN, errno.EIO):
+        w = DeadWriterOnDrain(
+            exc_factory=lambda e=eno: OSError(e, f"errno {e}"),
+        )
+        sock = make_client(w)
+        await sock.send_complete("task-reboot", summary="done")
+        check(
+            f"exc OSError(errno={eno}): pending_count",
+            sock.pending_count(),
+            1,
+        )
+        check(
+            f"exc OSError(errno={eno}): frame is task.complete",
+            decode(sock._outbox[0])["type"],
+            "task.complete",
         )
 
 
