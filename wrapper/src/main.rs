@@ -283,42 +283,87 @@ async fn run_main() -> Result<()> {
         wargs.command.as_deref(),
     )?;
 
-    // First-launch setup on freshly-created sessions. Two independent
-    // concerns, now split so the trust-ack runs for every wrapper-runtime
-    // agent (not only those with a startup_file attached):
+    // First-launch setup. Two independent concerns, now cleanly split
+    // so trust-ack polling runs for every wrapper-runtime agent — NOT
+    // only fresh sessions (the old gating missed re-spawns with a
+    // still-stuck dialog and the lib.rs auto-reclaim path where
+    // freshly_created is always false).
     //
-    //   1. Trust-dialog auto-ack — always run. Each runtime CLI phrases
-    //      its trust-folder dialog differently; per-kind `trust_prompt_hints()`
-    //      / `trust_ack_key()` in detector.rs own the data. ClaudeCode
-    //      and Default have empty hints, which make this block a no-op.
+    //   1. Trust-ack polling — ALWAYS runs when the runtime has
+    //      prompt_acks entries. Loop captures the pane every 500ms;
+    //      on a hint match, sends the paired ack key and keeps
+    //      polling so a follow-up prompt (codex update → trust) gets
+    //      picked up. Fast-exits after 4 consecutive no-hit polls
+    //      (~2s of stable pane) so idle sessions aren't penalized.
+    //      Hard cap at 30 polls (~15s) for pathological slow boots.
     //
-    //   2. Briefing injection — only runs when `--startup-file` is set.
-    //      Same "wait for prompt, read file, send-keys" flow as before.
-    if freshly_created {
-        // Boot grace — give the CLI time to render its initial screen,
-        // including any trust dialog, before we start capturing.
-        sleep(Duration::from_secs(3)).await;
-
-        // Trust-dialog auto-ack (runs for every fresh session).
-        let hints = kind.trust_prompt_hints();
-        if !hints.is_empty() {
-            match tmux::capture_pane(&session, 10) {
-                Ok(lines) => {
-                    let hit = lines
-                        .iter()
-                        .any(|l| hints.iter().any(|h| l.contains(h)));
-                    if hit {
-                        let ack = kind.trust_ack_key();
-                        info!(ack, "detected trust prompt, sending ack key");
-                        let _ = tmux::send_keys(&session, ack);
-                        sleep(Duration::from_millis(500)).await;
+    //   2. Briefing injection — STILL runs only on fresh sessions
+    //      with --startup-file. Unchanged.
+    let prompts = kind.prompt_acks();
+    if !prompts.is_empty() {
+        const MAX_POLLS: u32 = 30;            // 30 × 500ms = 15s max
+        const STABLE_THRESHOLD: u32 = 4;      // 4 polls (~2s) with no hit → done
+        let mut no_hit_streak: u32 = 0;
+        let mut acked_any = false;
+        for attempt in 0..MAX_POLLS {
+            sleep(Duration::from_millis(500)).await;
+            let lines = match tmux::capture_pane(&session, 30) {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!(
+                        error = ?e,
+                        attempt,
+                        "capture_pane failed during trust-ack poll"
+                    );
+                    no_hit_streak += 1;
+                    if no_hit_streak >= STABLE_THRESHOLD {
+                        break;
                     }
+                    continue;
                 }
-                Err(e) => warn!("initial capture failed: {e:#}"),
+            };
+            // First-match-wins across the ordered prompt list. The
+            // continue after an ack lets the next poll re-capture and
+            // catch any follow-up prompt.
+            let mut acked = false;
+            for (hint, ack) in prompts {
+                if lines.iter().any(|l| l.contains(hint)) {
+                    info!(
+                        hint,
+                        ack,
+                        attempt,
+                        "trust prompt visible; sending ack key"
+                    );
+                    if let Err(e) = tmux::send_keys(&session, ack) {
+                        warn!(error = ?e, hint, "send_keys failed during trust-ack");
+                    }
+                    acked = true;
+                    acked_any = true;
+                    break;
+                }
+            }
+            if acked {
+                no_hit_streak = 0;
+            } else {
+                no_hit_streak += 1;
+                if no_hit_streak >= STABLE_THRESHOLD {
+                    break;
+                }
             }
         }
+        if !acked_any {
+            info!(
+                kind = ?kind,
+                "no trust prompt observed during startup window; proceeding"
+            );
+        }
+    }
 
-        // Briefing injection (runs only when a startup file is attached).
+    // Briefing injection — still gated on freshly_created AND
+    // startup_file. Runs after trust-ack polling completes so the
+    // briefing lands at the CLI's real input prompt, not on top of
+    // a lingering trust dialog.
+    if freshly_created {
         if let Some(ref startup_path) = wargs.startup_file {
             info!(startup_path, "handling startup briefing...");
 
