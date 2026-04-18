@@ -1,11 +1,14 @@
 use regex::Regex;
 
-/// Known agent types with their idle-prompt patterns.
+/// Known agent types with their idle-prompt patterns and trust-dialog
+/// handling data. Adding a new runtime is a single match-arm addition
+/// per method — no callsite changes elsewhere.
 #[derive(Debug, Clone)]
 pub enum AgentKind {
     ClaudeCode,
     Codex,
     Gemini,
+    Cursor,
     /// Generic shell or unknown agent.
     Default,
 }
@@ -20,6 +23,8 @@ impl AgentKind {
             AgentKind::Codex
         } else if lower.contains("gemini") {
             AgentKind::Gemini
+        } else if lower.contains("cursor") {
+            AgentKind::Cursor
         } else {
             AgentKind::Default
         }
@@ -31,7 +36,57 @@ impl AgentKind {
             AgentKind::Codex => r"^codex>",
             // Gemini CLI shows " >   Type your message" as its idle prompt.
             AgentKind::Gemini => r"^\s*>\s+(Type your message|$)",
+            // Cursor uses an alt-screen TUI with no traditional trailing
+            // prompt. Closest stable signal is the persistent
+            // "Composer <model>" footer line. Live-probe during
+            // consolidation task showed this line present in idle state.
+            // KNOWN SOFT SPOT: if `Composer` also renders during
+            // generation (unconfirmed in prod), idle detection could
+            // false-fire mid-task and emit a premature task-complete.
+            // Worth revisiting once cursor workers see real traffic;
+            // the first agent to hit this will surface it.
+            AgentKind::Cursor => r"^\s*Composer\s",
             AgentKind::Default => r"^[\$>\+]\s*$",
+        }
+    }
+
+    /// Substring hints for matching the runtime's first-launch
+    /// trust-folder dialog. Per-runtime because each CLI phrases the
+    /// dialog differently; returning an empty slice means "no dialog
+    /// expected, skip the trust-ack step."
+    ///
+    /// Kept as substrings (not regex) so lookups stay `str::contains`
+    /// cheap and the match is robust to minor TUI layout changes.
+    pub fn trust_prompt_hints(&self) -> &'static [&'static str] {
+        match self {
+            // ClaudeCode DOES show a trust dialog in practice ("Quick
+            // safety check: Is this a project you created..." with
+            // options "1. Yes, I trust this folder" / "2. No, exit"),
+            // but the Alor registry has no wrapper-runtime claude slot
+            // — all claude yamls route through the SDK worker via
+            // run-worker.sh which never hits the CLI's trust prompt.
+            // Intentionally empty so we don't add a false-positive
+            // match surface that'd be exercised by no real spawn.
+            // If a wrapper-runtime claude slot is ever added, flip
+            // this to `&["trust this folder"]` and add an ack-key.
+            AgentKind::ClaudeCode => &[],
+            AgentKind::Codex => &["trust this folder"],
+            AgentKind::Gemini => &["Trusting a folder"],
+            AgentKind::Cursor => &["Workspace Trust Required"],
+            AgentKind::Default => &[],
+        }
+    }
+
+    /// Key to inject to acknowledge the trust dialog when one of the
+    /// `trust_prompt_hints()` is matched. No-op for kinds with empty
+    /// hints — the caller never reaches this for them.
+    pub fn trust_ack_key(&self) -> &'static str {
+        match self {
+            AgentKind::ClaudeCode => "1", // unused; empty hints
+            AgentKind::Codex => "1",
+            AgentKind::Gemini => "1",
+            AgentKind::Cursor => "a",
+            AgentKind::Default => "", // unused; empty hints
         }
     }
 }
@@ -96,10 +151,81 @@ mod tests {
     }
 
     #[test]
+    fn cursor_idle() {
+        let d = IdleDetector::new(&AgentKind::Cursor);
+        // Persistent footer line captured from live cursor-agent probe.
+        assert!(d.is_idle(&lines(&["  Composer 2 Fast"])));
+        assert!(d.is_idle(&lines(&["Composer auto"])));
+        // Must not false-match arbitrary text even if "Composer" appears
+        // mid-line (word-start anchored via `^\s*`).
+        assert!(!d.is_idle(&lines(&["Running Composer 2 Fast now"])));
+        assert!(!d.is_idle(&lines(&["$ "])));
+        // Still rejects non-cursor idle prompts.
+        assert!(!d.is_idle(&lines(&["codex> "])));
+    }
+
+    #[test]
     fn default_idle() {
         let d = IdleDetector::new(&AgentKind::Default);
         assert!(d.is_idle(&lines(&["$ "])));
         assert!(d.is_idle(&lines(&["> "])));
         assert!(!d.is_idle(&lines(&["$ running something"])));
+    }
+
+    // ---- from_name routing ----
+
+    #[test]
+    fn from_name_routes_known_runtimes() {
+        assert!(matches!(AgentKind::from_name("claude"), AgentKind::ClaudeCode));
+        assert!(matches!(AgentKind::from_name("claude-alor"), AgentKind::ClaudeCode));
+        assert!(matches!(AgentKind::from_name("codex"), AgentKind::Codex));
+        assert!(matches!(AgentKind::from_name("codex-reviewer"), AgentKind::Codex));
+        assert!(matches!(AgentKind::from_name("gemini"), AgentKind::Gemini));
+        assert!(matches!(AgentKind::from_name("cursor"), AgentKind::Cursor));
+        assert!(matches!(AgentKind::from_name("cursor-agent"), AgentKind::Cursor));
+        assert!(matches!(AgentKind::from_name("weird-unknown"), AgentKind::Default));
+    }
+
+    // ---- trust-prompt data ----
+
+    #[test]
+    fn trust_prompt_hints_per_kind() {
+        // ClaudeCode intentionally empty — no wrapper-runtime claude
+        // slot exists in the registry; run-worker.sh path never hits
+        // the CLI's trust prompt.
+        assert_eq!(AgentKind::ClaudeCode.trust_prompt_hints(), &[] as &[&str]);
+
+        // Codex: the classic "Trust this folder" wording.
+        assert_eq!(
+            AgentKind::Codex.trust_prompt_hints(),
+            &["trust this folder"]
+        );
+
+        // Gemini: distinctive "Trusting a folder" dialog intro.
+        assert_eq!(
+            AgentKind::Gemini.trust_prompt_hints(),
+            &["Trusting a folder"]
+        );
+
+        // Cursor: box header "Workspace Trust Required" (confirmed via
+        // live probe in /tmp and $HOME — cursor re-prompts every
+        // session, doesn't persist trust state).
+        assert_eq!(
+            AgentKind::Cursor.trust_prompt_hints(),
+            &["Workspace Trust Required"]
+        );
+
+        assert_eq!(AgentKind::Default.trust_prompt_hints(), &[] as &[&str]);
+    }
+
+    #[test]
+    fn trust_ack_key_per_kind() {
+        assert_eq!(AgentKind::Codex.trust_ack_key(), "1");
+        assert_eq!(AgentKind::Gemini.trust_ack_key(), "1");
+        assert_eq!(AgentKind::Cursor.trust_ack_key(), "a");
+        // ClaudeCode + Default values exist but are unused because
+        // their hints are empty; locked anyway to prevent drift.
+        assert_eq!(AgentKind::ClaudeCode.trust_ack_key(), "1");
+        assert_eq!(AgentKind::Default.trust_ack_key(), "");
     }
 }

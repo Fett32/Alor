@@ -283,56 +283,75 @@ async fn run_main() -> Result<()> {
         wargs.command.as_deref(),
     )?;
 
-    // Inject startup file if provided AND session was freshly created.
+    // First-launch setup on freshly-created sessions. Two independent
+    // concerns, now split so the trust-ack runs for every wrapper-runtime
+    // agent (not only those with a startup_file attached):
+    //
+    //   1. Trust-dialog auto-ack — always run. Each runtime CLI phrases
+    //      its trust-folder dialog differently; per-kind `trust_prompt_hints()`
+    //      / `trust_ack_key()` in detector.rs own the data. ClaudeCode
+    //      and Default have empty hints, which make this block a no-op.
+    //
+    //   2. Briefing injection — only runs when `--startup-file` is set.
+    //      Same "wait for prompt, read file, send-keys" flow as before.
     if freshly_created {
-        if let Some(ref startup_path) = wargs.startup_file {
-        info!(startup_path, "handling startup briefing...");
-        
-        // 1. Give it a few seconds to boot the process
+        // Boot grace — give the CLI time to render its initial screen,
+        // including any trust dialog, before we start capturing.
         sleep(Duration::from_secs(3)).await;
 
-        // 2. Check for "Trust this folder" prompt
-        match tmux::capture_pane(&session, 10) {
-            Ok(lines) => {
-                if lines.iter().any(|l| l.contains("trust this folder")) {
-                    info!("detected trust prompt, sending '1'");
-                    let _ = tmux::send_keys(&session, "1");
-                    sleep(Duration::from_millis(500)).await;
-                }
-            }
-            Err(e) => warn!("initial capture failed: {e:#}"),
-        }
-
-        // 3. Wait for actual prompt (up to 15s)
-        let mut ready = false;
-        for i in 0..30 {
-            if let Ok(lines) = tmux::capture_pane(&session, 20) {
-                let text = lines.join("\n");
-                // Look for common prompts: " > ", "❯", "$ ", or "% "
-                if text.contains(" > ") || text.contains("❯") || text.contains("$ ") || text.contains("% ") {
-                    info!("detected prompt after {}ms, sending briefing", i * 500);
-                    ready = true;
-                    break;
-                }
-            }
-            sleep(Duration::from_millis(500)).await;
-        }
-
-        if ready {
-            match std::fs::read_to_string(startup_path) {
-                Ok(contents) => {
-                    if let Err(e) = tmux::send_keys(&session, &contents) {
-                        error!("failed to inject startup file: {e:#}");
+        // Trust-dialog auto-ack (runs for every fresh session).
+        let hints = kind.trust_prompt_hints();
+        if !hints.is_empty() {
+            match tmux::capture_pane(&session, 10) {
+                Ok(lines) => {
+                    let hit = lines
+                        .iter()
+                        .any(|l| hints.iter().any(|h| l.contains(h)));
+                    if hit {
+                        let ack = kind.trust_ack_key();
+                        info!(ack, "detected trust prompt, sending ack key");
+                        let _ = tmux::send_keys(&session, ack);
+                        sleep(Duration::from_millis(500)).await;
                     }
                 }
-                Err(e) => {
-                    error!(startup_path, "failed to read startup file: {e:#}");
-                }
+                Err(e) => warn!("initial capture failed: {e:#}"),
             }
-        } else {
-            warn!("timed out waiting for prompt, skipping briefing");
         }
-    }
+
+        // Briefing injection (runs only when a startup file is attached).
+        if let Some(ref startup_path) = wargs.startup_file {
+            info!(startup_path, "handling startup briefing...");
+
+            // Wait for the actual input prompt (up to 15s).
+            let mut ready = false;
+            for i in 0..30 {
+                if let Ok(lines) = tmux::capture_pane(&session, 20) {
+                    let text = lines.join("\n");
+                    // Look for common prompts: " > ", "❯", "$ ", or "% "
+                    if text.contains(" > ") || text.contains("❯") || text.contains("$ ") || text.contains("% ") {
+                        info!("detected prompt after {}ms, sending briefing", i * 500);
+                        ready = true;
+                        break;
+                    }
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+
+            if ready {
+                match std::fs::read_to_string(startup_path) {
+                    Ok(contents) => {
+                        if let Err(e) = tmux::send_keys(&session, &contents) {
+                            error!("failed to inject startup file: {e:#}");
+                        }
+                    }
+                    Err(e) => {
+                        error!(startup_path, "failed to read startup file: {e:#}");
+                    }
+                }
+            } else {
+                warn!("timed out waiting for prompt, skipping briefing");
+            }
+        }
     }
 
     // Initial connection.
