@@ -25,6 +25,7 @@ pub const MSG_ERROR: &str = "wrapper.error";
 pub const MSG_USER_INTERVENTION: &str = "user.intervention";
 pub const MSG_WORKER_USER_INPUT: &str = "worker.user_input";
 pub const MSG_WORKER_ORCH_RESPONSE: &str = "worker.orch_response";
+pub const MSG_WORKER_FRAME_WEDGED: &str = "worker.frame_wedged";
 pub const MSG_SHUTDOWN: &str = "daemon.shutdown";
 
 // Phase 9: CLI message types
@@ -270,6 +271,38 @@ pub struct WorkerOrchResponse {
     #[serde(default)]
     pub during_task: bool,
     /// Optional task_id for mid-task sends.
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
+}
+
+// ---------------------------------------------------------------------------
+// W→O  worker.frame_wedged — SDK worker dropped a stale BEGIN frame on
+//      nested-BEGIN recovery (see stdin_loop in orchestrator-py/worker.py)
+// ---------------------------------------------------------------------------
+
+/// Emitted when the worker's stdin state machine hits a BEGIN marker while
+/// already inside an unclosed frame. The previous frame's body is
+/// discarded (its orch caller will time out — same outcome as a lost END)
+/// and processing restarts on the new uuid. This event gives the orch a
+/// structured signal for the dropped frame so it can distinguish wedge
+/// timeouts from any other END-loss timeout.
+///
+/// The stale caller's pending `agent_send_message_await` matches
+/// `dropped_uuid` against its outstanding correlation_id to raise
+/// `FrameWedgedError` (Python) instead of returning a bare timeout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerFrameWedged {
+    pub agent_id: String,
+    /// uuid of the stale BEGIN whose body was discarded.
+    pub dropped_uuid: Uuid,
+    /// uuid of the nested BEGIN that triggered recovery (the new frame).
+    pub new_uuid: Uuid,
+    /// Total body bytes discarded (joined with '\n' as the worker would
+    /// have dispatched them). Useful for eyeballing wedge severity.
+    pub bytes_dropped: u64,
+    /// Number of buffered body lines discarded.
+    pub lines_dropped: u32,
+    /// task_id the stale frame was captured under, if the worker was mid-task.
     #[serde(default)]
     pub task_id: Option<Uuid>,
 }

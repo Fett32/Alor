@@ -43,11 +43,13 @@ class FakeClient:
 
 
 class FakeSock:
-    """Stand-in for AgentClient. Records orch_response + user_input calls."""
+    """Stand-in for AgentClient. Records orch_response + user_input +
+    frame_wedged calls."""
 
     def __init__(self) -> None:
         self.orch_responses: list[dict] = []
         self.user_inputs: list[dict] = []
+        self.frame_wedged: list[dict] = []
 
     async def send_worker_orch_response(
         self, *, correlation_id: str, text: str, during_task: bool, task_id: str | None
@@ -66,6 +68,25 @@ class FakeSock:
     ) -> None:
         self.user_inputs.append(
             {"text": text, "during_task": during_task, "task_id": task_id}
+        )
+
+    async def send_worker_frame_wedged(
+        self,
+        *,
+        dropped_uuid: str,
+        new_uuid: str,
+        bytes_dropped: int,
+        lines_dropped: int,
+        task_id: str | None,
+    ) -> None:
+        self.frame_wedged.append(
+            {
+                "dropped_uuid": dropped_uuid,
+                "new_uuid": new_uuid,
+                "bytes_dropped": bytes_dropped,
+                "lines_dropped": lines_dropped,
+                "task_id": task_id,
+            }
         )
 
 
@@ -203,6 +224,21 @@ async def main() -> int:
     # The nested-BEGIN warn line fired.
     saw_warn = any("nested BEGIN" in w for w in warnings)
     assert_eq("nested-BEGIN warning printed", saw_warn, True)
+
+    # Structured wedge event fires with the dropped frame's fields so the
+    # stale caller's orch-side await can attribute the drop instead of
+    # burning down to a plain timeout.
+    assert_eq("frame_wedged emitted once", len(sock.frame_wedged), 1)
+    fw = sock.frame_wedged[0]
+    assert_eq("frame_wedged.dropped_uuid is uuid_a", fw["dropped_uuid"], uuid_a)
+    assert_eq("frame_wedged.new_uuid is uuid_b", fw["new_uuid"], uuid_b)
+    # Body was two body_a lines joined with '\n' — 14+5+5 = not quite;
+    # compute from the source of truth: "body_a_line_1\nbody_a_line_2".
+    expected_bytes = len("body_a_line_1\nbody_a_line_2".encode("utf-8"))
+    assert_eq("frame_wedged.bytes_dropped matches joined body", fw["bytes_dropped"], expected_bytes)
+    assert_eq("frame_wedged.lines_dropped is 2", fw["lines_dropped"], 2)
+    # No active task in the scenario.
+    assert_eq("frame_wedged.task_id is None", fw["task_id"], None)
 
     print()
     print("PASS — BEGIN-without-END wedge recovery works as specified.")

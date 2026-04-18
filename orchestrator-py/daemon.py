@@ -35,6 +35,48 @@ class DaemonError(RuntimeError):
 ERR_CODE_FRAMED_SEND_NOT_SUPPORTED = "framed_send_not_supported"
 
 
+class FrameWedgedError(DaemonError):
+    """Raised when the worker dropped the stale BEGIN frame carrying this
+    `agent_send_message_await` caller's correlation_id before the matching
+    END arrived.
+
+    Triggered by the worker.py stdin state machine's nested-BEGIN recovery
+    path: a second `agent_send_message` landed against the same worker
+    while this caller's frame was still open, so the worker discarded this
+    body and swapped to the new uuid. The SDK turn this caller was waiting
+    on never ran — no retry-safe state was mutated on the worker side.
+
+    Attributes:
+        dropped_uuid: correlation_id of the dropped frame (== this caller's).
+        new_uuid: correlation_id of the frame that interrupted us.
+        bytes_dropped / lines_dropped: body size stats, mostly for logging.
+        agent_id / task_id: as-reported by the worker event.
+
+    Retry is usually safe and usually the right call, but scheduling is up
+    to the caller — re-running immediately just risks wedging again if the
+    same competing caller is still active.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        dropped_uuid: str,
+        new_uuid: str,
+        bytes_dropped: int,
+        lines_dropped: int,
+        agent_id: str | None,
+        task_id: str | None,
+    ) -> None:
+        super().__init__(message)
+        self.dropped_uuid = dropped_uuid
+        self.new_uuid = new_uuid
+        self.bytes_dropped = bytes_dropped
+        self.lines_dropped = lines_dropped
+        self.agent_id = agent_id
+        self.task_id = task_id
+
+
 class FramedSendNotSupportedError(DaemonError):
     """Raised when `cli.agent.send_message` with `suppress_echo=true`
     targets an agent whose runtime can't decode BEGIN/END framing.
@@ -212,6 +254,14 @@ async def agent_send_message_await(
     timeout (it's a valid outcome: worker busy / SDK stalled / reply got
     dropped).
 
+    Raises `FrameWedgedError` (a DaemonError subclass) if the worker emits
+    a `worker.frame_wedged` event carrying this call's correlation_id as
+    its `dropped_uuid` — i.e. a nested BEGIN arrived and the worker threw
+    away our body without running the SDK turn. That's a distinct outcome
+    from a vanilla timeout and retry is generally safe; see the exception
+    class docstring. Also raises `FramedSendNotSupportedError` if the
+    underlying send hits the runtime gate.
+
     Implementation: opens its own `cli.event.stream` subscription BEFORE
     firing the send to close the race window where the reply fires before
     we subscribe. The orch's primary event_watcher is unaffected — the
@@ -276,9 +326,30 @@ async def agent_send_message_await(
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
             payload = env.get("payload") or {}
-            if payload.get("event") != "worker.orch_response":
-                continue
+            event = payload.get("event")
             data = payload.get("data") or {}
+
+            # Wedge signal: the worker discarded our frame on a
+            # nested-BEGIN recovery. Surface a typed error instead of
+            # letting the await burn down to timeout and pretending we
+            # don't know what happened.
+            if event == "worker.frame_wedged" and data.get("dropped_uuid") == corrid:
+                raise FrameWedgedError(
+                    f"frame wedged on agent {data.get('agent_id') or '?'}: "
+                    f"our BEGIN ({corrid[:8]}) was discarded mid-send by a "
+                    f"nested BEGIN ({(data.get('new_uuid') or '?')[:8]}); "
+                    f"{data.get('bytes_dropped', 0)} body bytes dropped, "
+                    "SDK turn never ran — retry is safe",
+                    dropped_uuid=corrid,
+                    new_uuid=data.get("new_uuid") or "",
+                    bytes_dropped=int(data.get("bytes_dropped") or 0),
+                    lines_dropped=int(data.get("lines_dropped") or 0),
+                    agent_id=data.get("agent_id"),
+                    task_id=data.get("task_id"),
+                )
+
+            if event != "worker.orch_response":
+                continue
             if data.get("correlation_id") != corrid:
                 continue
             return {

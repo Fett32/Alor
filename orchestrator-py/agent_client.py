@@ -44,6 +44,7 @@ MSG_SHUTDOWN = "daemon.shutdown"
 MSG_USER_INTERVENTION = "user.intervention"
 MSG_WORKER_USER_INPUT = "worker.user_input"
 MSG_WORKER_ORCH_RESPONSE = "worker.orch_response"
+MSG_WORKER_FRAME_WEDGED = "worker.frame_wedged"
 
 
 class AgentClientError(RuntimeError):
@@ -281,6 +282,37 @@ class AgentClient:
         if task_id is not None:
             payload["task_id"] = task_id
         await self.send(MSG_WORKER_ORCH_RESPONSE, payload)
+
+    async def send_worker_frame_wedged(
+        self,
+        dropped_uuid: str,
+        new_uuid: str,
+        bytes_dropped: int,
+        lines_dropped: int,
+        task_id: str | None,
+    ) -> None:
+        """Tell the daemon a stale BEGIN frame was discarded by the stdin
+        state machine's nested-BEGIN recovery path.
+
+        Routes through the outbox like every other send_*, so an outage
+        during the wedge doesn't further compound the failure: the stale
+        caller's orch still surfaces a timeout (not a wedge), but the
+        event lands as soon as the daemon socket recovers.
+
+        `dropped_uuid` is the correlation_id the orch stamped into the
+        stale BEGIN; the orch matches on it to raise FrameWedgedError
+        against the right pending send.
+        """
+        payload: dict[str, Any] = {
+            "agent_id": self.agent_id,
+            "dropped_uuid": dropped_uuid,
+            "new_uuid": new_uuid,
+            "bytes_dropped": bytes_dropped,
+            "lines_dropped": lines_dropped,
+        }
+        if task_id is not None:
+            payload["task_id"] = task_id
+        await self.send(MSG_WORKER_FRAME_WEDGED, payload)
 
     async def send_status(
         self, task_id: str | None, alive: bool, details: str | None = None

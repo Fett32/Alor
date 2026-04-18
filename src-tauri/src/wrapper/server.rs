@@ -17,8 +17,8 @@ use crate::wrapper::protocol::{
     CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliDelete, CliKill, CliMemoryGet,
     CliProjectGet, CliProjectSave, CliSpawn, CliTaskCancel, CliTaskCreate,
     CliTaskComplete as CliTaskCompletePayload, CliTaskGet, Envelope, TaskAccept, TaskAssign,
-    TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WorkerOrchResponse,
-    WorkerUserInput, WrapperError, WrapperRegister, MSG_CLI_AGENT_ENSURE_RUNNING,
+    TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WorkerFrameWedged,
+    WorkerOrchResponse, WorkerUserInput, WrapperError, WrapperRegister, MSG_CLI_AGENT_ENSURE_RUNNING,
     MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_DELETE, MSG_CLI_ERROR,
     MSG_CLI_EVENT_STREAM, MSG_CLI_KILL, MSG_CLI_MEMORY_GET, MSG_CLI_PROJECT_GET,
     MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE, MSG_CLI_RESPONSE, MSG_CLI_SPAWN,
@@ -26,8 +26,8 @@ use crate::wrapper::protocol::{
     MSG_CLI_TASK_GET, MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER,
     MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
     MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
-    MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT, WORKER_ECHO_SENTINEL_BEGIN,
-    WORKER_ECHO_SENTINEL_END, ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
+    MSG_WORKER_FRAME_WEDGED, MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT,
+    WORKER_ECHO_SENTINEL_BEGIN, WORKER_ECHO_SENTINEL_END, ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -539,6 +539,37 @@ impl SocketServer {
                             "correlation_id": payload.correlation_id.to_string(),
                             "text": payload.text,
                             "during_task": payload.during_task,
+                            "task_id": payload.task_id.map(|t| t.to_string()),
+                        }),
+                    )
+                    .await;
+                }
+            }
+
+            MSG_WORKER_FRAME_WEDGED => {
+                // SDK worker dropped a stale BEGIN frame on nested-BEGIN
+                // recovery. Log loudly — this is the telemetry that lets us
+                // attribute a pending agent_send_message_await timeout to a
+                // wedge instead of a routine END-loss — and broadcast so
+                // orchestrator-py's await loop can surface a typed error.
+                if let Ok(payload) = env.decode_payload::<WorkerFrameWedged>() {
+                    warn!(
+                        agent_id,
+                        dropped_uuid = %payload.dropped_uuid,
+                        new_uuid = %payload.new_uuid,
+                        bytes_dropped = payload.bytes_dropped,
+                        lines_dropped = payload.lines_dropped,
+                        task_id = ?payload.task_id,
+                        "worker frame wedged — stale BEGIN discarded on nested-BEGIN recovery"
+                    );
+                    self.broadcast_event(
+                        "worker.frame_wedged",
+                        json!({
+                            "agent_id": agent_id,
+                            "dropped_uuid": payload.dropped_uuid.to_string(),
+                            "new_uuid": payload.new_uuid.to_string(),
+                            "bytes_dropped": payload.bytes_dropped,
+                            "lines_dropped": payload.lines_dropped,
                             "task_id": payload.task_id.map(|t| t.to_string()),
                         }),
                     )

@@ -411,12 +411,37 @@ async def stdin_loop(
             kind, marker_uuid = parse_frame_marker(raw_line)
             if kind == "begin" and marker_uuid:
                 stale_uuid = frame_uuid or "?"
+                lines_dropped = len(frame_buffer)
+                # Match the byte count the worker would have dispatched had
+                # the frame closed normally (body = "\n".join(buffer)).
+                bytes_dropped = len(
+                    "\n".join(frame_buffer).encode("utf-8")
+                )
                 print(
                     f"{C_YELLOW}[warn] nested BEGIN {marker_uuid[:8]} "
                     f"inside unclosed frame {stale_uuid[:8]} — discarding "
-                    f"{len(frame_buffer)} buffered line(s), restarting on "
+                    f"{lines_dropped} buffered line(s), restarting on "
                     f"new uuid{C_RESET}"
                 )
+                # Structured telemetry alongside the warn line. Lets the
+                # stale caller's orch distinguish a wedge-induced timeout
+                # from an ordinary END-loss timeout and attribute the drop.
+                # Fire-and-forget via the outbox — if the daemon is down
+                # we just queue, same as every other worker→orch send.
+                if stale_uuid != "?":
+                    try:
+                        await sock.send_worker_frame_wedged(
+                            dropped_uuid=stale_uuid,
+                            new_uuid=marker_uuid,
+                            bytes_dropped=bytes_dropped,
+                            lines_dropped=lines_dropped,
+                            task_id=frame_task_id,
+                        )
+                    except Exception as e:
+                        # Recovery must continue even if the send blows up.
+                        print(
+                            f"{C_RED}[frame_wedged send failed] {e}{C_RESET}"
+                        )
                 # Stay in_frame; swap uuid + buffer + task_id for the fresh
                 # frame. The orch that issued the stale BEGIN will time out
                 # on its own await — we can't resurrect that send.
