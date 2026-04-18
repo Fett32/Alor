@@ -246,16 +246,77 @@ impl PaneManager {
         Ok(())
     }
 
+    /// Returns true if tmux knows about a pane with this id.
+    /// Used to detect stale entries in the `panes` map (see
+    /// `add_agent_pane` idempotency check).
+    ///
+    /// `tmux display-message -t %id` is NOT usable for this —
+    /// invalid targets silently fall back to the current pane and
+    /// return success. `tmux list-panes -t %id` correctly exits
+    /// non-zero when the pane is gone.
+    pub(crate) async fn pane_exists(&self, pane_id: &str) -> bool {
+        Command::new("tmux")
+            .args(["list-panes", "-t", pane_id])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Test-only: seed a `panes` map entry without going through
+    /// `add_agent_pane` (which needs a live alor-main session). Lets
+    /// the stale-entry eviction test set up the preconditions.
+    #[cfg(test)]
+    pub(crate) async fn test_insert_pane(&self, agent_id: &str, pane_id: &str) {
+        self.panes.lock().await.insert(
+            agent_id.to_string(),
+            PaneInfo {
+                pane_id: pane_id.to_string(),
+                column: Some(0),
+            },
+        );
+    }
+
+    /// Test-only: expose whether an agent_id is currently tracked in
+    /// the map (without caring what the pane_id is).
+    #[cfg(test)]
+    pub(crate) async fn test_has_entry(&self, agent_id: &str) -> bool {
+        self.panes.lock().await.contains_key(agent_id)
+    }
+
     /// Add an agent's session as a pane in alor-main.
     /// The pane runs `tmux attach -t alor-<agent>` so the agent session
     /// stays durable even if alor-main is destroyed.
+    ///
+    /// Idempotent with stale-entry eviction: if the `panes` map
+    /// already tracks this agent, we verify the recorded pane still
+    /// exists in tmux before short-circuiting. External pane death —
+    /// the agent's tmux session crashes, its attach command exits,
+    /// the pane closes — leaves the map entry orphaned, which used
+    /// to cause the bug fixed by task 1ed52762: re-connecting agents
+    /// silently returned Ok here without ever adding a new pane, so
+    /// `connected: true` + sidebar row + working Kill button but no
+    /// pane in alor-main. Now we evict the stale entry and fall
+    /// through to the layout code.
     pub async fn add_agent_pane(&self, agent_id: &str) -> Result<()> {
         let mut panes = self.panes.lock().await;
 
-        // Already has a pane?
-        if panes.contains_key(agent_id) {
-            tracing::debug!(agent_id, "agent already has a pane in {MAIN_SESSION}");
-            return Ok(());
+        // Already has a tracked pane — verify it's still alive.
+        if let Some(info) = panes.get(agent_id).cloned() {
+            if self.pane_exists(&info.pane_id).await {
+                tracing::debug!(
+                    agent_id,
+                    pane_id = %info.pane_id,
+                    "agent already has a pane in {MAIN_SESSION}"
+                );
+                return Ok(());
+            }
+            tracing::warn!(
+                agent_id,
+                pane_id = %info.pane_id,
+                "tracked pane no longer exists in tmux (external death); evicting stale entry and re-adding"
+            );
+            panes.remove(agent_id);
         }
 
         let agent_session = format!("alor-{agent_id}");
@@ -717,5 +778,154 @@ impl PaneManager {
             .await
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a disposable tmux session and return (session_name, first_pane_id).
+    /// Caller is responsible for kill-session on cleanup.
+    async fn make_test_session() -> Option<(String, String)> {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let session = format!("alor-pm-test-{nonce}");
+        let ok = Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, "sleep", "300"])
+            .output()
+            .await
+            .ok()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            return None;
+        }
+        // Grab the first pane's id.
+        let out = Command::new("tmux")
+            .args(["list-panes", "-t", &session, "-F", "#{pane_id}"])
+            .output()
+            .await
+            .ok()?;
+        let pane_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Some((session, pane_id))
+    }
+
+    async fn kill_session(session: &str) {
+        let exact = format!("={session}");
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &exact])
+            .output()
+            .await;
+    }
+
+    /// Skip the test gracefully if tmux isn't on PATH or isn't usable
+    /// (CI runners without tmux, sandbox environments).
+    async fn tmux_available() -> bool {
+        Command::new("tmux")
+            .arg("-V")
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn pane_exists_returns_true_for_live_pane_and_false_after_kill() {
+        if !tmux_available().await {
+            eprintln!("tmux not available, skipping");
+            return;
+        }
+        let (session, pane_id) = match make_test_session().await {
+            Some(v) => v,
+            None => {
+                eprintln!("failed to create test session, skipping");
+                return;
+            }
+        };
+
+        let pm = PaneManager::new();
+
+        // Alive: list-panes succeeds.
+        assert!(
+            pm.pane_exists(&pane_id).await,
+            "pane_exists should be true for a freshly-created pane {pane_id}"
+        );
+
+        // Kill the session → pane dies with it.
+        kill_session(&session).await;
+
+        // Dead: list-panes fails.
+        assert!(
+            !pm.pane_exists(&pane_id).await,
+            "pane_exists should be false for a dead pane {pane_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_exists_rejects_bogus_id() {
+        if !tmux_available().await {
+            eprintln!("tmux not available, skipping");
+            return;
+        }
+        let pm = PaneManager::new();
+        // Very high pane id nothing else is likely using. `list-panes -t
+        // %999999` returns "can't find pane" with exit 1.
+        assert!(!pm.pane_exists("%999999").await);
+    }
+
+    #[tokio::test]
+    async fn add_agent_pane_evicts_stale_entry_when_tracked_pane_is_dead() {
+        // Regression test for task 1ed52762 root cause. Before this
+        // fix, add_agent_pane would early-return Ok() whenever the
+        // `panes` map had an entry for the agent — even if the tracked
+        // pane had been killed externally. The agent would stay
+        // connected with the sidebar rendering it, but no pane would
+        // ever appear in alor-main.
+        //
+        // This test doesn't exercise the full layout machinery (which
+        // requires a live alor-main session). It verifies the specific
+        // pre-condition eviction: after seeding a stale entry and
+        // letting pane_exists confirm it's dead, the stale entry is
+        // gone. The actual re-add path is exercised live (see the
+        // failure-mode discussion in add_agent_pane's docstring).
+        if !tmux_available().await {
+            eprintln!("tmux not available, skipping");
+            return;
+        }
+
+        let pm = PaneManager::new();
+
+        // Seed a stale entry: agent_id "pm-test-ghost" → pane_id "%999998"
+        // (almost certainly does not exist).
+        pm.test_insert_pane("pm-test-ghost", "%999998").await;
+        assert!(pm.test_has_entry("pm-test-ghost").await);
+
+        // add_agent_pane would try to lay out a pane in alor-main,
+        // which doesn't exist in the test environment — that's an
+        // expected failure we ignore. What we CARE about is whether
+        // the stale entry was evicted before the layout attempt.
+        let _ = pm.add_agent_pane("pm-test-ghost").await;
+
+        // Entry should be evicted — either because the layout code
+        // added a fresh entry (if alor-main existed) or because the
+        // stale-entry eviction ran before the layout code failed.
+        // What matters: the ORIGINAL bogus %999998 is no longer in
+        // the map.
+        //
+        // We can't reliably assert the entry is absent (some CI
+        // environments might have an alor-main from a prior test run
+        // and leave a new entry in place). Instead, assert that the
+        // tracked pane_id (if still present) is NOT the stale one.
+        let panes = pm.panes.lock().await;
+        if let Some(info) = panes.get("pm-test-ghost") {
+            assert_ne!(
+                info.pane_id, "%999998",
+                "stale pane_id must not survive eviction"
+            );
+        }
     }
 }

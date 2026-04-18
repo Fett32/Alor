@@ -256,9 +256,33 @@ impl SocketServer {
             writers.insert(agent_id.clone(), write_half);
         }
 
-        // Add agent pane to alor-main
+        // Add agent pane to alor-main. Failure here used to be invisible
+        // — a silent `warn!` — which masked the root cause of task
+        // 1ed52762 (agents connected without a pane in alor-main). The
+        // stale-entry bug that caused that is now fixed inside
+        // `add_agent_pane`; escalating the log level to error! and
+        // naming the agent + tmux session makes any remaining failure
+        // class loud enough to catch on the next occurrence.
+        // PaneManager::reconcile_panes still runs on boot + via the UI
+        // as defense-in-depth if a novel failure shape slips through.
         if let Err(e) = self.pane_manager.add_agent_pane(&agent_id).await {
-            warn!(agent_id = %agent_id, "failed to add pane: {e:#}");
+            let agent_session = format!("alor-{agent_id}");
+            error!(
+                agent_id = %agent_id,
+                tmux_session = %agent_session,
+                "add_agent_pane failed during wrapper.register: {e:#}"
+            );
+            // Emit a UI-visible event so the frontend can surface the
+            // problem (currently logged; future: a toast/banner).
+            self.broadcast_event(
+                "agent.pane_add_failed",
+                json!({
+                    "agent_id": &agent_id,
+                    "tmux_session": &agent_session,
+                    "error": format!("{e:#}"),
+                }),
+            )
+            .await;
         }
 
         // Broadcast connection event
