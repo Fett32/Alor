@@ -62,13 +62,22 @@ def format_event_for_agent(evt: daemon.Event) -> str | None:
     if evt.event == "task.completed":
         agent = d.get("agent_id", "?")
         task_id = str(d.get("task_id", ""))[:8] or "?"
+        title = d.get("title") or ""
         summary = d.get("summary")
+        # Title may be empty if the task was pruned from state between
+        # complete and broadcast; degrade gracefully rather than rendering
+        # an empty quoted string.
+        title_clause = f' "{title}"' if title else ""
         if summary:
             return (
-                f"[Alor event] task {task_id} completed by {agent}.\n\n"
+                f"[Alor event] task {task_id}{title_clause} "
+                f"completed by {agent}.\n\n"
                 f"Worker report:\n{summary}"
             )
-        return f"[Alor event] task {task_id} completed by {agent} (no summary attached)."
+        return (
+            f"[Alor event] task {task_id}{title_clause} "
+            f"completed by {agent} (no summary attached)."
+        )
     if evt.event == "task.blocked":
         agent = d.get("agent_id", "?")
         task_id = str(d.get("task_id", ""))[:8] or "?"

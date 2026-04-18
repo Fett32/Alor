@@ -384,6 +384,17 @@ impl SocketServer {
                     // Only broadcast task.completed if the transition actually
                     // succeeded — otherwise the orch hears "done" but state
                     // still says not-done.
+                    //
+                    // `title` is carried in the payload so the orchestrator's
+                    // event formatter can render a single rich notification
+                    // with agent + title + summary. A previous iteration also
+                    // injected a terse "[Alor] Task completed by <agent>" line
+                    // into the orchestrator's tmux session via send-keys as a
+                    // belt-and-braces notification path for non-SDK orchs —
+                    // but the current Claude-SDK orchestrator (main.py)
+                    // already subscribes to this event, and the tmux line
+                    // landed as stdin on top of the SDK injection, firing a
+                    // duplicate turn per completion. Killed.
                     match self.app_state.transition_task(payload.task_id, TaskState::Completed) {
                         Ok(_) => {
                             self.broadcast_event(
@@ -391,6 +402,7 @@ impl SocketServer {
                                 json!({
                                     "task_id": payload.task_id.to_string(),
                                     "agent_id": agent_id,
+                                    "title": task_title,
                                     "summary": payload.summary,
                                 }),
                             )
@@ -400,60 +412,6 @@ impl SocketServer {
                             warn!("transition to Completed failed: {e}; not broadcasting");
                         }
                     }
-
-                    // Notify orchestrator by injecting into its tmux session,
-                    // but only if the session appears idle (at a prompt).
-                    let agent_id_owned = agent_id.to_string();
-                    let notify_msg = format!(
-                        "[Alor] Task completed by {}: \"{}\" ({})",
-                        agent_id_owned, task_title, &payload.task_id.to_string()[..8]
-                    );
-                    tokio::spawn(async move {
-                        // Check if orchestrator is at a prompt before injecting.
-                        let capture = tokio::process::Command::new("tmux")
-                            .args(["capture-pane", "-p", "-t", "alor-orchestrator", "-S", "-3"])
-                            .output()
-                            .await;
-                        let is_idle = match capture {
-                            Ok(out) if out.status.success() => {
-                                let text = String::from_utf8_lossy(&out.stdout);
-                                // Scan the last few lines for any prompt character.
-                                // Gemini's TUI puts the prompt mid-screen with a
-                                // status bar below, so checking only the last line
-                                // misses it. Also handles Claude (❯), bash ($/%),
-                                // and generic (>) prompts.
-                                text.lines()
-                                    .rev()
-                                    .take(5)
-                                    .any(|line| {
-                                        let t = line.trim();
-                                        t == "❯" || t == "$" || t == "%" || t == ">"
-                                            || t.starts_with("> ")
-                                            || t.starts_with("❯ ")
-                                            || t.ends_with('❯')
-                                            || t.ends_with('>')
-                                            || t.ends_with('$')
-                                            || t.ends_with('%')
-                                    })
-                            }
-                            _ => false,
-                        };
-
-                        if is_idle {
-                            let _ = tokio::process::Command::new("tmux")
-                                .args(["send-keys", "-t", "alor-orchestrator", "-l", &notify_msg])
-                                .output()
-                                .await;
-                            let _ = tokio::process::Command::new("tmux")
-                                .args(["send-keys", "-t", "alor-orchestrator", "Enter"])
-                                .output()
-                                .await;
-                        } else {
-                            tracing::info!(
-                                "orchestrator busy, skipping tmux injection for: {notify_msg}"
-                            );
-                        }
-                    });
                 }
             }
 
