@@ -59,17 +59,20 @@ impl AgentKind {
     /// cheap and the match is robust to minor TUI layout changes.
     pub fn trust_prompt_hints(&self) -> &'static [&'static str] {
         match self {
-            // ClaudeCode DOES show a trust dialog in practice ("Quick
-            // safety check: Is this a project you created..." with
-            // options "1. Yes, I trust this folder" / "2. No, exit"),
-            // but the Alor registry has no wrapper-runtime claude slot
-            // — all claude yamls route through the SDK worker via
-            // run-worker.sh which never hits the CLI's trust prompt.
-            // Intentionally empty so we don't add a false-positive
-            // match surface that'd be exercised by no real spawn.
-            // If a wrapper-runtime claude slot is ever added, flip
-            // this to `&["trust this folder"]` and add an ack-key.
-            AgentKind::ClaudeCode => &[],
+            // Claude Code's trust dialog opens with
+            //   "Quick safety check: Is this a project you created or one you trust?"
+            // and offers "1. Yes, I trust this folder" / "2. No, exit".
+            // The "trust this folder" option text happens to collide
+            // with codex's dialog wording, but this refactor matches on
+            // the distinctive intro line instead so each runtime keeps
+            // its own signal.
+            //
+            // In the current registry all claude yamls are runtime:
+            // claude-sdk (run-worker.sh) and never hit this CLI prompt,
+            // so the hint is future-proofing: a wrapper-runtime claude
+            // slot won't hang on trust-ack just because nobody
+            // remembered to add hints when registering it.
+            AgentKind::ClaudeCode => &["Quick safety check"],
             AgentKind::Codex => &["trust this folder"],
             AgentKind::Gemini => &["Trusting a folder"],
             AgentKind::Cursor => &["Workspace Trust Required"],
@@ -190,10 +193,14 @@ mod tests {
 
     #[test]
     fn trust_prompt_hints_per_kind() {
-        // ClaudeCode intentionally empty — no wrapper-runtime claude
-        // slot exists in the registry; run-worker.sh path never hits
-        // the CLI's trust prompt.
-        assert_eq!(AgentKind::ClaudeCode.trust_prompt_hints(), &[] as &[&str]);
+        // Claude: matches the distinctive intro line "Quick safety
+        // check" (not the "trust this folder" option text, which is
+        // also present in codex's dialog — each runtime keeps its own
+        // signal under the principled refactor).
+        assert_eq!(
+            AgentKind::ClaudeCode.trust_prompt_hints(),
+            &["Quick safety check"]
+        );
 
         // Codex: the classic "Trust this folder" wording.
         assert_eq!(
@@ -215,17 +222,20 @@ mod tests {
             &["Workspace Trust Required"]
         );
 
+        // Default: empty, no catch-all. Keeps fail-open semantics for
+        // unknown runtimes — we'd rather a new CLI hang once at its
+        // trust dialog than splat unrelated keystrokes into its pane.
         assert_eq!(AgentKind::Default.trust_prompt_hints(), &[] as &[&str]);
     }
 
     #[test]
     fn trust_ack_key_per_kind() {
+        assert_eq!(AgentKind::ClaudeCode.trust_ack_key(), "1");
         assert_eq!(AgentKind::Codex.trust_ack_key(), "1");
         assert_eq!(AgentKind::Gemini.trust_ack_key(), "1");
         assert_eq!(AgentKind::Cursor.trust_ack_key(), "a");
-        // ClaudeCode + Default values exist but are unused because
-        // their hints are empty; locked anyway to prevent drift.
-        assert_eq!(AgentKind::ClaudeCode.trust_ack_key(), "1");
+        // Default's value is unused (empty hints skip the ack path
+        // entirely), locked here anyway to prevent drift.
         assert_eq!(AgentKind::Default.trust_ack_key(), "");
     }
 }
