@@ -405,6 +405,87 @@ mod tests {
     }
 
     #[test]
+    fn cursor_approval_gate_not_idle() {
+        // Regression test for the third distinct cursor non-idle state
+        // identified during the live verification probe (task 037b77ba
+        // follow-up to 1b5196c7 — cursor_false_completion suspicion).
+        //
+        // When cursor-agent prompts the user to approve a shell
+        // command, the approval box takes over the bottom of the
+        // pane:
+        //
+        //     Run this command?
+        //     Not in allowlist: <cmd>
+        //      → Run (once) (y)
+        //        Add Shell(<bin>) to allowlist? (tab)
+        //        Auto-run everything (shift+tab)
+        //        Skip (esc or n)
+        //                                              ctrl+r to review changed files
+        //
+        // Critical observation from the live probe: the
+        // `Composer <model>` footer is pushed off the viewport
+        // entirely by the approval box. So the detector's primary
+        // pattern `^\s*Composer\s` doesn't match — `is_idle` returns
+        // false via the primary-pattern miss, not via the
+        // `ctrl+c to stop` anti-pattern (which is ALSO absent here;
+        // cursor shows `ctrl+r to review changed files` instead).
+        //
+        // The fixture below is the verbatim tail-15 captured from a
+        // live cursor-agent probe via the wrapper-exact command
+        // (`tmux capture-pane -p -t '=<session>:' -S -50`). Across
+        // 50 consecutive 200ms polls over 11 seconds of the approval
+        // gate, the detector reported 0 idle samples — well below
+        // the ~15 consecutive samples that `IDLE_STABLE_SECS = 3.0`
+        // would need to fire a false task.complete.
+        let d = IdleDetector::new(&AgentKind::Cursor);
+        let approval_gate_tail = lines(&[
+            "",
+            " ┌───────────────────────────────────────────────────────────────────────────────────────────────────┐",
+            " │ $  wc -l /tmp/alor-cursor-fc-fixture/test.txt in .                                                │",
+            " └───────────────────────────────────────────────────────────────────────────────────────────────────┘",
+            "",
+            "",
+            "  Run this command?",
+            "  Not in allowlist: wc -l /tmp/alor-cursor-fc-fixture/test.txt",
+            "   → Run (once) (y)",
+            "     Add Shell(wc) to allowlist? (tab)",
+            "     Auto-run everything (shift+tab)",
+            "     Skip (esc or n)",
+            "",
+            "",
+            "                                                                       ctrl+r to review changed files",
+        ]);
+
+        // Primary assertion: the whole tail must NOT be classified as
+        // idle. If this starts failing, the detector would emit a
+        // premature task.complete during every shell-command approval
+        // gate — exactly the 883bdc60 / 1b5196c7 symptom.
+        assert!(
+            !d.is_idle(&approval_gate_tail),
+            "cursor approval-gate tail must NOT be classified as idle"
+        );
+
+        // Defensive: verify the fixture genuinely exercises the
+        // primary-pattern-miss path rather than accidentally tripping
+        // some other guard. If a future detector refactor loosens
+        // the pattern (e.g. matches "Run" or "ctrl+r"), this
+        // assertion surfaces the drift loudly instead of letting
+        // the main is_idle check carry a stale regression meaning.
+        let primary = Regex::new(AgentKind::Cursor.pattern())
+            .expect("primary pattern compiles");
+        for line in &approval_gate_tail {
+            assert!(
+                !primary.is_match(line.trim_end()),
+                "primary pattern `{}` must NOT match approval-gate line `{}` — \
+                 if this fails, the fixture no longer exercises the \
+                 Composer-pushed-off-viewport scenario the test was written for",
+                AgentKind::Cursor.pattern(),
+                line,
+            );
+        }
+    }
+
+    #[test]
     fn default_idle() {
         let d = IdleDetector::new(&AgentKind::Default);
         assert!(d.is_idle(&lines(&["$ "])));
