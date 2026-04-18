@@ -71,6 +71,32 @@ impl AgentKind {
         }
     }
 
+    /// How many trailing lines of the tmux capture to scan for the
+    /// idle pattern. 5 is fine for bottom-anchored shell-style
+    /// prompts (claude/codex/gemini/default) — the idle marker is
+    /// always on (or very near) the last visible line when those
+    /// runtimes are idle.
+    ///
+    /// Cursor draws a TUI with its `Composer <model>` footer a few
+    /// lines from the bottom of the pane, and the lines below it are
+    /// blank padding. A live probe showed the footer sitting at
+    /// offset 6 from the bottom on a fresh post-ack capture (pane
+    /// -y 50, capture 20 lines total, Composer at line 15) — tail-5
+    /// missed it, causing a silent missed-idle. 15 lines gives 2.5x
+    /// headroom over the worst case observed and still leaves plenty
+    /// of margin against the `ctrl+c to stop` anti-pattern (which
+    /// tends to land one line above Composer, so the larger window
+    /// also catches the not-idle signal when generation is active).
+    ///
+    /// Making this runtime-specific (rather than bumping a global
+    /// constant) keeps the other runtimes' detection cheap and tight.
+    pub fn idle_tail_window(&self) -> usize {
+        match self {
+            AgentKind::Cursor => 15,
+            _ => 5,
+        }
+    }
+
     /// Prompts to auto-acknowledge on startup, in the order the runtime
     /// typically renders them. Each entry is
     /// `(substring-to-match, key-to-send-as-ack)`. Multiple entries per
@@ -142,6 +168,11 @@ pub struct IdleDetector {
     /// this regex — overrides a `re` match. See cursor case in
     /// `active_pattern()` for the motivating example.
     active_re: Option<Regex>,
+    /// Cached from `AgentKind::idle_tail_window()` at construction.
+    /// The number of trailing pane lines `is_idle_tail` scans. Most
+    /// runtimes use 5; cursor's TUI needs a wider window because its
+    /// idle footer sits several lines from the bottom of the pane.
+    tail_window: usize,
 }
 
 impl IdleDetector {
@@ -153,7 +184,17 @@ impl IdleDetector {
         // reverting to pre-guard behavior (potential false-fire,
         // loud-test-visible).
         let active_re = kind.active_pattern().and_then(|p| Regex::new(p).ok());
-        IdleDetector { re, active_re }
+        let tail_window = kind.idle_tail_window();
+        IdleDetector { re, active_re, tail_window }
+    }
+
+    /// Returns the runtime-specific scan window size used by
+    /// `is_idle_tail`. Exposed so callers that also want to hash /
+    /// fingerprint the trailing pane content can keep that window
+    /// aligned with the idle-detection one (see wrapper/src/main.rs
+    /// intervention-detection fingerprint).
+    pub fn tail_window(&self) -> usize {
+        self.tail_window
     }
 
     /// Returns true if any of the provided lines match the idle pattern
@@ -171,9 +212,12 @@ impl IdleDetector {
         lines.iter().any(|l| self.re.is_match(l.trim_end()))
     }
 
-    /// Convenience: check only the last `tail` lines.
-    pub fn is_idle_tail(&self, lines: &[String], tail: usize) -> bool {
-        let start = lines.len().saturating_sub(tail);
+    /// Convenience: check the last `tail_window` lines (runtime-
+    /// specific). The window size is fixed at construction from
+    /// `AgentKind::idle_tail_window()`, so callers don't have to
+    /// track per-runtime sizing themselves.
+    pub fn is_idle_tail(&self, lines: &[String]) -> bool {
+        let start = lines.len().saturating_sub(self.tail_window);
         self.is_idle(&lines[start..])
     }
 }
@@ -235,6 +279,84 @@ mod tests {
         assert!(!d.is_idle(&lines(&["$ "])));
         // Still rejects non-cursor idle prompts.
         assert!(!d.is_idle(&lines(&["codex> "])));
+    }
+
+    #[test]
+    fn idle_tail_windows_are_per_runtime() {
+        // Locked-values guard: the size numbers are security- /
+        // correctness-relevant (smaller → missed idle, larger → wider
+        // scan cost). Drift should be deliberate.
+        assert_eq!(AgentKind::ClaudeCode.idle_tail_window(), 5);
+        assert_eq!(AgentKind::Codex.idle_tail_window(), 5);
+        assert_eq!(AgentKind::Gemini.idle_tail_window(), 5);
+        assert_eq!(AgentKind::Default.idle_tail_window(), 5);
+        // Cursor needs a wider window — see `idle_tail_window()`
+        // docstring for the probe-derived sizing.
+        assert_eq!(AgentKind::Cursor.idle_tail_window(), 15);
+    }
+
+    #[test]
+    fn detector_exposes_configured_tail_window() {
+        // IdleDetector should surface the per-kind window so callers
+        // (e.g. wrapper/main.rs intervention fingerprint) can keep
+        // their own tail slicing aligned.
+        assert_eq!(IdleDetector::new(&AgentKind::ClaudeCode).tail_window(), 5);
+        assert_eq!(IdleDetector::new(&AgentKind::Cursor).tail_window(), 15);
+    }
+
+    #[test]
+    fn cursor_fresh_session_idle_caught_by_wider_window() {
+        // Regression test for the missed-idle flagged in d175037's
+        // wrap-up. Captured verbatim from a live cursor-agent fresh
+        // post-trust-ack state via the wrapper-exact command
+        // (`tmux capture-pane -p -t '=<session>:' -S -50`):
+        //
+        // 20-line capture. `Composer 2 Fast` sits at line 15 — that's
+        // offset 6 from the bottom. The previous fixed tail=5 scan
+        // would have missed it (all 5 trailing lines are blank),
+        // leaving the detector silent even though the runtime was
+        // fully idle and waiting for input.
+        //
+        // With the per-runtime window (Cursor → 15), the scan reaches
+        // the Composer line and fires correctly. Asserted both ways
+        // below so a regression of either the window size or the
+        // idle pattern surfaces clearly.
+        let fresh_idle_capture = lines(&[
+            "cursor-agent",
+            "fett@Fett-Linux:/tmp/alor-cursor-probe2$ cursor-agent",
+            "",
+            "",
+            "  Cursor Agent",
+            "  v2026.04.17-479fd04",
+            "  hint: /auto-run to skip all approvals",
+            "",
+            "",
+            "",
+            "",
+            "  → a",
+            "",
+            "",
+            "  Composer 2 Fast",
+            "  /tmp/alor-cursor-probe2",
+            "",
+            "",
+            "",
+            "",
+        ]);
+
+        let d = IdleDetector::new(&AgentKind::Cursor);
+        assert!(
+            d.is_idle_tail(&fresh_idle_capture),
+            "Cursor fresh-session idle should be detected via is_idle_tail with the runtime's tail_window"
+        );
+
+        // Sanity: confirm the old 5-line window would have missed it.
+        // Using the same scan logic directly on the bottom 5 lines.
+        let start = fresh_idle_capture.len() - 5;
+        assert!(
+            !d.is_idle(&fresh_idle_capture[start..]),
+            "Regression guard: Composer is NOT in the last 5 lines of the fixture — if this assertion starts failing, the fixture has drifted and the test no longer exercises the bug it was written for"
+        );
     }
 
     #[test]

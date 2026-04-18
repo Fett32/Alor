@@ -20,9 +20,12 @@ use tracing::{error, info, warn};
 const DAEMON_SOCK: &str = "/tmp/alor/daemon.sock";
 const CAPTURE_LINES: usize = 50;
 const POLL_INTERVAL_MS: u64 = 500;
-/// Number of trailing lines to check for the idle pattern.
-const IDLE_TAIL: usize = 5;
 /// Idle pattern must be stable for this many seconds before marking complete.
+///
+/// Tail-window sizing used to be a constant here (IDLE_TAIL = 5) but
+/// cursor's TUI needed a wider window — it now lives per-runtime on
+/// `AgentKind::idle_tail_window()` and flows through
+/// `IdleDetector::tail_window()`. See detector.rs for rationale.
 const IDLE_STABLE_SECS: f64 = 3.0;
 
 /// Grace period after injection before user-intervention detection kicks in.
@@ -541,7 +544,17 @@ async fn run_loop(
             match tmux::capture_pane(session, CAPTURE_LINES) {
                 Ok(lines) => {
                     // -- user intervention detection --
-                    let tail: Vec<&str> = lines.iter().rev().take(IDLE_TAIL).map(|s| s.as_str()).collect();
+                    // Fingerprint window uses the detector's tail
+                    // window so it stays in sync with idle scanning:
+                    // cursor (wider window) hashes more of the pane,
+                    // shell-prompt runtimes hash the last 5 lines.
+                    // Keeps "did the pane change?" aligned with
+                    // "is the runtime idle?" — a change that only
+                    // touches the cursor UI region (e.g. a spinner
+                    // appearing above the Composer footer) now
+                    // correctly registers as content_changed.
+                    let tail_n = detector.tail_window();
+                    let tail: Vec<&str> = lines.iter().rev().take(tail_n).map(|s| s.as_str()).collect();
                     let fingerprint = tail.join("\n");
                     let content_changed = prev_fingerprint.as_deref() != Some(&fingerprint);
                     prev_fingerprint = Some(fingerprint);
@@ -554,7 +567,7 @@ async fn run_loop(
                         let past_cooldown = last_intervention_sent
                             .map(|t| now.duration_since(t).as_secs_f64() >= INTERVENTION_COOLDOWN_SECS)
                             .unwrap_or(true);
-                        let is_idle = detector.is_idle_tail(&lines, IDLE_TAIL);
+                        let is_idle = detector.is_idle_tail(&lines);
 
                         if past_injection_grace && past_cooldown && !is_idle {
                             info!("detected user intervention in tmux pane");
@@ -573,7 +586,7 @@ async fn run_loop(
                     let past_idle_grace = last_injection
                         .map(|t| Instant::now().duration_since(t).as_secs_f64() >= INJECTION_GRACE_SECS)
                         .unwrap_or(true);
-                    if past_idle_grace && detector.is_idle_tail(&lines, IDLE_TAIL) {
+                    if past_idle_grace && detector.is_idle_tail(&lines) {
                         let now = Instant::now();
                         let first_seen = *idle_since.get_or_insert(now);
                         let elapsed = now.duration_since(first_seen).as_secs_f64();
