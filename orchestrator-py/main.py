@@ -176,6 +176,17 @@ async def event_watcher(
 
 
 async def main() -> int:
+    # Bare invocation -> fresh session. `--resume <session_id>` -> continue
+    # from a prior SDK session (jsonl transcript under .claude/projects/...).
+    # Glitches close the tmux pane but the transcript survives, so resume
+    # gets the full message history back (tools, decisions, everything).
+    resume_session: str | None = None
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--resume":
+        if len(argv) < 2:
+            sys.exit("--resume requires a session id")
+        resume_session = argv[1]
+
     system_prompt = load_system_prompt()
     model = DEFAULT_MODEL
 
@@ -195,14 +206,16 @@ async def main() -> int:
         # live, so the orch can just ask directly instead of invoking
         # a CC-TUI-only tool that silently drops.
         can_use_tool=make_gate("orch"),
+        resume=resume_session,
     )
 
+    banner_lines = [f"model: {model}"]
+    if resume_session:
+        banner_lines.append(f"resuming: {resume_session}")
+    banner_lines.append("commands: /reset  /usage  /quit")
     banner(
         "Alor Orchestrator",
-        [
-            f"model: {model}",
-            "commands: /reset  /usage  /quit",
-        ],
+        banner_lines,
     )
 
     stop_events = asyncio.Event()
@@ -244,10 +257,15 @@ async def main() -> int:
                 )
                 try:
                     async with client_lock:
-                        await client.query(
-                            "Introduce yourself in one short line so Fett knows you're online and ready. "
+                        greet_prompt = (
+                            "Resumed. Acknowledge in one short line that you're back online and "
+                            "ready to continue from where the prior session left off. "
+                            "Do not list your tools."
+                            if resume_session
+                            else "Introduce yourself in one short line so Fett knows you're online and ready. "
                             "Do not list your tools."
                         )
+                        await client.query(greet_prompt)
                         await process_response(client, totals, cost_accumulator)
                     print_footer(session_start, cost_accumulator[0], totals)
                 except Exception as e:
