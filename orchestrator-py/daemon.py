@@ -173,8 +173,9 @@ async def task_list(
     state: str = "default",
     limit: int | None = None,
     offset: int = 0,
+    view: str | None = None,
 ) -> dict[str, Any]:
-    """List tasks, filtered by state, paginated.
+    """List tasks, filtered by state, paginated, projected by view.
 
     `state` values:
       - "default" (default) → non-terminal tasks only (hides Completed /
@@ -190,17 +191,29 @@ async def task_list(
     src-tauri/src/wrapper/protocol.rs::DEFAULT_TASK_LIST_LIMIT). Pass
     `limit=0` to disable capping (use sparingly).
 
-    Response shape: `{tasks: [...], total: N, returned: M, offset: O,
-    has_more: bool}`. Callers paginate by re-calling with `offset +=
-    returned` while `has_more` is true.
+    `view` selects the per-task field projection:
+      - None (falls through to server default, "summary") / "summary"
+        → {id, title, state, assigned_to, updated_at} only. ~70
+        tokens/task — safe to pull hundreds per page for scans.
+      - "full" → every Task field (description, proposal_brief,
+        proposal_diff, summary, project, etc.). ~1.1k tokens/task
+        average. Prefer `task_get` for single-task detail reads.
+      - Any other string: the server silently treats it as "summary".
 
-    Server-side filter + pagination via the `state_filter` / `limit` /
-    `offset` payload fields on `cli.task.list` (see
-    src-tauri/src/wrapper/protocol.rs::CliTaskList).
+    Response shape: `{tasks: [...], total: N, returned: M, offset: O,
+    has_more: bool, view: str}`. Callers paginate by re-calling with
+    `offset += returned` while `has_more` is true. `view` echoes back
+    which shape the server actually applied.
+
+    Server-side filter / pagination / projection via the `state_filter`
+    / `limit` / `offset` / `view` payload fields on `cli.task.list`
+    (see src-tauri/src/wrapper/protocol.rs::CliTaskList).
     """
     payload: dict[str, Any] = {"state_filter": state, "offset": offset}
     if limit is not None:
         payload["limit"] = limit
+    if view is not None:
+        payload["view"] = view
     return await _one_shot("cli.task.list", payload)
 
 

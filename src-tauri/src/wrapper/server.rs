@@ -642,14 +642,34 @@ impl SocketServer {
                 let returned = page.len() as u32;
                 let has_more = (start + page.len()) < tasks.len();
 
+                // Projection: default to "summary" (lean 5-field shape
+                // sized for context-safe scans). "full" returns the
+                // whole Task. Anything else silently falls back to
+                // summary — an LLM typo mustn't crash the list.
+                // The literal `view` string we emit in the response
+                // tells the caller which shape they actually got.
+                let requested_view = payload.view.as_deref().unwrap_or(
+                    crate::wrapper::protocol::DEFAULT_TASK_LIST_VIEW,
+                );
+                let (tasks_json, view_emitted): (serde_json::Value, &'static str) =
+                    match requested_view {
+                        "full" => (json!(page), "full"),
+                        _ => {
+                            let summaries: Vec<_> =
+                                page.iter().map(|t| t.summary()).collect();
+                            (json!(summaries), "summary")
+                        }
+                    };
+
                 match Envelope::new(
                     MSG_CLI_RESPONSE,
                     json!({
-                        "tasks": page,
+                        "tasks": tasks_json,
                         "total": total,
                         "returned": returned,
                         "offset": offset,
                         "has_more": has_more,
+                        "view": view_emitted,
                     }),
                 ) {
                     Ok(mut e) => {

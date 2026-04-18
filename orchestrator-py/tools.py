@@ -81,8 +81,13 @@ async def task_get(args: dict[str, Any]) -> dict[str, Any]:
     "server-side (default 20 tasks/page) to keep orch context under "
     "budget; response includes total/returned/offset/has_more — "
     "paginate by re-calling with offset += returned while has_more is "
-    "true. Prefer task_get by id when you already have one.",
-    {"state": str, "limit": int, "offset": int},
+    "true. View defaults to 'summary' "
+    "(id/title/state/assigned_to/updated_at only, ~70 tokens/task) — "
+    "use it for scans and raise limit freely (e.g. 200). Pass "
+    "view='full' only if you genuinely need descriptions/proposals for "
+    "many tasks at once; otherwise prefer task_get for single-task "
+    "detail reads.",
+    {"state": str, "limit": int, "offset": int, "view": str},
 )
 async def task_list(args: dict[str, Any]) -> dict[str, Any]:
     try:
@@ -108,7 +113,16 @@ async def task_list(args: dict[str, Any]) -> dict[str, Any]:
         limit = _as_int(args.get("limit"))
         offset = _as_int(args.get("offset")) or 0
 
-        return _ok(await daemon.task_list(state=state, limit=limit, offset=offset))
+        # `view` is optional. Missing/blank → server default ("summary").
+        # Lowercase so "Summary" / "FULL" / "summary" all work; the
+        # server treats unknown values as "summary" anyway, so this is
+        # just cosmetic normalization.
+        raw_view = (args.get("view") or "").strip().lower()
+        view = raw_view or None
+
+        return _ok(
+            await daemon.task_list(state=state, limit=limit, offset=offset, view=view)
+        )
     except Exception as e:
         return _err(str(e))
 

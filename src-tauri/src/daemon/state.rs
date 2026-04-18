@@ -158,7 +158,40 @@ pub struct Task {
     pub project: Option<String>,
 }
 
+/// Projection of `Task` used by `cli.task.list` when the caller passes
+/// `view = "summary"` (the default — see
+/// `src-tauri/src/wrapper/protocol.rs::DEFAULT_TASK_LIST_VIEW`).
+///
+/// Five fields: id, title, state, assigned_to, updated_at. ~0.2k tokens
+/// per task vs. ~1.1k tokens for the full Task — lets a scan pull
+/// hundreds of entries safely under the orch-context ceiling. Detail
+/// (description / proposal_brief / proposal_diff / summary / project)
+/// stays reachable via `task_get`.
+///
+/// Serialize-only; there's no reason to reconstruct a Task from the
+/// summary on the wire.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskSummary {
+    pub id: Uuid,
+    pub title: String,
+    pub state: TaskState,
+    pub assigned_to: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 impl Task {
+    /// Project to the summary-view shape. Called by the server after
+    /// filtering + pagination when `view = "summary"`.
+    pub fn summary(&self) -> TaskSummary {
+        TaskSummary {
+            id: self.id,
+            title: self.title.clone(),
+            state: self.state.clone(),
+            assigned_to: self.assigned_to.clone(),
+            updated_at: self.updated_at,
+        }
+    }
+
     pub fn new(title: impl Into<String>, description: impl Into<String>) -> Self {
         let now = Utc::now();
         Self {
@@ -1005,6 +1038,47 @@ mod tests {
         assert!(!TaskState::Completed.can_transition_to(&TaskState::Accepted));
         assert!(!TaskState::Rejected.can_transition_to(&TaskState::Completed));
         assert!(!TaskState::Stale.can_transition_to(&TaskState::Accepted));
+    }
+
+    #[test]
+    fn task_summary_projects_only_the_five_lean_fields() {
+        // Build a Task with every field populated so we can confirm the
+        // projection genuinely drops the heavy ones (description,
+        // proposal_brief, proposal_diff, summary, project,
+        // created_at, parent_task_id, subtask_order, user_intervened[_at]).
+        let mut t = Task::new("title", "a long description");
+        t.state = TaskState::Accepted;
+        t.assigned_to = Some("claude-alor".to_string());
+        t.proposal_brief = Some("brief".to_string());
+        t.proposal_diff = Some("diff".to_string());
+        t.summary = Some("summary".to_string());
+        t.project = Some("alor".to_string());
+        t.parent_task_id = Some(Uuid::new_v4());
+        t.subtask_order = 3;
+        t.user_intervened = true;
+        t.user_intervened_at = Some(Utc::now());
+
+        let s = t.summary();
+        assert_eq!(s.id, t.id);
+        assert_eq!(s.title, "title");
+        assert_eq!(s.state, TaskState::Accepted);
+        assert_eq!(s.assigned_to.as_deref(), Some("claude-alor"));
+        assert_eq!(s.updated_at, t.updated_at);
+
+        // Serialize the summary and confirm heavy fields aren't in the
+        // wire JSON. This is the real contract: server sends these,
+        // callers don't see description etc.
+        let json = serde_json::to_value(&s).expect("summary serializes");
+        let obj = json.as_object().expect("summary is a JSON object");
+        let keys: std::collections::BTreeSet<&str> =
+            obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "id", "title", "state", "assigned_to", "updated_at",
+        ]
+        .iter()
+        .copied()
+        .collect();
+        assert_eq!(keys, expected, "summary must serialize exactly 5 fields");
     }
 
     #[test]

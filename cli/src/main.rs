@@ -80,8 +80,19 @@ struct CliTaskGet { task_id: Uuid }
 
 #[derive(Deserialize)]
 struct AgentInfo { id: String, name: String, connected: bool, tmux_session: Option<String> }
+// `description` is absent in the summary-view response (the default for
+// cli.task.list as of DEFAULT_TASK_LIST_VIEW). `#[serde(default)]`
+// lets the same struct deserialize either shape; `task_get` still
+// returns a full Task so description is populated there.
 #[derive(Deserialize)]
-struct TaskInfo { id: Uuid, title: String, state: String, assigned_to: Option<String>, description: String }
+struct TaskInfo {
+    id: Uuid,
+    title: String,
+    state: String,
+    assigned_to: Option<String>,
+    #[serde(default)]
+    description: String,
+}
 #[derive(Deserialize)]
 struct StatusResponsePayload { agents: Vec<AgentInfo>, tasks: Vec<TaskInfo> }
 #[derive(Deserialize)]

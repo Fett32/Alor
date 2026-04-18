@@ -369,15 +369,28 @@ pub struct CliTaskGet {
 ///   - Pass `limit = 0` for "no limit" (returns whole filtered set; only
 ///     use this when you've already counted and know it's safe).
 ///
-/// Response (`CliTaskListResponse`) includes `{tasks, total, returned,
-/// offset, has_more}` so callers can paginate without a second RPC to
-/// count.
+/// `view` controls the per-task field projection:
+///   - `None` or `"summary"` (default — see `DEFAULT_TASK_LIST_VIEW`):
+///     return only {id, title, state, assigned_to, updated_at}. ~70
+///     tokens per task, so e.g. a 200-task scan fits comfortably under
+///     the 25k-token ceiling. Use for roster scans.
+///   - `"full"`: return every `Task` field (including description,
+///     proposal_brief, proposal_diff, summary, project). ~1.1k tokens
+///     per task with heavy-tail tasks up to ~4k. Use when you need
+///     detail on many tasks at once — but usually prefer `task_get`
+///     for a single-task read.
+///   - Anything else: silently treated as `"summary"`. An LLM caller
+///     with a typo shouldn't blow up the list.
+///
+/// Response envelope includes `{tasks, total, returned, offset,
+/// has_more, view}` so callers can paginate without a second RPC and
+/// know which shape they got back.
 ///
 /// The frontend's `get_tasks` Tauri command is a separate path and still
 /// returns the full live set (filtering + chunking happen client-side in
-/// TaskList.js for snappy dropdown toggles). Pagination caps only apply
-/// to the CLI/MCP surface — the orchestrator-facing one where context
-/// blowup is the real cost.
+/// TaskList.js for snappy dropdown toggles). Pagination caps + summary
+/// view only apply to the CLI/MCP surface — the orchestrator-facing one
+/// where context blowup is the real cost.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CliTaskList {
     #[serde(default)]
@@ -386,11 +399,17 @@ pub struct CliTaskList {
     pub limit: Option<u32>,
     #[serde(default)]
     pub offset: Option<u32>,
+    #[serde(default)]
+    pub view: Option<String>,
 }
 
 /// Default `limit` for `cli.task.list` when the caller doesn't specify
 /// one. See `CliTaskList` docstring for the sizing rationale.
 pub const DEFAULT_TASK_LIST_LIMIT: u32 = 20;
+
+/// Default `view` for `cli.task.list`. "summary" keeps scans lean;
+/// callers that need detail must opt in with `"full"`.
+pub const DEFAULT_TASK_LIST_VIEW: &str = "summary";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliAssign {
