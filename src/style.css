@@ -171,6 +171,94 @@ html, body {
   z-index: 2;
 }
 
+/* Inline alert when wrapper.register cannot attach an agent pane to alor-main */
+.agent-pane-fail-banner {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 10px 12px;
+  background: linear-gradient(
+    180deg,
+    rgba(208, 96, 96, 0.22) 0%,
+    rgba(208, 96, 96, 0.08) 100%
+  );
+  border-bottom: 1px solid rgba(208, 96, 96, 0.45);
+}
+
+.agent-pane-fail-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-pane-fail-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.35;
+}
+
+.agent-pane-fail-meta {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+.agent-pane-fail-err {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 96px;
+  overflow-y: auto;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+.agent-pane-fail-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.btn-pane-fail-retry,
+.btn-pane-fail-dismiss {
+  border-radius: var(--radius-sm);
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.btn-pane-fail-retry {
+  background: var(--accent-dim);
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
+.btn-pane-fail-retry:hover:not(:disabled) {
+  background: var(--accent);
+}
+
+.btn-pane-fail-retry:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.btn-pane-fail-dismiss {
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.btn-pane-fail-dismiss:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
 .panel-header {
   display: flex;
   align-items: center;

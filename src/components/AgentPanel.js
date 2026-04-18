@@ -35,8 +35,9 @@ let agents = [];
 /** ID of the currently selected agent, or null. */
 let selectedId = null;
 
-/** Event unlisten handle. */
+/** Event unlisten handles. */
 let unlistenAgents = null;
+let unlistenPaneAddFailed = null;
 
 // ---------------------------------------------------------------------------
 // DOM refs (resolved once after DOMContentLoaded)
@@ -49,6 +50,8 @@ let $regId;
 let $regName;
 let $regTmux;
 let $panel;
+/** Host for pane-add-failure banner (created on first use). */
+let $paneFailBanner = null;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -120,6 +123,16 @@ export function initAgentPanel() {
       });
     });
     listen("agent.disconnected", () => fetchAgents());
+
+    listen("agent.pane_add_failed", (event) => {
+      const p = event.payload;
+      const agentId = p?.agent_id ?? "(unknown)";
+      const tmuxSession = p?.tmux_session ?? "";
+      const errText = p?.error ?? String(p);
+      showPaneAddFailedBanner({ agentId, tmuxSession, errText });
+    }).then((fn) => {
+      unlistenPaneAddFailed = fn;
+    });
   } catch (err) {
     console.error("[AgentPanel] init failed:", err);
   }
@@ -130,6 +143,7 @@ export function initAgentPanel() {
  */
 export function destroyAgentPanel() {
   if (unlistenAgents) unlistenAgents();
+  if (unlistenPaneAddFailed) unlistenPaneAddFailed();
 }
 
 /**
@@ -138,6 +152,79 @@ export function destroyAgentPanel() {
  */
 export function getAgents() {
   return [...agents];
+}
+
+// ---------------------------------------------------------------------------
+// Pane add failure banner
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {{ agentId: string, tmuxSession: string, errText: string }} detail
+ */
+function showPaneAddFailedBanner({ agentId, tmuxSession, errText }) {
+  if (!$panel) return;
+
+  if (!$paneFailBanner) {
+    $paneFailBanner = document.createElement("div");
+    $paneFailBanner.id = "agent-pane-fail-banner";
+    $paneFailBanner.className = "agent-pane-fail-banner";
+    $paneFailBanner.setAttribute("role", "alert");
+    $panel.insertBefore($paneFailBanner, $panel.firstChild);
+  }
+
+  $paneFailBanner.replaceChildren();
+
+  const inner = document.createElement("div");
+  inner.className = "agent-pane-fail-inner";
+
+  const title = document.createElement("div");
+  title.className = "agent-pane-fail-title";
+  title.append(
+    document.createTextNode("Could not add pane for agent "),
+    Object.assign(document.createElement("strong"), { textContent: agentId }),
+  );
+
+  const meta = document.createElement("div");
+  meta.className = "agent-pane-fail-meta";
+  meta.textContent = tmuxSession
+    ? `tmux session: ${tmuxSession}`
+    : "tmux session: —";
+
+  const errEl = document.createElement("div");
+  errEl.className = "agent-pane-fail-err";
+  errEl.textContent = errText;
+
+  const actions = document.createElement("div");
+  actions.className = "agent-pane-fail-actions";
+
+  const btnRetry = document.createElement("button");
+  btnRetry.type = "button";
+  btnRetry.className = "btn-pane-fail-retry";
+  btnRetry.textContent = "Retry";
+  btnRetry.addEventListener("click", () => {
+    btnRetry.disabled = true;
+    invoke("pane_reconcile")
+      .then(() => fetchAgents())
+      .catch((err) => {
+        console.warn("[AgentPanel] pane_reconcile (banner) failed:", err);
+      })
+      .finally(() => {
+        btnRetry.disabled = false;
+      });
+  });
+
+  const btnDismiss = document.createElement("button");
+  btnDismiss.type = "button";
+  btnDismiss.className = "btn-pane-fail-dismiss";
+  btnDismiss.textContent = "Dismiss";
+  btnDismiss.addEventListener("click", () => {
+    $paneFailBanner?.remove();
+    $paneFailBanner = null;
+  });
+
+  actions.append(btnRetry, btnDismiss);
+  inner.append(title, meta, errEl, actions);
+  $paneFailBanner.appendChild(inner);
 }
 
 // ---------------------------------------------------------------------------

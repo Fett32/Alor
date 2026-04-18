@@ -274,15 +274,15 @@ impl SocketServer {
             );
             // Emit a UI-visible event so the frontend can surface the
             // problem (currently logged; future: a toast/banner).
-            self.broadcast_event(
-                "agent.pane_add_failed",
-                json!({
-                    "agent_id": &agent_id,
-                    "tmux_session": &agent_session,
-                    "error": format!("{e:#}"),
-                }),
-            )
-            .await;
+            let pane_fail = json!({
+                "agent_id": &agent_id,
+                "tmux_session": &agent_session,
+                "error": format!("{e:#}"),
+            });
+            self.broadcast_event("agent.pane_add_failed", pane_fail.clone())
+                .await;
+            self.app_state
+                .emit_event_with("agent.pane_add_failed", pane_fail);
         }
 
         // Broadcast connection event
