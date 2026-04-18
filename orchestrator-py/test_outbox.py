@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -383,6 +384,106 @@ async def test_all_six_send_paths_route_through_outbox() -> None:
 # ---------------------------------------------------------------------------
 
 
+async def test_disk_persist_round_trip() -> None:
+    """Queued frames survive process restart via on-disk JSONL mirror.
+
+    Regression test for the dogfood-reboot bug: pkill -9 of the Python
+    worker tore down the in-memory outbox and queued completions were
+    lost. With disk persistence, a fresh AgentClient pointed at the
+    same path rehydrates the deque.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        outbox_path = Path(td) / "claude-alor.jsonl"
+
+        # First life: queue two frames on a dead writer, file exists.
+        sock_a = AgentClient("claude-alor", outbox_path=outbox_path)
+        sock_a._writer = DeadWriterOnDrain()  # type: ignore[assignment]
+        await sock_a.send_complete("task-A", summary="first")
+        await sock_a.send_complete("task-B", summary="second")
+        check("disk: file exists after enqueue", outbox_path.exists(), True)
+        check("disk: 2 queued in memory", sock_a.pending_count(), 2)
+
+        # Second life: fresh AgentClient reads the same path.
+        # The old sock_a is gone (simulating pkill -9 + respawn).
+        sock_b = AgentClient("claude-alor", outbox_path=outbox_path)
+        check("disk: rehydrated 2 frames", sock_b.pending_count(), 2)
+        head = decode(sock_b._outbox[0])
+        tail = decode(sock_b._outbox[1])
+        check("disk: FIFO preserved (head task-A)", head["payload"]["task_id"], "task-A")
+        check("disk: FIFO preserved (tail task-B)", tail["payload"]["task_id"], "task-B")
+        check("disk: rehydrated kind is task.complete", head["type"], "task.complete")
+
+
+async def test_disk_persist_cleared_on_empty() -> None:
+    """Successful flush empties the file (file removed)."""
+    with tempfile.TemporaryDirectory() as td:
+        outbox_path = Path(td) / "clean.jsonl"
+
+        sock = AgentClient("clean", outbox_path=outbox_path)
+        sock._writer = DeadWriterOnDrain()  # type: ignore[assignment]
+        await sock.send_accept("task-1")
+        check("empty-cleanup: file written", outbox_path.exists(), True)
+
+        # Swap to a live writer and drain.
+        sock._writer = CapturingWriter()  # type: ignore[assignment]
+        flushed = await sock.flush_outbox()
+        check("empty-cleanup: flushed 1", flushed, 1)
+        check("empty-cleanup: outbox empty", sock.pending_count(), 0)
+        check(
+            "empty-cleanup: file removed once empty",
+            outbox_path.exists(),
+            False,
+        )
+
+
+async def test_disk_persist_skips_corrupt_lines() -> None:
+    """A tampered outbox with garbage lines still boots cleanly."""
+    with tempfile.TemporaryDirectory() as td:
+        outbox_path = Path(td) / "dirty.jsonl"
+        outbox_path.parent.mkdir(parents=True, exist_ok=True)
+        # Two valid frames bracketing one garbage line.
+        valid_1 = (
+            json.dumps(
+                {"type": "task.accept", "correlation_id": "c1", "payload": {"task_id": "ok-1"}}
+            )
+            + "\n"
+        ).encode()
+        valid_2 = (
+            json.dumps(
+                {"type": "task.accept", "correlation_id": "c2", "payload": {"task_id": "ok-2"}}
+            )
+            + "\n"
+        ).encode()
+        garbage = b"{this is not json\n"
+        outbox_path.write_bytes(valid_1 + garbage + valid_2)
+
+        sock = AgentClient("dirty", outbox_path=outbox_path)
+        check("corrupt: 2 valid frames loaded", sock.pending_count(), 2)
+        ids = [decode(f)["payload"]["task_id"] for f in sock._outbox]
+        check("corrupt: valid payloads preserved", ids, ["ok-1", "ok-2"])
+
+
+async def test_disk_persist_missing_file_is_empty_start() -> None:
+    """A nonexistent outbox path → fresh empty outbox, no error."""
+    with tempfile.TemporaryDirectory() as td:
+        outbox_path = Path(td) / "never-written.jsonl"
+        sock = AgentClient("fresh", outbox_path=outbox_path)
+        check("missing: empty start", sock.pending_count(), 0)
+        check("missing: no file created yet", outbox_path.exists(), False)
+
+
+async def test_disk_persist_in_memory_mode_writes_nothing() -> None:
+    """outbox_path=None → disk is never touched."""
+    with tempfile.TemporaryDirectory() as td:
+        sock = AgentClient("mem-only", outbox_path=None)
+        sock._writer = DeadWriterOnDrain()  # type: ignore[assignment]
+        await sock.send_accept("t1")
+        check("in-mem: 1 queued", sock.pending_count(), 1)
+        # No file anywhere under the tmpdir.
+        leftovers = list(Path(td).rglob("*"))
+        check("in-mem: no file written", leftovers, [])
+
+
 async def main() -> int:
     await test_happy_path()
     await test_dead_writer_enqueues()
@@ -394,6 +495,11 @@ async def main() -> int:
     await test_flush_fifo_order()
     await test_partial_flush_keeps_remainder()
     await test_all_six_send_paths_route_through_outbox()
+    await test_disk_persist_round_trip()
+    await test_disk_persist_cleared_on_empty()
+    await test_disk_persist_skips_corrupt_lines()
+    await test_disk_persist_missing_file_is_empty_start()
+    await test_disk_persist_in_memory_mode_writes_nothing()
 
     print()
     if FAILURES:

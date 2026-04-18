@@ -11,13 +11,31 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+import tempfile
 import uuid
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 DAEMON_SOCKET = "/tmp/alor/daemon.sock"
+
+
+def default_outbox_path(agent_id: str) -> Path:
+    """Canonical on-disk outbox location for an agent.
+
+    `$XDG_DATA_HOME/alor/outbox/<agent_id>.jsonl`, defaulting to
+    `~/.local/share/alor/outbox/<agent_id>.jsonl`. Matches the Rust
+    daemon's `data_dir()` convention (src-tauri/src/daemon/session.rs)
+    so both halves of Alor read/write under the same root.
+
+    Callers are free to pass an explicit path instead — tests do.
+    """
+    base = os.environ.get("XDG_DATA_HOME")
+    root = Path(base) if base else Path.home() / ".local" / "share"
+    return root / "alor" / "outbox" / f"{agent_id}.jsonl"
 
 # Match daemon.py's 16 MiB read buffer so task.assign envelopes carrying
 # long TASK BRIEF descriptions (or any envelope above 64 KiB) don't trip
@@ -25,10 +43,17 @@ DAEMON_SOCKET = "/tmp/alor/daemon.sock"
 # chunk is longer than limit".
 SOCKET_READ_LIMIT = 16 * 1024 * 1024
 
-# In-memory outbox caps. A worker whose daemon dies mid-`task.complete`
-# used to silently lose the envelope; now the send queues under one of
-# these caps and flushes on reconnect. Kept in-memory because the worker
-# ignores SIGHUP (see worker.py main) and survives daemon cycles intact.
+# Outbox caps. A worker whose daemon dies mid-`task.complete` used to
+# silently lose the envelope; now the send queues under one of these
+# caps and flushes on reconnect.
+#
+# Persistence: the outbox is mirrored to disk at
+# `default_outbox_path(agent_id)` (JSONL, one frame per line). On
+# AgentClient construction the file is read back so a full process
+# restart — which happens during dogfood reboots where kill_all_agents
+# SIGKILLs the Python worker — doesn't lose queued completions. In-
+# memory operation is still supported by passing `outbox_path=None`;
+# the tests rely on that path for isolation.
 OUTBOX_MAX_ENTRIES = 100
 OUTBOX_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
 
@@ -86,7 +111,12 @@ class Envelope:
 class AgentClient:
     """Persistent connection to the Alor daemon for a single agent slot."""
 
-    def __init__(self, agent_id: str, socket_path: str = DAEMON_SOCKET) -> None:
+    def __init__(
+        self,
+        agent_id: str,
+        socket_path: str = DAEMON_SOCKET,
+        outbox_path: Path | None = None,
+    ) -> None:
         self.agent_id = agent_id
         self.socket_path = socket_path
         self._reader: asyncio.StreamReader | None = None
@@ -94,11 +124,20 @@ class AgentClient:
         # Outbox of pre-serialized frames whose send hit a dead/unwritable
         # socket. `send()` appends here instead of raising so the worker's
         # turn doesn't blow up; `daemon_loop` drains via `flush_outbox()`
-        # after a successful reconnect. In-memory only — see module-level
-        # cap constants and the comment there for why.
+        # after a successful reconnect.
+        #
+        # When `outbox_path` is set, the deque is mirrored to an on-disk
+        # JSONL file after every mutation and rehydrated from it on
+        # construction. This is what lets a dogfood reboot (pkill -9 of
+        # the worker) replay a queued task.complete once the new worker
+        # process comes up. Pass `outbox_path=None` for purely in-memory
+        # operation (tests).
         self._outbox: deque[bytes] = deque()
         self._outbox_bytes: int = 0
         self._outbox_dropped: int = 0
+        self._outbox_path: Path | None = outbox_path
+        if self._outbox_path is not None:
+            self._load_outbox_from_disk()
 
     # --- outbox introspection (used by reconnect path + tests) ----------
 
@@ -122,6 +161,10 @@ class AgentClient:
         dropped first. A single frame larger than the byte cap is still
         accepted when the outbox is empty — losing it outright is strictly
         worse than keeping one oversized envelope.
+
+        On every successful mutation the deque is flushed to disk (when
+        an outbox path was configured) so a worker reboot doesn't lose
+        queued frames.
         """
         # Count cap.
         while len(self._outbox) >= OUTBOX_MAX_ENTRIES:
@@ -146,6 +189,136 @@ class AgentClient:
             )
         self._outbox.append(frame)
         self._outbox_bytes += len(frame)
+        self._persist_outbox()
+
+    # --- on-disk persistence --------------------------------------------
+    #
+    # Format: the file is a concatenation of the exact frames as they go
+    # over the wire — each frame is already newline-terminated JSON, so
+    # the file reads as JSONL for free. No header, no metadata: if the
+    # file exists it's a valid outbox; if it's empty or missing, the
+    # outbox is empty.
+
+    def _load_outbox_from_disk(self) -> None:
+        """Rehydrate the deque from disk on construction.
+
+        Silently skips a missing file (the common cold-start case).
+        Logs and ignores a corrupted file — a worker that can't parse
+        its stale outbox should still come up clean rather than crash.
+        Subject to the same entry/byte caps as in-memory enqueue, so a
+        tampered file can't force the process over its limits.
+        """
+        path = self._outbox_path
+        if path is None or not path.exists():
+            return
+        try:
+            raw = path.read_bytes()
+        except OSError as e:
+            print(
+                f"[agent_client] failed to read outbox {path}: {e!r}; "
+                f"continuing with empty outbox",
+                file=sys.stderr,
+            )
+            return
+        if not raw:
+            return
+        # Split on newlines; each frame already ends in one so the
+        # trailing split yields an empty string we drop.
+        loaded = 0
+        for line in raw.split(b"\n"):
+            if not line:
+                continue
+            # Validate by parsing — a frame that can't parse as JSON
+            # can't be a valid envelope; skip it rather than queue a
+            # poison pill the daemon will choke on.
+            try:
+                json.loads(line)
+            except (ValueError, UnicodeDecodeError) as e:
+                print(
+                    f"[agent_client] skipping corrupt outbox line "
+                    f"({len(line)} bytes, {e!r})",
+                    file=sys.stderr,
+                )
+                continue
+            # Re-terminate with newline since we split it off.
+            frame = line + b"\n"
+            # Cap enforcement is done via _enqueue's direct appends —
+            # but we want to avoid re-triggering _persist_outbox() for
+            # each reloaded frame (N^2 I/O). Append manually under cap.
+            if (
+                len(self._outbox) >= OUTBOX_MAX_ENTRIES
+                or (
+                    self._outbox
+                    and self._outbox_bytes + len(frame) > OUTBOX_MAX_BYTES
+                )
+            ):
+                # File exceeded caps — drop oldest to stay under. Rare;
+                # would require someone to have written a too-big file
+                # while the worker was down.
+                dropped = self._outbox.popleft()
+                self._outbox_bytes -= len(dropped)
+                self._outbox_dropped += 1
+            self._outbox.append(frame)
+            self._outbox_bytes += len(frame)
+            loaded += 1
+        if loaded > 0:
+            print(
+                f"[agent_client] rehydrated {loaded} frame(s) "
+                f"({self._outbox_bytes} bytes) from {path}",
+                file=sys.stderr,
+            )
+
+    def _persist_outbox(self) -> None:
+        """Atomically write the current deque to disk.
+
+        Temp-file + rename so a crash mid-write can't leave a half-
+        truncated outbox. When the deque is empty the file is removed
+        (clean shutdown tidies up after itself). Errors are logged
+        but non-fatal: losing persistence is worse than crashing the
+        worker.
+        """
+        path = self._outbox_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not self._outbox:
+                # Empty outbox — remove the file entirely.
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                return
+            # Build the full payload in memory (bounded by OUTBOX_MAX_BYTES
+                # + per-frame newlines already included).
+            payload = b"".join(self._outbox)
+            # Atomic write: temp file in the same directory → rename.
+            # delete=False so we can rename; we clean up on the error
+            # path ourselves.
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                prefix=".outbox.",
+                suffix=".tmp",
+                dir=str(path.parent),
+            )
+            try:
+                with os.fdopen(tmp_fd, "wb") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_name, path)
+            except Exception:
+                # Best-effort cleanup of the temp file if rename failed.
+                try:
+                    os.unlink(tmp_name)
+                except FileNotFoundError:
+                    pass
+                raise
+        except OSError as e:
+            print(
+                f"[agent_client] failed to persist outbox to {path}: "
+                f"{e!r}",
+                file=sys.stderr,
+            )
 
     async def connect_and_register(self) -> None:
         """Open the socket and send the register envelope.
@@ -229,6 +402,11 @@ class AgentClient:
             self._outbox.popleft()
             self._outbox_bytes -= len(frame)
             sent += 1
+            # Persist after every successful pop so a crash mid-flush
+            # doesn't cause the drained frame to replay next boot (the
+            # daemon is idempotent on replays anyway, but tidier this
+            # way). When the outbox empties this will delete the file.
+            self._persist_outbox()
         return sent
 
     async def send_accept(self, task_id: str) -> None:

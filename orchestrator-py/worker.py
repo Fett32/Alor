@@ -22,7 +22,14 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from prompt_toolkit.patch_stdout import patch_stdout
 
 import agent_client
-from agent_client import AgentClient, Envelope, MSG_TASK_ASSIGN, MSG_STATUS_REQUEST, MSG_SHUTDOWN
+from agent_client import (
+    AgentClient,
+    Envelope,
+    MSG_TASK_ASSIGN,
+    MSG_STATUS_REQUEST,
+    MSG_SHUTDOWN,
+    default_outbox_path,
+)
 import common
 from common import (
     C_BLUE, C_CYAN, C_DIM, C_GREEN, C_RED, C_RESET, C_YELLOW,
@@ -588,7 +595,15 @@ async def main() -> int:
         pass  # Not in main thread or not supported — not fatal.
 
     # Connect to daemon first — fail fast if it's not reachable.
-    sock = AgentClient(args.agent_id)
+    # Pass an outbox path so queued frames survive a full worker-
+    # process restart (dogfood reboots SIGKILL workers via pkill -f
+    # — see src-tauri/src/commands.rs::kill_all_agents). Without
+    # on-disk persistence a task.complete queued between Alor going
+    # down and coming back up would be lost when the worker dies.
+    sock = AgentClient(
+        args.agent_id,
+        outbox_path=default_outbox_path(args.agent_id),
+    )
     try:
         await sock.connect_and_register()
     except Exception as e:
