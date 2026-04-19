@@ -528,6 +528,15 @@ pub const DEFAULT_TASK_GET_VIEW: &str = "summary";
 ///   - Pass `limit = 0` for "no limit" (returns whole filtered set; only
 ///     use this when you've already counted and know it's safe).
 ///
+/// View-specific clamp (audit 8b03cae6 fix #3): `view = "full"` is
+/// hard-clamped to `TASK_LIST_FULL_MAX_LIMIT` (50) tasks per page
+/// regardless of what the caller passed. `limit = 0` on full view
+/// does NOT disable pagination — it gets clamped too. When the
+/// clamp fires, the response carries `limit_clamped_from: <orig>,
+/// limit_applied: 50` so the caller can see it and paginate.
+/// Summary view is left unclamped (lean enough that unlimited scans
+/// are context-safe at realistic task counts).
+///
 /// `view` controls the per-task field projection:
 ///   - `None` or `"summary"` (default — see `DEFAULT_TASK_LIST_VIEW`):
 ///     return only {id, title, state, assigned_to, updated_at}. ~70
@@ -569,6 +578,26 @@ pub const DEFAULT_TASK_LIST_LIMIT: u32 = 20;
 /// Default `view` for `cli.task.list`. "summary" keeps scans lean;
 /// callers that need detail must opt in with `"full"`.
 pub const DEFAULT_TASK_LIST_VIEW: &str = "summary";
+
+/// Hard cap on tasks returned per `cli.task.list` call when
+/// `view = "full"`. Applied regardless of what the caller passes for
+/// `limit` — including `limit = 0` ("no limit"). Existing summary
+/// view is not clamped (the per-task projection is ~70 tokens, so
+/// unlimited is cheap enough in practice).
+///
+/// Sized against the pathological-case analysis in audit 8b03cae6
+/// fix #3: full-view tasks serialize to ~1.1 KB each on average
+/// (heavy tails up to ~4 KB with populated description +
+/// proposal_diff). 50 tasks at 1.1 KB ≈ 55 KB worst-case response;
+/// callers that genuinely need more paginate via `offset += 50`. The
+/// pre-clamp worst case was 100+ tasks × 1.1 KB = 110 KB+ landing in
+/// a single orch tool response.
+///
+/// Callers that trip the clamp see
+/// `limit_clamped_from: <original>, limit_applied: 50` in the
+/// response envelope alongside `total` / `has_more` so they can
+/// recognize the cap and paginate if they really need more.
+pub const TASK_LIST_FULL_MAX_LIMIT: u32 = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliAssign {

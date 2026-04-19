@@ -132,12 +132,18 @@ async def task_get(args: dict[str, Any]) -> dict[str, Any]:
     "server-side (default 20 tasks/page) to keep orch context under "
     "budget; response includes total/returned/offset/has_more — "
     "paginate by re-calling with offset += returned while has_more is "
-    "true. View defaults to 'summary' "
+    "true. "
+    "View defaults to 'summary' "
     "(id/title/state/assigned_to/updated_at only, ~70 tokens/task) — "
-    "use it for scans and raise limit freely (e.g. 200). Pass "
-    "view='full' only if you genuinely need descriptions/proposals for "
-    "many tasks at once; otherwise prefer task_get for single-task "
-    "detail reads.",
+    "use it for scans and raise limit freely (e.g. 200) or pass "
+    "limit=0 for unlimited (summary is cheap enough at any scale). "
+    "view='full' is for a specific handful of tasks you need "
+    "descriptions/proposals for — pair it with a small limit (≤20) "
+    "or rely on the server's auto-clamp at 50 (limit=0 or limit>50 "
+    "on full view is clamped to 50 and the response carries "
+    "`limit_clamped_from` + `limit_applied` fields). For bulk scans, "
+    "ALWAYS use summary — never full. For a single task's detail, "
+    "prefer task_get over task_list(view='full', limit=1).",
     {"state": str, "limit": int, "offset": int, "view": str},
 )
 async def task_list(args: dict[str, Any]) -> dict[str, Any]:

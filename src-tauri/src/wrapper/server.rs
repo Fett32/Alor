@@ -29,8 +29,9 @@ use crate::wrapper::protocol::{
     MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
     MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
     MSG_WORKER_FRAME_WEDGED, MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT,
-    DEFAULT_TASK_GET_VIEW, TASK_SUMMARY_MAX_BYTES, WORKER_ECHO_SENTINEL_BEGIN,
-    WORKER_ECHO_SENTINEL_END, ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
+    DEFAULT_TASK_GET_VIEW, TASK_LIST_FULL_MAX_LIMIT, TASK_SUMMARY_MAX_BYTES,
+    WORKER_ECHO_SENTINEL_BEGIN, WORKER_ECHO_SENTINEL_END,
+    ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -768,50 +769,96 @@ impl SocketServer {
 
                 let total = tasks.len() as u32;
                 let offset = payload.offset.unwrap_or(0);
-                let limit = payload
+                let requested_limit = payload
                     .limit
                     .unwrap_or(crate::wrapper::protocol::DEFAULT_TASK_LIST_LIMIT);
 
+                // Resolve view first — the clamp below depends on it.
+                // Projection: default to "summary" (lean 5-field shape
+                // sized for context-safe scans). "full" returns the
+                // whole Task. Anything else silently falls back to
+                // summary — an LLM typo mustn't crash the list.
+                let requested_view = payload.view.as_deref().unwrap_or(
+                    crate::wrapper::protocol::DEFAULT_TASK_LIST_VIEW,
+                );
+                let is_full_view = requested_view == "full";
+
+                // Audit 8b03cae6 fix #3: hard-clamp on `view="full"` so a
+                // caller that passes `limit=0` (no limit) or a large
+                // limit can't land 100+ full-serialized Task objects in
+                // a single orch tool response. 50 × ~1.1 KB = ~55 KB
+                // worst case, bounded. Summary view remains uncapped —
+                // the projection is lean enough that unlimited scans
+                // are safe at realistic task counts.
+                //
+                // `limit = 0` on full view is the sneakiest case: the
+                // existing handler treated 0 as "no limit", which let
+                // the clamp escape. We unify both oversize cases here:
+                // any full-view limit that would return > MAX_LIMIT
+                // gets clamped (including the sentinel 0 → unlimited
+                // reading).
+                let (effective_limit, limit_clamped_from) = if is_full_view {
+                    let would_exceed =
+                        requested_limit == 0 || requested_limit > TASK_LIST_FULL_MAX_LIMIT;
+                    if would_exceed {
+                        warn!(
+                            requested_limit,
+                            clamped_to = TASK_LIST_FULL_MAX_LIMIT,
+                            "task_list: clamping view=full limit (see audit 8b03cae6 fix #3; \
+                             caller should paginate via offset or use view=summary for scans)"
+                        );
+                        (TASK_LIST_FULL_MAX_LIMIT, Some(requested_limit))
+                    } else {
+                        (requested_limit, None)
+                    }
+                } else {
+                    // Summary view: leave limit=0 as "no limit" intact
+                    // (cheap per-task projection; unlimited scans are
+                    // fine). No clamp metadata in the response.
+                    (requested_limit, None)
+                };
+
                 let start = (offset as usize).min(tasks.len());
-                let end = if limit == 0 {
+                let end = if effective_limit == 0 {
                     tasks.len()
                 } else {
-                    (start + limit as usize).min(tasks.len())
+                    (start + effective_limit as usize).min(tasks.len())
                 };
                 let page: Vec<_> = tasks[start..end].to_vec();
                 let returned = page.len() as u32;
                 let has_more = (start + page.len()) < tasks.len();
 
-                // Projection: default to "summary" (lean 5-field shape
-                // sized for context-safe scans). "full" returns the
-                // whole Task. Anything else silently falls back to
-                // summary — an LLM typo mustn't crash the list.
-                // The literal `view` string we emit in the response
-                // tells the caller which shape they actually got.
-                let requested_view = payload.view.as_deref().unwrap_or(
-                    crate::wrapper::protocol::DEFAULT_TASK_LIST_VIEW,
-                );
+                // Emit the view string the server actually applied so
+                // a caller that typoed (and fell through to summary)
+                // sees which shape came back.
                 let (tasks_json, view_emitted): (serde_json::Value, &'static str) =
-                    match requested_view {
-                        "full" => (json!(page), "full"),
-                        _ => {
-                            let summaries: Vec<_> =
-                                page.iter().map(|t| t.summary()).collect();
-                            (json!(summaries), "summary")
-                        }
+                    if is_full_view {
+                        (json!(page), "full")
+                    } else {
+                        let summaries: Vec<_> =
+                            page.iter().map(|t| t.summary()).collect();
+                        (json!(summaries), "summary")
                     };
 
-                match Envelope::new(
-                    MSG_CLI_RESPONSE,
-                    json!({
-                        "tasks": tasks_json,
-                        "total": total,
-                        "returned": returned,
-                        "offset": offset,
-                        "has_more": has_more,
-                        "view": view_emitted,
-                    }),
-                ) {
+                // Build response. When the full-view clamp fired we
+                // add `limit_clamped_from` + `limit_applied` so the
+                // caller can recognize the cap. Absent on unclamped
+                // responses so the normal path's shape is unchanged
+                // (back-compat for anyone eyeballing the envelope).
+                let mut resp = json!({
+                    "tasks": tasks_json,
+                    "total": total,
+                    "returned": returned,
+                    "offset": offset,
+                    "has_more": has_more,
+                    "view": view_emitted,
+                });
+                if let Some(orig) = limit_clamped_from {
+                    let obj = resp.as_object_mut().expect("resp is a JSON object");
+                    obj.insert("limit_clamped_from".to_string(), json!(orig));
+                    obj.insert("limit_applied".to_string(), json!(effective_limit));
+                }
+                match Envelope::new(MSG_CLI_RESPONSE, resp) {
                     Ok(mut e) => {
                         e.correlation_id = correlation_id;
                         e
@@ -2734,6 +2781,228 @@ mod tests {
             "missing-task error payload must say 'not found'; got {:?}",
             resp.payload
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // task_list full-view limit clamp (audit 8b03cae6 fix #3)
+    // ---------------------------------------------------------------------
+    //
+    // The list view=full escape hatch used to let a caller land 100+
+    // full-serialized Task objects (1.1 KB each → 110 KB+) in a single
+    // orchestrator tool response by passing `limit=0` or a large limit.
+    // These tests pin the server-side clamp at TASK_LIST_FULL_MAX_LIMIT
+    // (50), the limit_clamped_from / limit_applied response fields, and
+    // the summary-view leave-alone.
+
+    /// Helper: seed `n` tasks into state. Returns nothing — state is
+    /// consulted via the MSG_CLI_TASK_LIST handler directly.
+    fn seed_tasks(state: &AppState, n: usize) {
+        for i in 0..n {
+            state.add_task(Task::new(format!("task-{i}"), "d"));
+        }
+    }
+
+    /// Helper: fire a MSG_CLI_TASK_LIST with the given view/limit and
+    /// return the response payload for inspection.
+    async fn task_list_payload(
+        server: &SocketServer,
+        view: Option<&str>,
+        limit: Option<u32>,
+    ) -> serde_json::Value {
+        let mut body = serde_json::json!({});
+        if let Some(v) = view {
+            body["view"] = serde_json::json!(v);
+        }
+        if let Some(l) = limit {
+            body["limit"] = serde_json::json!(l);
+        }
+        // Force state_filter="all" so non-terminal filter doesn't
+        // silently drop our fixture tasks (new Task defaults to
+        // Pending, which IS non-terminal, but be explicit).
+        body["state_filter"] = serde_json::json!("all");
+        let env = Envelope::new(MSG_CLI_TASK_LIST, body).expect("build envelope");
+        let resp = server.handle_cli_message(env).await;
+        resp.payload
+    }
+
+    #[tokio::test]
+    async fn task_list_full_view_limit_zero_is_clamped_to_max() {
+        // limit=0 historically meant "no limit". On view=full that
+        // was the canonical escape hatch. Must now clamp to
+        // TASK_LIST_FULL_MAX_LIMIT and surface the clamp metadata.
+        let server = server_for_test();
+        seed_tasks(&server.app_state, 100);
+
+        let payload = task_list_payload(&server, Some("full"), Some(0)).await;
+
+        assert_eq!(payload.get("view").and_then(|v| v.as_str()), Some("full"));
+        assert_eq!(
+            payload
+                .get("returned")
+                .and_then(|v| v.as_u64())
+                .expect("returned"),
+            TASK_LIST_FULL_MAX_LIMIT as u64,
+            "limit=0 on view=full must clamp to TASK_LIST_FULL_MAX_LIMIT"
+        );
+        assert_eq!(
+            payload
+                .get("limit_clamped_from")
+                .and_then(|v| v.as_u64())
+                .expect("limit_clamped_from present"),
+            0,
+        );
+        assert_eq!(
+            payload
+                .get("limit_applied")
+                .and_then(|v| v.as_u64())
+                .expect("limit_applied present"),
+            TASK_LIST_FULL_MAX_LIMIT as u64,
+        );
+        // has_more correctly reflects the clamp — 100 tasks, 50
+        // returned, more remain.
+        assert_eq!(
+            payload.get("has_more").and_then(|v| v.as_bool()),
+            Some(true),
+            "clamp must not zero out has_more"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_full_view_large_limit_is_clamped_to_max() {
+        // limit=100 (or any limit > MAX) must clamp, with the clamp
+        // metadata reflecting the original value.
+        let server = server_for_test();
+        seed_tasks(&server.app_state, 100);
+
+        let payload = task_list_payload(&server, Some("full"), Some(100)).await;
+
+        assert_eq!(
+            payload
+                .get("returned")
+                .and_then(|v| v.as_u64())
+                .expect("returned"),
+            TASK_LIST_FULL_MAX_LIMIT as u64,
+        );
+        assert_eq!(
+            payload
+                .get("limit_clamped_from")
+                .and_then(|v| v.as_u64())
+                .expect("limit_clamped_from present"),
+            100,
+        );
+        assert_eq!(
+            payload
+                .get("limit_applied")
+                .and_then(|v| v.as_u64())
+                .expect("limit_applied present"),
+            TASK_LIST_FULL_MAX_LIMIT as u64,
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_full_view_small_limit_is_not_clamped() {
+        // A limit inside the cap must pass through untouched — no
+        // clamp metadata in the response so the normal-path shape
+        // is unchanged.
+        let server = server_for_test();
+        seed_tasks(&server.app_state, 100);
+
+        let payload = task_list_payload(&server, Some("full"), Some(10)).await;
+
+        assert_eq!(
+            payload
+                .get("returned")
+                .and_then(|v| v.as_u64())
+                .expect("returned"),
+            10,
+        );
+        assert!(
+            payload.get("limit_clamped_from").is_none(),
+            "unclamped response must NOT carry limit_clamped_from; \
+             got payload = {}",
+            payload
+        );
+        assert!(
+            payload.get("limit_applied").is_none(),
+            "unclamped response must NOT carry limit_applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_full_view_at_exact_cap_is_not_clamped() {
+        // Boundary: limit == MAX must NOT trigger the clamp (it's
+        // the exact allowed value). Guards against off-by-one in
+        // the `would_exceed` predicate.
+        let server = server_for_test();
+        seed_tasks(&server.app_state, 100);
+
+        let payload = task_list_payload(
+            &server,
+            Some("full"),
+            Some(TASK_LIST_FULL_MAX_LIMIT),
+        )
+        .await;
+
+        assert_eq!(
+            payload
+                .get("returned")
+                .and_then(|v| v.as_u64())
+                .expect("returned"),
+            TASK_LIST_FULL_MAX_LIMIT as u64,
+        );
+        assert!(
+            payload.get("limit_clamped_from").is_none(),
+            "limit == cap must not trigger clamp metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_summary_view_limit_zero_is_not_clamped() {
+        // Summary view remains unclamped — the per-task projection
+        // is lean (~70 tokens) and unlimited scans are context-safe
+        // at realistic task counts. This is the behavior callers
+        // doing a "give me everything for the dashboard" scan rely
+        // on; changing it here would be a regression for every
+        // summary consumer.
+        let server = server_for_test();
+        seed_tasks(&server.app_state, 100);
+
+        let payload = task_list_payload(&server, Some("summary"), Some(0)).await;
+
+        assert_eq!(payload.get("view").and_then(|v| v.as_str()), Some("summary"));
+        assert_eq!(
+            payload
+                .get("returned")
+                .and_then(|v| v.as_u64())
+                .expect("returned"),
+            100,
+            "summary view with limit=0 must return the whole filtered set"
+        );
+        assert!(
+            payload.get("limit_clamped_from").is_none(),
+            "summary-view response must not carry clamp metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_default_view_with_limit_zero_is_not_clamped() {
+        // Default view (no `view` field on the payload) resolves to
+        // summary per DEFAULT_TASK_LIST_VIEW. Same leave-alone
+        // contract as explicit summary.
+        let server = server_for_test();
+        seed_tasks(&server.app_state, 100);
+
+        let payload = task_list_payload(&server, None, Some(0)).await;
+
+        assert_eq!(payload.get("view").and_then(|v| v.as_str()), Some("summary"));
+        assert_eq!(
+            payload
+                .get("returned")
+                .and_then(|v| v.as_u64())
+                .expect("returned"),
+            100,
+        );
+        assert!(payload.get("limit_clamped_from").is_none());
     }
 
     #[tokio::test]
