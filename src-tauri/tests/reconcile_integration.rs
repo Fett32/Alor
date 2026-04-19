@@ -437,3 +437,83 @@ async fn mark_agent_killed_noop_for_unknown_agent() {
         .expect("auto-registered after set_agent_connected");
     assert!(!a.connected);
 }
+
+// ---------------------------------------------------------------------------
+// Reported `connected[]` tracks per-agent flag (regression: split-brain
+// between writers-map and per-agent `connected: bool`)
+// ---------------------------------------------------------------------------
+//
+// Live repro this locks down (2026-04-18): `agent_list` surfaced
+// cursor-alor in its top-level `connected[]` even though the per-agent
+// row's `connected` flag read false. Root cause: the cli.status
+// handler derived `connected[]` from `self.writers.keys()` and
+// `mark_agent_zombie` / `mark_agent_killed` deliberately leave writers
+// in place (to keep a lingering wrapper reachable for SHUTDOWN). The
+// fix points the reported list at
+// `AppState::connected_agent_ids` — the authoritative view backed by
+// the per-agent flag, which every mutation funnels through
+// `set_agent_connected`.
+
+#[tokio::test]
+async fn connected_index_follows_per_agent_flag_after_mark_agent_zombie() {
+    // Simulates the exact production repro: an agent gets into the
+    // zombie state (tmux session gone but wrapper socket lingering
+    // long enough to keep a writers entry alive), the caller flips
+    // it disconnected via mark_agent_zombie, and the next
+    // `agent_list` must NOT show the stale id in `connected[]`.
+    //
+    // We don't need a real tmux session here — just the state flag
+    // path. The bug was entirely in which source fed `connected[]`.
+    let state = AppState::new();
+    let server = SocketServer::with_configs(state.clone(), PaneManager::new(), vec![]);
+
+    state
+        .set_agent_connected("cursor-alor", true)
+        .expect("seed connected");
+    assert_eq!(state.connected_agent_ids(), vec!["cursor-alor".to_string()]);
+
+    // Flip to zombie. Per-agent flag goes false; writers untouched
+    // (matches the live repro shape — the stale entry is the whole
+    // point of this test).
+    server.mark_agent_zombie("cursor-alor").await;
+
+    // The reported index must reflect the per-agent flag.
+    assert!(
+        state.connected_agent_ids().is_empty(),
+        "connected index must drop ids whose per-agent flag is false; \
+         got {:?}",
+        state.connected_agent_ids()
+    );
+    assert!(!state.get_agent("cursor-alor").unwrap().connected);
+}
+
+#[tokio::test]
+async fn connected_index_follows_per_agent_flag_after_mark_agent_killed() {
+    // Parallel to the zombie case: cli.kill path funnels through
+    // mark_agent_killed. Same invariant — reported `connected[]`
+    // must drop the id once the flag flips.
+    let state = AppState::new();
+    let server = SocketServer::with_configs(state.clone(), PaneManager::new(), vec![]);
+
+    state
+        .set_agent_connected("cursor-alor-4", true)
+        .expect("seed connected");
+    state
+        .set_agent_connected("claude-alor", true)
+        .expect("seed connected");
+    let mut ids = state.connected_agent_ids();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["claude-alor".to_string(), "cursor-alor-4".to_string()]
+    );
+
+    server.mark_agent_killed("cursor-alor-4").await;
+
+    // Only the killed id drops out; the other stays.
+    assert_eq!(
+        state.connected_agent_ids(),
+        vec!["claude-alor".to_string()],
+        "mark_agent_killed must remove only the killed id from the index"
+    );
+}

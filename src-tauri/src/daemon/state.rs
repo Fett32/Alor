@@ -1196,6 +1196,35 @@ impl AppState {
             .collect()
     }
 
+    /// IDs of agents whose per-agent `connected: bool` is currently
+    /// true. This is the authoritative "connected index" surfaced in
+    /// the `cli.status` response's top-level `connected[]` list.
+    ///
+    /// Deriving the reported list from the per-agent flag — rather
+    /// than from the transport-layer `writers` map on SocketServer —
+    /// eliminates the split-brain that bit us when `mark_agent_zombie`
+    /// / `mark_agent_killed` flip `connected → false` but deliberately
+    /// leave the writers entry in place (so a lingering wrapper
+    /// socket can still receive SHUTDOWN). The per-agent flag is the
+    /// single source of truth for "does the UI / orchestrator
+    /// consider this agent online?"; the writers map remains purely
+    /// a transport concern (whose keys the daemon can still write to).
+    ///
+    /// Because every mutation of `Agent.connected` funnels through
+    /// `set_agent_connected`, this derivation is automatically
+    /// consistent: callers can't forget to update an auxiliary index.
+    /// Order is not stable (HashMap iteration); callers that compare
+    /// against a sorted list should sort before comparing.
+    pub fn connected_agent_ids(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .agents
+            .values()
+            .filter(|a| a.connected)
+            .map(|a| a.id.clone())
+            .collect()
+    }
+
     pub fn get_agent(&self, id: &str) -> Option<Agent> {
         self.inner.lock().agents.get(id).cloned()
     }
@@ -1503,6 +1532,93 @@ mod tests {
             3,
             "agent's 3 non-terminal tasks must be in current_tasks"
         );
+    }
+
+    #[test]
+    fn connected_agent_ids_tracks_set_agent_connected_flips() {
+        // Regression: `agent_list` used to surface the writers-map keys
+        // as its top-level `connected[]`, which drifted from the
+        // per-agent `connected` flag under `mark_agent_zombie` /
+        // `mark_agent_killed` (those deliberately leave writers
+        // untouched so a lingering socket can still receive SHUTDOWN).
+        // Live repro on cursor-alor: top-level `connected` included
+        // the id while the agent row said `connected: false`.
+        //
+        // The fix pins the reported list to the per-agent flag via
+        // `AppState::connected_agent_ids`. Because every mutation of
+        // `Agent.connected` funnels through `set_agent_connected`,
+        // flipping the flag automatically moves the id into or out
+        // of the reported index — no auxiliary structure to forget.
+        let state = AppState::new();
+
+        // Baseline: empty index before any agents exist.
+        assert!(state.connected_agent_ids().is_empty());
+
+        // Auto-register via set_agent_connected(true) — the production
+        // wrapper-register path. Agent must appear in the index.
+        state
+            .set_agent_connected("claude-alor", true)
+            .expect("first connect");
+        let ids = state.connected_agent_ids();
+        assert_eq!(ids, vec!["claude-alor".to_string()]);
+
+        // Second agent added; index grows.
+        state
+            .set_agent_connected("cursor-alor", true)
+            .expect("second connect");
+        let mut ids = state.connected_agent_ids();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["claude-alor".to_string(), "cursor-alor".to_string()]
+        );
+
+        // Flip cursor-alor → false via set_agent_connected. This is
+        // the code path exercised by mark_agent_zombie /
+        // mark_agent_killed / the read-loop cleanup. It must remove
+        // the id from the index.
+        state
+            .set_agent_connected("cursor-alor", false)
+            .expect("disconnect flip");
+        let ids = state.connected_agent_ids();
+        assert_eq!(
+            ids,
+            vec!["claude-alor".to_string()],
+            "disconnected agent must be removed from the index"
+        );
+
+        // The per-agent row survives (we tombstone only via
+        // remove_agent / delete_agent); its flag just reads false.
+        let a = state
+            .get_agent("cursor-alor")
+            .expect("row preserved on disconnect");
+        assert!(!a.connected);
+
+        // Flip back to true: the id must re-appear.
+        state
+            .set_agent_connected("cursor-alor", true)
+            .expect("reconnect flip");
+        let mut ids = state.connected_agent_ids();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["claude-alor".to_string(), "cursor-alor".to_string()],
+            "reconnected agent must be re-added to the index"
+        );
+
+        // Idempotent double-false: repeated disconnects must not
+        // produce a negative / duplicate entry. (set_agent_connected
+        // already tolerates this; belt-and-braces here because the
+        // live repro originated from exactly this shape — repeated
+        // disconnect signals arriving via different paths.)
+        state
+            .set_agent_connected("cursor-alor", false)
+            .expect("first disconnect");
+        state
+            .set_agent_connected("cursor-alor", false)
+            .expect("second disconnect is idempotent");
+        let ids = state.connected_agent_ids();
+        assert_eq!(ids, vec!["claude-alor".to_string()]);
     }
 
     #[test]

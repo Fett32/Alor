@@ -609,7 +609,22 @@ impl SocketServer {
                 let requested_view = payload.view.as_deref().unwrap_or(
                     crate::wrapper::protocol::DEFAULT_STATUS_VIEW,
                 );
-                let connected: Vec<String> = self.writers.lock().await.keys().cloned().collect();
+                // Derive `connected[]` from the per-agent `connected`
+                // flag rather than from `self.writers.keys()`. The
+                // writers map is the transport layer's record of
+                // "sockets I can currently write to" — intentionally
+                // kept around by `mark_agent_zombie` /
+                // `mark_agent_killed` even after the state flag has
+                // been flipped to false (so a lingering wrapper can
+                // still receive SHUTDOWN). Reporting that list as
+                // `connected[]` created a split-brain: cursor-alor
+                // showed as "connected" in agent_list while its
+                // per-agent record said `connected: false`. The
+                // per-agent flag is the authoritative view; every
+                // mutation of it funnels through
+                // `AppState::set_agent_connected`, which means this
+                // derivation can't drift.
+                let connected: Vec<String> = self.app_state.connected_agent_ids();
 
                 let response_json = match requested_view {
                     "full" => {
