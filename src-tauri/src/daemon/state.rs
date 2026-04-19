@@ -139,6 +139,25 @@ pub struct Task {
     pub parent_task_id: Option<Uuid>,
     #[serde(default)]
     pub subtask_order: u32,
+    /// Set to true by `record_user_intervention` when the wrapper's
+    /// tmux poll detects that pane content changed while the agent
+    /// wasn't idle — typically the user typing (or pasting) into the
+    /// agent's pane mid-task. The `user_intervened_at` companion
+    /// holds the timestamp of the most recent intervention.
+    ///
+    /// Informational-only: NOTHING in the daemon reads this flag as a
+    /// gate or guard. The task-completion paths (wrapper-driven
+    /// `MSG_TASK_COMPLETE`, orch-driven `MSG_CLI_TASK_COMPLETE`, state
+    /// machine `transition_task`) do not check it. It exists so the
+    /// orchestrator can surface "hey, Fett touched this task's pane"
+    /// in its own reasoning / summaries. If you see a task that
+    /// appears stuck with `user_intervened: true`, the flag is a
+    /// symptom, not the cause — look elsewhere (idle-detector
+    /// stability, wrapper reconnect cycles, etc).
+    ///
+    /// Cleared by `AppState::clear_user_intervention` or by setting
+    /// it back manually; see `cli.task.intervention.clear` RPC for
+    /// the orchestrator-facing path.
     #[serde(default)]
     pub user_intervened: bool,
     #[serde(default)]
@@ -1063,6 +1082,46 @@ impl AppState {
         affected
     }
 
+    /// Reset `user_intervened` + `user_intervened_at` on the given task.
+    /// Orchestrator-facing counterpart to `record_user_intervention`.
+    ///
+    /// Use case: Fett typed something into a worker's pane (which
+    /// latched `user_intervened: true`) but the input was
+    /// unsubmitted or unintentional. The flag is informational —
+    /// nothing in the daemon blocks completion on it — but leaving
+    /// it set is misleading when the task is still in-flight and
+    /// the intervention isn't relevant anymore. Exposed via
+    /// `cli.task.intervention.clear`.
+    ///
+    /// Idempotent: clearing an already-clear flag is a no-op.
+    /// Persists the state change + emits `tasks-changed` so the UI
+    /// refreshes. Returns the updated Task on success, NotFound on
+    /// unknown task id.
+    pub fn clear_user_intervention(&self, id: Uuid) -> anyhow::Result<Task> {
+        let mut s = self.inner.lock();
+        let task = s
+            .tasks
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("task {} not found", id))?;
+        let was_set = task.user_intervened;
+        task.user_intervened = false;
+        task.user_intervened_at = None;
+        if was_set {
+            task.updated_at = Utc::now();
+        }
+        let result = task.clone();
+        drop(s);
+        if was_set {
+            tracing::info!(
+                task_id = %id,
+                "cleared user_intervened flag"
+            );
+            self.save();
+            self.emit_event("tasks-changed");
+        }
+        Ok(result)
+    }
+
     // --- agents --------------------------------------------------------------
 
     pub fn register_agent(&self, agent: Agent) {
@@ -1427,6 +1486,84 @@ mod tests {
         assert!(summary.contains("\n\n[ALERT]"));
 
         let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn clear_user_intervention_resets_flag_and_timestamp() {
+        // record_user_intervention latches the flag; clear_user_intervention
+        // is the orch-facing reset. Used when Fett types into a worker's
+        // pane but the intervention is stale (unsubmitted keystrokes,
+        // typing mistake, etc.) and shouldn't keep the flag set.
+        let nonce = Uuid::new_v4();
+        let state_path = std::env::temp_dir().join(format!("alor-test-int-clear-{nonce}.json"));
+        let _ = std::fs::remove_file(&state_path);
+
+        let app_state = AppState::with_persistence(state_path.clone());
+        let mut t = Task::new("intervention clear", "test");
+        t.state = TaskState::Accepted;
+        t.assigned_to = Some("cursor-test".to_string());
+        let id = t.id;
+        app_state.add_task(t);
+
+        // Latch the flag via the normal intervention path.
+        let flagged = app_state.record_user_intervention("cursor-test");
+        assert_eq!(flagged, vec![id], "our task should be in the flagged set");
+        let after_set = app_state.get_task(id).expect("still present");
+        assert!(after_set.user_intervened);
+        assert!(after_set.user_intervened_at.is_some());
+        let set_updated_at = after_set.updated_at;
+
+        // Clear. Should reset both fields + bump updated_at.
+        let cleared = app_state
+            .clear_user_intervention(id)
+            .expect("clear succeeds");
+        assert!(!cleared.user_intervened);
+        assert_eq!(cleared.user_intervened_at, None);
+        assert_ne!(
+            cleared.updated_at, set_updated_at,
+            "clear must bump updated_at when the flag was actually set"
+        );
+        // Task state itself is unchanged.
+        assert_eq!(cleared.state, TaskState::Accepted);
+        assert_eq!(cleared.assigned_to.as_deref(), Some("cursor-test"));
+
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn clear_user_intervention_on_unset_flag_is_noop_no_updated_at_bump() {
+        // Clearing when the flag was never set must not modify the
+        // task (including updated_at). Matters because the orch may
+        // defensively call clear any time it re-processes a task.
+        let nonce = Uuid::new_v4();
+        let state_path = std::env::temp_dir().join(format!("alor-test-int-noop-{nonce}.json"));
+        let _ = std::fs::remove_file(&state_path);
+
+        let app_state = AppState::with_persistence(state_path.clone());
+        let t = Task::new("never flagged", "test");
+        let id = t.id;
+        let original_updated_at = t.updated_at;
+        app_state.add_task(t);
+
+        let cleared = app_state
+            .clear_user_intervention(id)
+            .expect("clear succeeds on unset flag");
+        assert!(!cleared.user_intervened);
+        assert_eq!(
+            cleared.updated_at, original_updated_at,
+            "no-op clear must not bump updated_at"
+        );
+
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn clear_user_intervention_unknown_task_errors() {
+        let app_state = AppState::new();
+        let err = app_state
+            .clear_user_intervention(Uuid::new_v4())
+            .expect_err("clearing an unknown task must error");
+        assert!(err.to_string().contains("not found"));
     }
 
     #[test]

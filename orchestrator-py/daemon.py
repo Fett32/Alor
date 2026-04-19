@@ -221,6 +221,22 @@ async def task_cancel(task_id: str) -> dict[str, Any]:
     return await _one_shot("cli.task.cancel", {"task_id": task_id})
 
 
+async def task_intervention_clear(task_id: str) -> dict[str, Any]:
+    """Reset the `user_intervened` flag on a task.
+
+    See src-tauri/src/daemon/state.rs::Task docstring: the flag is
+    informational-only (nothing in the daemon blocks completion on
+    it). Call this to clear a stale intervention — e.g. when Fett
+    typed into a worker's pane but nothing was actually submitted
+    and the intervention isn't semantically relevant anymore.
+
+    Returns {task_id, user_intervened} from the daemon response.
+    """
+    return await _one_shot(
+        "cli.task.intervention.clear", {"task_id": task_id}
+    )
+
+
 async def status() -> dict[str, Any]:
     return await _one_shot("cli.status")
 

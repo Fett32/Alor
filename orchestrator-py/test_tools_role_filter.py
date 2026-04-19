@@ -82,6 +82,7 @@ def test_allowed_tool_names_worker_is_the_five() -> None:
         "task_cancel",
         "task_get",
         "task_list",
+        "task_intervention_clear",
         "project_get",
         "project_list",
         "memory_get",

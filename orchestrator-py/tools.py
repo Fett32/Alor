@@ -175,6 +175,25 @@ async def task_cancel(args: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool(
+    "task_intervention_clear",
+    "Reset the `user_intervened` flag on a task. The flag is "
+    "informational-only (nothing in the daemon blocks completion on "
+    "it) but latches true when the wrapper detects Fett typing into "
+    "an agent pane mid-task. Call this when the intervention was "
+    "unsubmitted / unintentional and the flag is misleading — e.g. "
+    "worker has since finished, stray keystrokes didn't actually "
+    "steer anything. Does NOT unstick a task that's actually stuck "
+    "in ACCEPTED; for that, use `task_complete` explicitly.",
+    {"task_id": str},
+)
+async def task_intervention_clear(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _ok(await daemon.task_intervention_clear(args["task_id"]))
+    except Exception as e:
+        return _err(str(e))
+
+
+@tool(
     "agent_list",
     "List worker agents with full state (id, name, connected, project, tier, "
     "max_concurrent, tmux_session, task_history) plus all tasks. Call before "
@@ -344,6 +363,7 @@ ALL_TOOLS = [
     task_get,
     task_list,
     task_cancel,
+    task_intervention_clear,
     agent_list,
     agent_ensure_running,
     agent_spawn,

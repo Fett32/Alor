@@ -35,6 +35,7 @@ pub const MSG_CLI_TASK_GET: &str = "cli.task.get";
 pub const MSG_CLI_TASK_CREATE: &str = "cli.task.create";
 pub const MSG_CLI_TASK_CANCEL: &str = "cli.task.cancel";
 pub const MSG_CLI_TASK_COMPLETE: &str = "cli.task.complete";
+pub const MSG_CLI_TASK_INTERVENTION_CLEAR: &str = "cli.task.intervention.clear";
 pub const MSG_CLI_ASSIGN: &str = "cli.assign";
 pub const MSG_CLI_SPAWN: &str = "cli.spawn";
 pub const MSG_CLI_KILL: &str = "cli.kill";
@@ -340,6 +341,17 @@ pub struct CliTaskComplete {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliTaskCancel {
+    pub task_id: Uuid,
+}
+
+/// Payload for `cli.task.intervention.clear`. Orchestrator-callable
+/// reset of a task's `user_intervened` flag. See
+/// `Task.user_intervened` docstring for the flag's informational-only
+/// semantics. Intended for the case where Fett accidentally typed
+/// into an agent pane mid-task and the intervention is stale
+/// (unsubmitted / irrelevant).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliTaskInterventionClear {
     pub task_id: Uuid,
 }
 

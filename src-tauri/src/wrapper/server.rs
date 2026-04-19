@@ -16,13 +16,15 @@ use crate::terminal::pane_manager::PaneManager;
 use crate::wrapper::protocol::{
     CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliDelete, CliKill, CliMemoryGet,
     CliProjectGet, CliProjectSave, CliSpawn, CliTaskCancel, CliTaskCreate,
-    CliTaskComplete as CliTaskCompletePayload, CliTaskGet, CliTaskList, Envelope, TaskAccept, TaskAssign,
+    CliTaskComplete as CliTaskCompletePayload, CliTaskGet, CliTaskInterventionClear,
+    CliTaskList, Envelope, TaskAccept, TaskAssign,
     TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WorkerFrameWedged,
     WorkerOrchResponse, WorkerUserInput, WrapperError, WrapperRegister, MSG_CLI_AGENT_ENSURE_RUNNING,
     MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_DELETE, MSG_CLI_ERROR,
     MSG_CLI_EVENT_STREAM, MSG_CLI_KILL, MSG_CLI_MEMORY_GET, MSG_CLI_PROJECT_GET,
     MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE, MSG_CLI_RESPONSE, MSG_CLI_SPAWN,
     MSG_CLI_STATUS, MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE, MSG_CLI_TASK_CREATE,
+    MSG_CLI_TASK_INTERVENTION_CLEAR,
     MSG_CLI_TASK_GET, MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER,
     MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
     MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
@@ -742,6 +744,38 @@ impl SocketServer {
                                 e
                             }
                             Err(_) => cli_error(correlation_id, "failed to build response"),
+                        }
+                    }
+                    Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),
+                }
+            }
+
+            MSG_CLI_TASK_INTERVENTION_CLEAR => {
+                match env.decode_payload::<CliTaskInterventionClear>() {
+                    Ok(payload) => {
+                        match self.app_state.clear_user_intervention(payload.task_id) {
+                            Ok(task) => {
+                                match Envelope::new(
+                                    MSG_CLI_RESPONSE,
+                                    json!({
+                                        "task_id": payload.task_id.to_string(),
+                                        "user_intervened": task.user_intervened,
+                                    }),
+                                ) {
+                                    Ok(mut e) => {
+                                        e.correlation_id = correlation_id;
+                                        e
+                                    }
+                                    Err(_) => cli_error(
+                                        correlation_id,
+                                        "failed to build response",
+                                    ),
+                                }
+                            }
+                            Err(e) => cli_error(
+                                correlation_id,
+                                &format!("failed to clear intervention: {e}"),
+                            ),
                         }
                     }
                     Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),

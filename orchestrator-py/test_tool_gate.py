@@ -272,6 +272,7 @@ async def test_worker_denies_orch_only_alor_tools() -> None:
         "task_cancel",
         "task_get",
         "task_list",
+        "task_intervention_clear",
         "project_get",
         "project_list",
         "memory_get",
