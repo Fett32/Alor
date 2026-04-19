@@ -13,7 +13,7 @@ use protocol::{
 };
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ---- configuration constants ------------------------------------------------
 
@@ -249,12 +249,22 @@ enum ExitReason {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("alor_wrapper=info".parse().unwrap()),
-        )
-        .init();
+    // Default to `alor_wrapper=info`. `RUST_LOG` overrides — including
+    // `RUST_LOG=alor_wrapper=debug` to enable the idle-poll diagnostic
+    // trail documented on `run_loop`.
+    //
+    // Previous `from_default_env().add_directive("alor_wrapper=info")`
+    // was buggy: tracing-subscriber's "most recently added directive
+    // wins" rule meant the hard-coded `info` clobbered any env
+    // override on the same target (see tracing-subscriber EnvFilter
+    // docs). The builder `with_default_directive` + `from_env_lossy`
+    // pattern does it the right way around — the builder default is
+    // the fallback, the env layers on top and wins.
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::builder()
+        .with_default_directive("alor_wrapper=info".parse().unwrap())
+        .from_env_lossy();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     if let Err(e) = run_main().await {
         error!("alor-wrapper fatal error: {e:#}");
@@ -464,6 +474,29 @@ async fn run_main() -> Result<()> {
 }
 
 /// Run the main select loop. Returns the reason it exited.
+///
+/// **Debug instrumentation**: enable with
+/// `RUST_LOG=alor_wrapper=debug` (or `alor_wrapper=trace` for every
+/// poll cycle) to get a per-iteration trail of the idle detector's
+/// decision-making. The structured fields logged on each
+/// `idle_poll` event are:
+///   - `is_idle`         — what the detector says about the tail.
+///   - `past_idle_grace` — whether the post-injection grace window
+///                          has elapsed.
+///   - `idle_since_secs` — how long the pane has been continuously
+///                          classified as idle (None if reset).
+///   - `last_inj_secs`   — seconds since the last task-assign
+///                          injection (None if never injected).
+///   - `content_changed` — whether the tail fingerprint changed
+///                          since the prior poll.
+///   - `decision`        — fire / accumulate / reset(not-idle) /
+///                          reset(grace) / reset(daemon-msg).
+///
+/// Motivating bug (task bd61772a, investigation at cc9e757):
+/// wrapper was actively polling, pane was stable, detector should
+/// have classified as idle, yet task.complete never fired. Static
+/// analysis couldn't pin the block; this instrumentation is the
+/// diagnostic tool for the next repro.
 async fn run_loop(
     agent: &str,
     session: &str,
@@ -478,6 +511,20 @@ async fn run_loop(
     let mut last_intervention_sent: Option<Instant> = None;
     let mut prev_fingerprint: Option<String> = None;
     let mut last_heartbeat = Instant::now();
+
+    // Log every fresh run_loop entry — including reconnects —
+    // so a post-mortem can see whether the wrapper was churning
+    // through reconnect cycles (which reset idle_since to None
+    // and would prevent the IDLE_STABLE_SECS threshold from
+    // ever accumulating).
+    debug!(
+        agent,
+        state = match state {
+            AgentState::Idle => "idle",
+            AgentState::Running { .. } => "running",
+        },
+        "run_loop starting (fresh local state: idle_since/last_injection/prev_fingerprint = None)"
+    );
 
     loop {
         // ---- Heartbeat: stay alive in the UI every 3s ----
@@ -508,6 +555,7 @@ async fn run_loop(
             result = client.recv() => {
                 match result {
                     Ok(Some(envelope)) => {
+                        let kind = envelope.kind.clone();
                         let keep_running = handle_envelope(
                             envelope,
                             agent,
@@ -518,7 +566,16 @@ async fn run_loop(
                         )
                         .await?;
                         // Reset idle timer on any daemon message.
+                        let had_timer = idle_since.is_some();
                         idle_since = None;
+                        if had_timer {
+                            debug!(
+                                agent,
+                                envelope_kind = %kind,
+                                decision = "reset(daemon-msg)",
+                                "idle_poll: timer reset by incoming daemon message"
+                            );
+                        }
                         if !keep_running {
                             return Ok(ExitReason::Shutdown);
                         }
@@ -583,18 +640,43 @@ async fn run_loop(
                     // -- idle detection --
                     // Skip idle detection during injection grace period to avoid
                     // false positives while the agent processes injected text.
+                    let now = Instant::now();
                     let past_idle_grace = last_injection
-                        .map(|t| Instant::now().duration_since(t).as_secs_f64() >= INJECTION_GRACE_SECS)
+                        .map(|t| now.duration_since(t).as_secs_f64() >= INJECTION_GRACE_SECS)
                         .unwrap_or(true);
-                    if past_idle_grace && detector.is_idle_tail(&lines) {
-                        let now = Instant::now();
+                    // Re-call is_idle_tail once so both the branch decision and
+                    // the debug log see the same value — cheap (regex match
+                    // over <=15 lines) and avoids the "detector evaluated
+                    // twice in the same poll with a fresh pane capture" class
+                    // of mismatch.
+                    let is_idle = detector.is_idle_tail(&lines);
+                    let last_inj_secs = last_injection
+                        .map(|t| now.duration_since(t).as_secs_f64());
+
+                    if past_idle_grace && is_idle {
                         let first_seen = *idle_since.get_or_insert(now);
                         let elapsed = now.duration_since(first_seen).as_secs_f64();
 
                         if elapsed >= IDLE_STABLE_SECS {
+                            // Firing: log at info level (matches the existing
+                            // "idle pattern stable, task complete" line) and
+                            // also emit a structured debug record so a
+                            // post-mortem log trail can tie the fire to the
+                            // preceding accumulation polls.
                             info!(
                                 stable_for = format!("{elapsed:.1}s"),
                                 "idle pattern stable, task complete"
+                            );
+                            debug!(
+                                agent,
+                                task_id = %task_id,
+                                is_idle,
+                                past_idle_grace,
+                                idle_since_secs = Some(elapsed),
+                                last_inj_secs,
+                                content_changed,
+                                decision = "fire",
+                                "idle_poll"
                             );
                             *state = AgentState::Idle;
                             idle_since = None;
@@ -607,10 +689,64 @@ async fn run_loop(
                                 },
                             )?;
                             client.send(&complete_env).await?;
+                        } else {
+                            debug!(
+                                agent,
+                                task_id = %task_id,
+                                is_idle,
+                                past_idle_grace,
+                                idle_since_secs = Some(elapsed),
+                                last_inj_secs,
+                                content_changed,
+                                decision = "accumulate",
+                                "idle_poll"
+                            );
                         }
                     } else {
-                        // Output changed — reset the stability timer.
+                        // Not idle, or still in injection grace — reset the
+                        // stability timer. Log which condition caused the
+                        // reset so a stuck task can be diagnosed: we saw in
+                        // bd61772a that the pane LOOKED idle but the detector
+                        // was apparently returning false (or the branch
+                        // wasn't reached). The `decision` field pins down
+                        // which of the two sub-conditions tripped.
+                        let had_timer = idle_since.is_some();
                         idle_since = None;
+                        let decision = if !past_idle_grace {
+                            "reset(grace)"
+                        } else {
+                            // past_idle_grace is true but is_idle false
+                            "reset(not-idle)"
+                        };
+                        // Only log on state changes or on rising edge — at
+                        // trace level, log every poll; at debug level, log
+                        // only when the decision bit changes (had_timer
+                        // transition). Keeps debug output bounded but still
+                        // catches the critical "timer keeps getting reset"
+                        // repeating pattern.
+                        if had_timer {
+                            debug!(
+                                agent,
+                                task_id = %task_id,
+                                is_idle,
+                                past_idle_grace,
+                                last_inj_secs,
+                                content_changed,
+                                decision,
+                                "idle_poll: timer reset"
+                            );
+                        } else {
+                            tracing::trace!(
+                                agent,
+                                task_id = %task_id,
+                                is_idle,
+                                past_idle_grace,
+                                last_inj_secs,
+                                content_changed,
+                                decision,
+                                "idle_poll"
+                            );
+                        }
                     }
                 }
                 Err(e) => {
