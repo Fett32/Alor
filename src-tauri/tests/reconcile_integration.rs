@@ -348,3 +348,92 @@ async fn mark_agent_zombie_noop_for_unknown_agent() {
         .expect("auto-registered after set_agent_connected");
     assert!(!a.connected);
 }
+
+// ---------------------------------------------------------------------------
+// agent_kill → mark_agent_killed state-flip path
+// ---------------------------------------------------------------------------
+//
+// Regression test for the "kill leaves state.connected: true" bug
+// observed on cursor-alor-4 (repro 2026-04-19): `cli.kill` tore down
+// the tmux session but never flipped `state.connected`, so
+// `agent_list` kept reporting the agent as connected with a dead
+// session. The fix routes the kill path through a new
+// `SocketServer::mark_agent_killed` helper that mirrors
+// `mark_agent_zombie` but broadcasts with `reason: "killed"`.
+
+#[tokio::test]
+async fn mark_agent_killed_flips_state_and_preserves_writers() {
+    // Mirror of `mark_agent_zombie_flips_state_and_preserves_writers`
+    // for the kill path. Same contract: flip `connected` → false,
+    // do NOT touch the writers map (natural socket-close cleanup
+    // handles that when the wrapper actually dies).
+    let state = AppState::new();
+    let server = SocketServer::with_configs(state.clone(), PaneManager::new(), vec![]);
+    let killed_id = "test-killed-no-child";
+    state
+        .set_agent_connected(killed_id, true)
+        .expect("seed connected");
+    assert!(state.get_agent(killed_id).unwrap().connected);
+    // No wrapper registered → writers empty.
+    assert!(!server.is_connected(killed_id).await);
+
+    server.mark_agent_killed(killed_id).await;
+
+    assert!(
+        !state.get_agent(killed_id).unwrap().connected,
+        "mark_agent_killed must flip connected → false"
+    );
+    assert!(
+        !server.is_connected(killed_id).await,
+        "mark_agent_killed must not add the agent to writers"
+    );
+}
+
+#[tokio::test]
+async fn mark_agent_killed_is_idempotent_across_double_kill() {
+    // Edge case from the brief: if a tracked wrapper child IS
+    // killed, the daemon's read-loop cleanup will ALSO eventually
+    // fire a disconnect when the socket closes. We want the net
+    // effect to be a single observable state transition to
+    // disconnected — not a flip-flop, not an error.
+    //
+    // `set_agent_connected(id, false)` is already idempotent on the
+    // flag value (no-op when already false). Repeated
+    // `mark_agent_killed` calls therefore land at the same final
+    // state. Duplicate `agent.disconnected` broadcasts are
+    // tolerated by design (subscribers should be disconnect-
+    // idempotent too — the CLI event stream has no trouble with
+    // repeats).
+    let state = AppState::new();
+    let server = SocketServer::with_configs(state.clone(), PaneManager::new(), vec![]);
+    let killed_id = "test-killed-double";
+    state
+        .set_agent_connected(killed_id, true)
+        .expect("seed connected");
+
+    server.mark_agent_killed(killed_id).await;
+    assert!(!state.get_agent(killed_id).unwrap().connected);
+
+    // Second call — simulates the socket-close cleanup racing with
+    // the explicit kill. Must not panic, must not re-flip anything.
+    server.mark_agent_killed(killed_id).await;
+    assert!(
+        !state.get_agent(killed_id).unwrap().connected,
+        "double mark_agent_killed must leave state disconnected"
+    );
+}
+
+#[tokio::test]
+async fn mark_agent_killed_noop_for_unknown_agent() {
+    // Defensive parallel to mark_agent_zombie_noop_for_unknown_agent:
+    // killing an agent that was never registered (e.g. a stale id
+    // from an orch cache) auto-registers with connected=false
+    // rather than panicking.
+    let state = AppState::new();
+    let server = SocketServer::with_configs(state.clone(), PaneManager::new(), vec![]);
+    server.mark_agent_killed("never-registered").await;
+    let a = state
+        .get_agent("never-registered")
+        .expect("auto-registered after set_agent_connected");
+    assert!(!a.connected);
+}

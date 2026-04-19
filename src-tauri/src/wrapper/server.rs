@@ -1116,6 +1116,24 @@ impl SocketServer {
                         // instances the worker explicitly killed.
                         self.app_state.clear_task_spawn(&payload.instance);
 
+                        // Flip state.connected → false and broadcast
+                        // the disconnect. Previously only the tmux
+                        // session + optional child were cleaned up,
+                        // leaving `state.connected: true` stuck for
+                        // agents with no tracked daemon-spawned child
+                        // (e.g. wrappers that self-registered or were
+                        // launched outside the daemon). Symptom was
+                        // identical to a reconcile-detected zombie,
+                        // except caused by the kill itself rather than
+                        // organic pane death. Idempotent with the
+                        // natural socket-close cleanup: if the
+                        // wrapper's read loop ALSO fires disconnect
+                        // (via socket drop after child.kill() or after
+                        // tmux teardown cascades), the flip is a no-op
+                        // on the state flag and the duplicate
+                        // `agent.disconnected` broadcast is benign.
+                        self.mark_agent_killed(&payload.instance).await;
+
                         let msg = if killed_child {
                             format!("killed process and tmux session for {}", payload.instance)
                         } else {
@@ -2016,22 +2034,62 @@ impl SocketServer {
     /// normal socket-drop disconnect so CLI event subscribers can
     /// branch if they care.
     pub async fn mark_agent_zombie(&self, agent_id: &str) {
+        self.mark_agent_disconnected(agent_id, "zombie_auto_cleared").await;
+    }
+
+    /// Mark an agent as disconnected because it was just killed. Called
+    /// from the `MSG_CLI_KILL` handler after the child process + tmux
+    /// session have been taken down. Analogous to `mark_agent_zombie`
+    /// but with a distinct `reason` so event subscribers can tell
+    /// "orch explicitly killed this" apart from "reconcile detected a
+    /// zombie and auto-cleaned up."
+    ///
+    /// Historical bug this addresses (task 2026-04-19 repro): the
+    /// `cli.kill` handler used to take the tmux session down but
+    /// never flip `state.connected` to false. For agents without a
+    /// tracked daemon-spawned child the wrapper's socket wasn't
+    /// closed by the kill path — so the natural "socket drop →
+    /// normal disconnect cleanup" never fired and `agent_list`
+    /// still showed `connected: true` with no tmux session. Classic
+    /// zombie shape, except caused by the kill itself. Calling this
+    /// method unconditionally from the kill path makes the state
+    /// transition loudly authoritative.
+    pub async fn mark_agent_killed(&self, agent_id: &str) {
+        self.mark_agent_disconnected(agent_id, "killed").await;
+    }
+
+    /// Shared implementation for the disconnect-with-reason paths.
+    /// Flips `state.connected` to false and broadcasts
+    /// `agent.disconnected` with the supplied reason. Deliberately
+    /// does NOT touch the `writers` map — kept wrapper sockets, if
+    /// any, drop through the normal read-loop cleanup path when they
+    /// actually close (see the handler in `handle_message`). That
+    /// preserves the ability to reach a still-live wrapper socket
+    /// for a follow-up SHUTDOWN if needed.
+    ///
+    /// Idempotent on repeated calls: `set_agent_connected(id, false)`
+    /// on an already-disconnected agent is a no-op for the flag
+    /// value; broadcast goes out each time but subscribers are
+    /// expected to tolerate duplicate disconnect events.
+    async fn mark_agent_disconnected(&self, agent_id: &str, reason: &str) {
         if let Err(e) = self.app_state.set_agent_connected(agent_id, false) {
             warn!(
                 agent_id,
-                "mark_agent_zombie: set_agent_connected(false) failed: {e:#}"
+                reason,
+                "mark_agent_disconnected: set_agent_connected(false) failed: {e:#}"
             );
             return;
         }
         info!(
             agent_id,
-            "reconcile_panes: zombie auto-cleared (connected -> false)"
+            reason,
+            "agent marked disconnected (connected -> false)"
         );
         self.broadcast_event(
             "agent.disconnected",
             json!({
                 "agent_id": agent_id,
-                "reason": "zombie_auto_cleared",
+                "reason": reason,
             }),
         )
         .await;
