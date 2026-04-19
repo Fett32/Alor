@@ -84,10 +84,20 @@ pub struct TaskAccept {
 }
 
 /// task.complete — idle pattern detected after a task.assign.
+///
+/// Mirrors the daemon-side `TaskComplete` in
+/// `src-tauri/src/wrapper/protocol.rs`. See that file for the
+/// summary / details split rationale. The Rust wrapper emits only
+/// `summary = None` today (idle-poll has no text to report), but
+/// the `details` field is carried so the Python SDK worker's richer
+/// completion payloads round-trip through the same struct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskComplete {
     pub task_id: Uuid,
     pub summary: Option<String>,
+    #[serde(default)]
+    pub details: Option<String>,
+    #[serde(default)]
     pub output: Option<serde_json::Value>,
 }
 

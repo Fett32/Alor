@@ -147,11 +147,92 @@ def test_task_blocked_and_other_paths_unchanged() -> None:
     assert_eq("non-injectable event -> None", skipped, None)
 
 
+def test_task_completed_with_has_details_appends_task_get_pointer() -> None:
+    """Audit 8b03cae6 fix #1: the worker splits its report into a terse
+    `summary` (injected verbatim) + an optional `details` (stashed on
+    the Task). When `has_details: true` rides on the event, the
+    formatter must append a `task_get(task_id=…)` pointer so the orch
+    knows where the full report lives. The full task_id (not the
+    8-char preview) has to land in the pointer so the orch can paste
+    it straight into a tool call.
+    """
+    full_id = "abcdef0123456789abcdef0123456789"
+    msg = orch_main.format_event_for_agent(
+        evt(
+            "task.completed",
+            {
+                "task_id": full_id,
+                "agent_id": "claude-alor",
+                "title": "Run the thing",
+                "summary": "Done; see details.",
+                "has_details": True,
+            },
+        )
+    )
+    assert msg is not None
+    assert_contains("has_details: still renders terse summary", msg, "Done; see details.")
+    assert_contains("has_details: appends task_get pointer", msg, "task_get(")
+    assert_contains("has_details: pointer carries full task_id", msg, full_id)
+    assert_contains(
+        "has_details: pointer mentions details field",
+        msg,
+        "`details`",
+    )
+
+
+def test_task_completed_without_has_details_omits_pointer() -> None:
+    """Back-compat path: `has_details` absent (old daemon) or False (new
+    daemon, worker's report fit in the terse budget) → no task_get
+    pointer. Short reports must still render as they did pre-fix.
+    """
+    msg = orch_main.format_event_for_agent(
+        evt(
+            "task.completed",
+            {
+                "task_id": "abcdef0123456789",
+                "agent_id": "claude-alor",
+                "title": "Tiny task",
+                "summary": "Done.",
+                # has_details deliberately omitted
+            },
+        )
+    )
+    assert msg is not None
+    assert_contains("no has_details: terse summary still rendered", msg, "Done.")
+    assert_eq(
+        "no has_details: no task_get pointer appended",
+        "task_get(" in msg,
+        False,
+    )
+
+    # Explicit False is equivalent to absent.
+    msg = orch_main.format_event_for_agent(
+        evt(
+            "task.completed",
+            {
+                "task_id": "abcdef0123456789",
+                "agent_id": "claude-alor",
+                "title": "Tiny task",
+                "summary": "Done.",
+                "has_details": False,
+            },
+        )
+    )
+    assert msg is not None
+    assert_eq(
+        "has_details=False: no task_get pointer appended",
+        "task_get(" in msg,
+        False,
+    )
+
+
 def main() -> int:
     test_task_completed_full_payload()
     test_task_completed_no_summary()
     test_task_completed_missing_title_fallback()
     test_task_blocked_and_other_paths_unchanged()
+    test_task_completed_with_has_details_appends_task_get_pointer()
+    test_task_completed_without_has_details_omits_pointer()
 
     print()
     print("PASS — task.completed renders a single rich injection with title + report.")

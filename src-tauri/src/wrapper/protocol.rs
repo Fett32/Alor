@@ -185,13 +185,93 @@ pub struct TaskBlocked {
 // ---------------------------------------------------------------------------
 
 /// Wrapper reports successful completion.
+///
+/// The `summary` / `details` split is the hot-path bloat fix from audit
+/// 8b03cae6: `task.completed` events inject the task's summary verbatim
+/// into the orchestrator's SDK context on every completion. When workers
+/// emit multi-KB reports this is the single highest-frequency source of
+/// context bloat in an active session.
+///
+/// Convention:
+///   - `summary` — **terse** (hard-capped at `TASK_SUMMARY_MAX_BYTES`
+///     server-side). This is what lands in the `task.completed` event
+///     and therefore in the orchestrator's prompt. The "what shipped
+///     + verdict" one-liner.
+///   - `details` — **optional, full report**. Stored on the Task and
+///     reachable via `task_get` on demand. Capped at the same 1 MiB
+///     limit as `summary` storage.
+///
+/// Back-compat: workers that only send `summary` still work — the
+/// server truncates oversized summary strings with a
+/// `"… [truncated]"` marker and logs a warn. `details` is optional
+/// (`#[serde(default)]`) so old wire payloads decode unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskComplete {
     pub task_id: Uuid,
-    /// Short human-readable summary of what was done.
+    /// Terse human-readable summary — one paragraph, injected verbatim
+    /// into the orchestrator's context on `task.completed`. Server hard-
+    /// caps at `TASK_SUMMARY_MAX_BYTES` and appends a truncation marker
+    /// on oversize.
     pub summary: Option<String>,
+    /// Full post-task report (unbounded-ish: 1 MiB cap in storage).
+    /// Stashed on the Task and available via `task_get`. None when the
+    /// worker's report fits within the terse `summary` budget — that
+    /// case emits `summary` only and skips the `has_details` pointer
+    /// in the event injection.
+    #[serde(default)]
+    pub details: Option<String>,
     /// Machine-readable output data (free-form JSON).
+    #[serde(default)]
     pub output: Option<serde_json::Value>,
+}
+
+/// Hard cap on the `TaskComplete::summary` field after server-side
+/// normalization. Values at or below this size pass through verbatim;
+/// larger values are truncated on a UTF-8 char boundary with
+/// `TASK_SUMMARY_TRUNCATION_MARKER` appended.
+///
+/// Sized to fit comfortably inside a single LLM context budget line
+/// after JSON envelope + formatter overhead: a 512 B summary + the
+/// ~200 B `format_event_for_agent` preamble lands ≈ 750 B per
+/// completion event. At 20 completions per session that's ~15 KB of
+/// orch-context cost for task.completed events — down from the pre-
+/// fix worst case of 10 KB per event (200 KB+ at the same frequency).
+pub const TASK_SUMMARY_MAX_BYTES: usize = 512;
+
+/// Suffix appended to a `TaskComplete::summary` when the server truncates
+/// it to fit `TASK_SUMMARY_MAX_BYTES`. Kept short (13 bytes) so the bulk
+/// of the cap is usable content. The marker doubles as a signal for the
+/// orch event formatter: if summary ends with this marker OR `details`
+/// is populated, append the "full report via task_get" pointer.
+pub const TASK_SUMMARY_TRUNCATION_MARKER: &str = "… [truncated]";
+
+/// Truncate `s` at a UTF-8 char boundary so the return value is at most
+/// `max_bytes` bytes long. When truncation happens, the marker is
+/// appended (and counted inside `max_bytes` — returned string never
+/// exceeds the cap). Returns `s` verbatim when already under the cap.
+///
+/// Used by the `MSG_TASK_COMPLETE` handler and (via re-export) by
+/// CLI-side callers that want to preview the truncation client-side.
+pub fn truncate_summary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let marker = TASK_SUMMARY_TRUNCATION_MARKER;
+    // Reserve room for the marker; if the cap is smaller than the
+    // marker itself, degrade to a plain hard-truncate (can't happen
+    // with TASK_SUMMARY_MAX_BYTES which is > marker.len(), but the
+    // fn is a public utility so stay defensive).
+    let target = max_bytes.saturating_sub(marker.len());
+    let mut end = target.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(max_bytes);
+    out.push_str(&s[..end]);
+    if end + marker.len() <= max_bytes {
+        out.push_str(marker);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -545,3 +625,107 @@ pub struct CliProjectSave {
     pub memory_agent: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_summary_passes_through_under_cap() {
+        // Values ≤ cap must round-trip verbatim — no marker appended,
+        // no allocation-shape surprises.
+        let s = "short report";
+        assert_eq!(
+            truncate_summary(s, TASK_SUMMARY_MAX_BYTES),
+            s,
+            "under-cap strings must round-trip unchanged"
+        );
+    }
+
+    #[test]
+    fn truncate_summary_caps_oversize_and_appends_marker() {
+        // ASCII oversize case: result is at most `max_bytes`, ends with
+        // the truncation marker, and contains a prefix of the input.
+        let big = "a".repeat(2_000);
+        let out = truncate_summary(&big, TASK_SUMMARY_MAX_BYTES);
+        assert!(
+            out.len() <= TASK_SUMMARY_MAX_BYTES,
+            "truncated summary must respect the byte cap; got {} bytes",
+            out.len()
+        );
+        assert!(
+            out.ends_with(TASK_SUMMARY_TRUNCATION_MARKER),
+            "truncated summary must carry the marker; got tail {:?}",
+            &out[out.len().saturating_sub(32)..]
+        );
+        // And the body is a prefix of the input, not some transformed form.
+        let body_len = out.len() - TASK_SUMMARY_TRUNCATION_MARKER.len();
+        assert_eq!(&out[..body_len], &big[..body_len]);
+    }
+
+    #[test]
+    fn truncate_summary_respects_utf8_char_boundaries() {
+        // Build a string whose truncation boundary lands mid-codepoint.
+        // The 3-byte `é` (via a combining sequence or a fancy emoji
+        // would also work; keep it simple with a 2-byte char). We use
+        // `á` (U+00E1 = 2 bytes in UTF-8) repeated so the boundary
+        // math predicts a mid-codepoint cut at the cap.
+        let ch = "á"; // 2 bytes
+        let s: String = ch.repeat(1000); // 2000 bytes, all 2-byte chars
+        let out = truncate_summary(&s, 101);
+        assert!(
+            out.len() <= 101,
+            "truncated string must respect the byte cap"
+        );
+        // The output must be valid UTF-8 (implied by being a &str; but
+        // we assert structurally: char_indices() iterates without panic).
+        let _ = out.char_indices().count();
+        // And — the important property — no byte mid-codepoint.
+        assert!(
+            out.is_char_boundary(out.len()),
+            "truncation must land on a UTF-8 char boundary"
+        );
+        assert!(out.ends_with(TASK_SUMMARY_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn truncate_summary_degrades_gracefully_when_cap_smaller_than_marker() {
+        // The public cap is well above the marker length so this path
+        // never fires in production, but the fn is a public utility.
+        // Confirm we don't panic and don't emit an invalid string.
+        let out = truncate_summary("abcdef", 3);
+        assert!(out.len() <= 3);
+        // Marker wouldn't fit — so it's omitted, not half-rendered.
+        assert!(!out.contains("… ["));
+    }
+
+    #[test]
+    fn task_complete_payload_round_trips_with_details() {
+        // Wire-shape smoke test. New `details` field deserializes from
+        // both "field present" and "field absent" payloads (back-compat
+        // for existing wrappers that only know `summary`).
+        let with_details = serde_json::json!({
+            "task_id": Uuid::nil(),
+            "summary": "terse verdict",
+            "details": "long multi-paragraph report\n…",
+            "output": null,
+        });
+        let decoded: TaskComplete = serde_json::from_value(with_details).unwrap();
+        assert_eq!(decoded.summary.as_deref(), Some("terse verdict"));
+        assert_eq!(
+            decoded.details.as_deref(),
+            Some("long multi-paragraph report\n…")
+        );
+
+        // Legacy shape: no `details` key at all. Must default to None,
+        // not fail to decode. This is the back-compat contract — old
+        // workers in the wild keep working through a daemon upgrade.
+        let legacy = serde_json::json!({
+            "task_id": Uuid::nil(),
+            "summary": "just a summary",
+        });
+        let decoded: TaskComplete = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.summary.as_deref(), Some("just a summary"));
+        assert_eq!(decoded.details, None);
+        assert_eq!(decoded.output, None);
+    }
+}

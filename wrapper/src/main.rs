@@ -685,6 +685,7 @@ async fn run_loop(
                                 TaskComplete {
                                     task_id,
                                     summary: None,
+                                    details: None,
                                     output: None,
                                 },
                             )?;

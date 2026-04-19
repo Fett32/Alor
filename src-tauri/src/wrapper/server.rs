@@ -14,8 +14,8 @@ use crate::daemon::project;
 use crate::daemon::state::{AppState, Task, TaskState};
 use crate::terminal::pane_manager::PaneManager;
 use crate::wrapper::protocol::{
-    CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliDelete, CliKill, CliMemoryGet,
-    CliProjectGet, CliProjectSave, CliSpawn, CliStatus, CliTaskCancel, CliTaskCreate,
+    truncate_summary, CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliDelete, CliKill,
+    CliMemoryGet, CliProjectGet, CliProjectSave, CliSpawn, CliStatus, CliTaskCancel, CliTaskCreate,
     CliTaskComplete as CliTaskCompletePayload, CliTaskGet, CliTaskInterventionClear,
     CliTaskList, Envelope, TaskAccept, TaskAssign,
     TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WorkerFrameWedged,
@@ -29,7 +29,8 @@ use crate::wrapper::protocol::{
     MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
     MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
     MSG_WORKER_FRAME_WEDGED, MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT,
-    WORKER_ECHO_SENTINEL_BEGIN, WORKER_ECHO_SENTINEL_END, ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
+    TASK_SUMMARY_MAX_BYTES, WORKER_ECHO_SENTINEL_BEGIN, WORKER_ECHO_SENTINEL_END,
+    ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -404,9 +405,43 @@ impl SocketServer {
                     let task_title = self.app_state.get_task(payload.task_id)
                         .map(|t| t.title.clone())
                         .unwrap_or_default();
-                    if let Some(ref s) = payload.summary {
+
+                    // Summary / details split — hot-path bloat fix (audit
+                    // 8b03cae6 #1). The `summary` field is the terse one-
+                    // paragraph report that gets injected into the
+                    // orchestrator's SDK context on every `task.completed`
+                    // event. Hard-cap at TASK_SUMMARY_MAX_BYTES (512 B)
+                    // with a "… [truncated]" marker so a runaway worker
+                    // can't flood orch context with a multi-KB report.
+                    // The full report lives in `details` (if the worker
+                    // split it out) and is reachable via `task_get`.
+                    //
+                    // Back-compat path: old workers send a single summary
+                    // field with the whole report. They'll hit the
+                    // truncation branch and log a warn — harmless, just
+                    // the orch gets a clipped summary until the worker
+                    // is updated to send `details` explicitly.
+                    let summary_terse = payload.summary.as_ref().map(|s| {
+                        if s.len() > TASK_SUMMARY_MAX_BYTES {
+                            warn!(
+                                agent_id,
+                                task_id = %payload.task_id,
+                                original_bytes = s.len(),
+                                cap = TASK_SUMMARY_MAX_BYTES,
+                                "task.complete summary exceeds cap; truncating for orch injection (worker should supply a terse `summary` + full `details`)"
+                            );
+                            truncate_summary(s, TASK_SUMMARY_MAX_BYTES)
+                        } else {
+                            s.clone()
+                        }
+                    });
+                    if let Some(ref s) = summary_terse {
                         self.app_state.set_task_summary(payload.task_id, s.clone());
                     }
+                    if let Some(ref d) = payload.details {
+                        self.app_state.set_task_details(payload.task_id, d.clone());
+                    }
+                    let has_details = payload.details.is_some();
                     // Only broadcast task.completed if the transition actually
                     // succeeded — otherwise the orch hears "done" but state
                     // still says not-done.
@@ -421,6 +456,11 @@ impl SocketServer {
                     // already subscribes to this event, and the tmux line
                     // landed as stdin on top of the SDK injection, firing a
                     // duplicate turn per completion. Killed.
+                    //
+                    // `has_details` tells the orch formatter whether to
+                    // append the "(full report available via task_get)"
+                    // pointer. The full `details` body is NOT included in
+                    // the broadcast — that's the whole point of the split.
                     match self.app_state.transition_task(payload.task_id, TaskState::Completed) {
                         Ok(_) => {
                             self.broadcast_event(
@@ -429,7 +469,8 @@ impl SocketServer {
                                     "task_id": payload.task_id.to_string(),
                                     "agent_id": agent_id,
                                     "title": task_title,
-                                    "summary": payload.summary,
+                                    "summary": summary_terse,
+                                    "has_details": has_details,
                                 }),
                             )
                             .await;
@@ -2248,6 +2289,7 @@ fn is_framed_send_allowed(
 mod tests {
     use super::*;
     use crate::daemon::state::Agent;
+    use crate::wrapper::protocol::TASK_SUMMARY_TRUNCATION_MARKER;
 
     /// Build a minimal AgentConfig with just `runtime` set; every other
     /// field defaults. Kept here rather than in config.rs because these
@@ -2389,6 +2431,7 @@ mod tests {
             TaskComplete {
                 task_id,
                 summary: Some("second-summary".to_string()),
+                details: None,
                 output: None,
             },
         )
@@ -2406,6 +2449,122 @@ mod tests {
             task.summary.as_deref(),
             Some("first-summary"),
             "replayed completion must not overwrite existing summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_complete_splits_summary_and_details_on_the_wire() {
+        // Hot-path bloat fix #1 (audit 8b03cae6). When a worker sends
+        // `task.complete` with both `summary` and `details`, the daemon
+        // must:
+        //   (a) store the summary verbatim (we're under the 512 B cap
+        //       here — no truncation marker).
+        //   (b) store the details on the Task for `task_get` to return.
+        //   (c) transition the task to Completed.
+        //
+        // The associated broadcast shape (has_details flag, summary
+        // injected, details body NOT injected) is exercised separately
+        // via format_event_for_agent regression tests on the Python
+        // side; here we pin the state mutations.
+        let server = server_for_test();
+        let task = Task::new("t", "d");
+        let id = task.id;
+        server.app_state.add_task(task);
+        server
+            .app_state
+            .transition_task(id, TaskState::Assigned)
+            .expect("assign");
+        server
+            .app_state
+            .transition_task(id, TaskState::Accepted)
+            .expect("accept");
+
+        let env = Envelope::new(
+            MSG_TASK_COMPLETE,
+            TaskComplete {
+                task_id: id,
+                summary: Some("done; scope-check passed".to_string()),
+                details: Some(
+                    "Full report:\n- 3 tests added\n- 1 refactor\n- diff attached".to_string(),
+                ),
+                output: None,
+            },
+        )
+        .expect("build envelope");
+        server.handle_message("test-agent", env).await;
+
+        let t = server.app_state.get_task(id).expect("task present");
+        assert_eq!(t.state, TaskState::Completed);
+        assert_eq!(t.summary.as_deref(), Some("done; scope-check passed"));
+        assert_eq!(
+            t.details.as_deref(),
+            Some("Full report:\n- 3 tests added\n- 1 refactor\n- diff attached")
+        );
+        // Summary under cap must NOT carry the truncation marker.
+        assert!(
+            !t.summary
+                .as_deref()
+                .unwrap()
+                .ends_with(TASK_SUMMARY_TRUNCATION_MARKER),
+            "summary under cap must not be marked truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_complete_truncates_oversize_summary_with_marker() {
+        // Back-compat path: a worker (old or misbehaving) sends a multi-
+        // KB summary with no `details` split. The daemon must truncate
+        // at the protocol cap and stash the clipped form — it may NOT
+        // let a 10 KB summary reach the orch-event broadcast verbatim
+        // (that's the whole point of the fix). No details field gets
+        // synthesized from the oversize summary; the daemon is a
+        // dumb cap, not a splitter. Workers are responsible for the
+        // summary/details split on their side.
+        let server = server_for_test();
+        let task = Task::new("t", "d");
+        let id = task.id;
+        server.app_state.add_task(task);
+        server
+            .app_state
+            .transition_task(id, TaskState::Assigned)
+            .expect("assign");
+        server
+            .app_state
+            .transition_task(id, TaskState::Accepted)
+            .expect("accept");
+
+        // 5 KB of ASCII — comfortably over the 512 B cap.
+        let big = "a".repeat(5_000);
+        let env = Envelope::new(
+            MSG_TASK_COMPLETE,
+            TaskComplete {
+                task_id: id,
+                summary: Some(big.clone()),
+                details: None,
+                output: None,
+            },
+        )
+        .expect("build envelope");
+        server.handle_message("test-agent", env).await;
+
+        let t = server.app_state.get_task(id).expect("task present");
+        assert_eq!(t.state, TaskState::Completed);
+        let stored = t.summary.as_deref().expect("summary stored");
+        assert!(
+            stored.len() <= TASK_SUMMARY_MAX_BYTES,
+            "oversize summary must be truncated to cap; got {} bytes",
+            stored.len()
+        );
+        assert!(
+            stored.ends_with(TASK_SUMMARY_TRUNCATION_MARKER),
+            "truncated summary must carry the marker; got tail {:?}",
+            &stored[stored.len().saturating_sub(32)..]
+        );
+        // And the handler does NOT invent a details field from the clip.
+        // Details synthesis is the worker's job; daemon is cap-only.
+        assert!(
+            t.details.is_none(),
+            "server must not synthesize details from a truncated summary"
         );
     }
 

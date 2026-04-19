@@ -21,8 +21,9 @@ import daemon
 import tools
 from common import (
     C_CYAN, C_DIM, C_RED, C_RESET,
-    banner, print_footer, process_response, read_line,
+    banner, process_response, read_line,
 )
+from alor_footer import print_footer
 from tool_gate import make_gate
 
 DEFAULT_MODEL = os.environ.get("ALOR_ORCHESTRATOR_MODEL", "claude-opus-4-7[1m]")
@@ -62,19 +63,36 @@ def format_event_for_agent(evt: daemon.Event) -> str | None:
     d = evt.data or {}
     if evt.event == "task.completed":
         agent = d.get("agent_id", "?")
-        task_id = str(d.get("task_id", ""))[:8] or "?"
+        task_id_full = str(d.get("task_id", ""))
+        task_id = task_id_full[:8] or "?"
         title = d.get("title") or ""
+        # `summary` is the terse, server-side-capped form
+        # (TASK_SUMMARY_MAX_BYTES = 512 B). The full report — when the
+        # worker supplied one — lives in the Task's `details` field,
+        # retrievable via `task_get`. `has_details` flag on the event
+        # tells us whether to hint at that.
         summary = d.get("summary")
+        has_details = bool(d.get("has_details"))
         # Title may be empty if the task was pruned from state between
         # complete and broadcast; degrade gracefully rather than rendering
         # an empty quoted string.
         title_clause = f' "{title}"' if title else ""
         if summary:
-            return (
+            msg = (
                 f"[Alor event] task {task_id}{title_clause} "
                 f"completed by {agent}.\n\n"
                 f"Worker report:\n{summary}"
             )
+            if has_details and task_id_full:
+                # Point the orch at `task_get` for the full report. Use
+                # the full uuid so it can paste it straight into a tool
+                # call without reconstructing from the 8-char preview.
+                msg += (
+                    f"\n\n(Full report available via "
+                    f'task_get(task_id="{task_id_full}") — '
+                    f"the Task's `details` field.)"
+                )
+            return msg
         return (
             f"[Alor event] task {task_id}{title_clause} "
             f"completed by {agent} (no summary attached)."

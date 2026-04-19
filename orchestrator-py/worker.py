@@ -33,8 +33,9 @@ from agent_client import (
 import common
 from common import (
     C_BLUE, C_CYAN, C_DIM, C_GREEN, C_RED, C_RESET, C_YELLOW,
-    banner, print_footer, process_response, read_line,
+    banner, process_response, read_line,
 )
+from alor_footer import print_footer
 import tools
 from tool_gate import make_gate
 
@@ -176,22 +177,74 @@ async def run_task(
         current["task_id"] = None
         tools.set_current_task(None)
 
-    summary = latest["text"].strip() or None
-    # Cap summary client-side too so we don't blow through the daemon's
-    # 1 MiB hard cap and get silently truncated; 64 KiB is plenty for a
-    # post-task report.
-    if summary is not None:
-        encoded = summary.encode("utf-8")
-        MAX = 64 * 1024
-        if len(encoded) > MAX:
-            trimmed = encoded[:MAX]
-            # Back up to a valid UTF-8 boundary.
-            while trimmed and (trimmed[-1] & 0xC0) == 0x80:
-                trimmed = trimmed[:-1]
-            summary = trimmed.decode("utf-8", errors="ignore") + "\n…[truncated]"
+    full_report = latest["text"].strip() or None
+
+    # Split into terse summary + optional full-report details. The
+    # orchestrator's `task.completed` event only carries `summary`,
+    # which the daemon hard-caps at 512 B. Anything longer gets
+    # stashed in `details` and is reachable from the orch via
+    # `task_get` (hinted at by the event formatter when
+    # `has_details: true` lands in the broadcast).
+    #
+    # Policy (audit 8b03cae6 fix #1):
+    #   - Report fits in ~400 B → send as `summary` only. No details,
+    #     no truncation marker. Back-compat with single-string callers.
+    #   - Report > 400 B → emit the first paragraph (or first 400 B if
+    #     there's no paragraph break within that window) as the terse
+    #     `summary`, and send the *full* report as `details`.
+    #
+    # The 400 B worker-side target leaves headroom under the 512 B
+    # protocol cap so the daemon's safety-net truncation rarely fires;
+    # if it does (e.g. a worker with no paragraph break in 400 B), the
+    # daemon's UTF-8-safe `truncate_summary` still yields a well-
+    # formed string. 1 MiB server-side cap on `details` is enforced
+    # by `AppState::set_task_details`; we clamp client-side at 64 KiB
+    # to match the prior behavior and keep outbox frames bounded.
+    TERSE_TARGET = 400  # bytes, leaves ~112 B headroom under server cap
+    DETAILS_MAX = 64 * 1024  # bytes
+
+    summary: str | None = None
+    details: str | None = None
+
+    if full_report is not None:
+        encoded_full = full_report.encode("utf-8")
+        if len(encoded_full) <= TERSE_TARGET:
+            # Short report — summary-only. Matches the pre-split shape
+            # so the orch sees exactly what it used to for small reports.
+            summary = full_report
+        else:
+            # Long report — split. Prefer a paragraph boundary inside
+            # the first TERSE_TARGET bytes; fall back to a UTF-8-safe
+            # hard cut if the worker's output has no blank-line break
+            # in that window.
+            head_bytes = encoded_full[:TERSE_TARGET]
+            # Back up to a UTF-8 boundary first so slicing a paragraph
+            # break doesn't split a multi-byte char.
+            while head_bytes and (head_bytes[-1] & 0xC0) == 0x80:
+                head_bytes = head_bytes[:-1]
+            head = head_bytes.decode("utf-8", errors="ignore")
+            para_end = head.find("\n\n")
+            if para_end > 0:
+                summary = head[:para_end].rstrip()
+            else:
+                # No paragraph break — hard-cut with a terse marker.
+                # Daemon's TASK_SUMMARY_TRUNCATION_MARKER would land
+                # here too; we synthesize our own so the orch event
+                # carries the pointer to `task_get` regardless.
+                summary = head.rstrip() + "…"
+
+            # Details = the whole report, capped client-side. Daemon
+            # will re-cap at 1 MiB as a safety net.
+            if len(encoded_full) > DETAILS_MAX:
+                trimmed = encoded_full[:DETAILS_MAX]
+                while trimmed and (trimmed[-1] & 0xC0) == 0x80:
+                    trimmed = trimmed[:-1]
+                details = trimmed.decode("utf-8", errors="ignore") + "\n…[truncated]"
+            else:
+                details = full_report
 
     try:
-        await sock.send_complete(task_id, summary=summary)
+        await sock.send_complete(task_id, summary=summary, details=details)
     except Exception as e:
         print(f"{C_RED}[complete send failed] {e}{C_RESET}")
 

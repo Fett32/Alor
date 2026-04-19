@@ -413,11 +413,35 @@ class AgentClient:
         await self.send(MSG_TASK_ACCEPT, {"task_id": task_id})
 
     async def send_complete(
-        self, task_id: str, summary: str | None = None, output: Any = None
+        self,
+        task_id: str,
+        summary: str | None = None,
+        details: str | None = None,
+        output: Any = None,
     ) -> None:
+        """Wire a `task.complete` envelope to the daemon.
+
+        The `summary` / `details` split is the hot-path bloat fix from
+        audit 8b03cae6 (task 2ddec9b7):
+          - `summary` is the **terse** one-paragraph report. Server caps
+            it at TASK_SUMMARY_MAX_BYTES (512 B) before injecting into
+            the orchestrator's SDK context on `task.completed`.
+          - `details` is the optional **full report**. Stored on the
+            Task and reachable via `task_get`. Capped at 1 MiB
+            server-side.
+
+        Workers that only have a short report pass `summary` alone and
+        leave `details=None` — the back-compat shape. When the full
+        report would exceed the terse cap, the worker should produce
+        both a terse `summary` line and the full `details` body; the
+        orchestrator's event formatter will append a "full report via
+        task_get" pointer.
+        """
         payload: dict[str, Any] = {"task_id": task_id}
         if summary is not None:
             payload["summary"] = summary
+        if details is not None:
+            payload["details"] = details
         if output is not None:
             payload["output"] = output
         await self.send(MSG_TASK_COMPLETE, payload)

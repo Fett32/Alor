@@ -169,8 +169,23 @@ pub struct Task {
     #[serde(default)]
     pub proposal_diff: Option<String>,
     /// Final free-form answer/report from the worker (set on completion).
+    ///
+    /// This is the **terse** post-task summary — one paragraph, hard-
+    /// capped server-side at `wrapper::protocol::TASK_SUMMARY_MAX_BYTES`
+    /// (512 B) so the orchestrator's `task.completed` event injection
+    /// stays cheap. The full report lives in `details` when the worker
+    /// emitted one. See the `TaskComplete` docstring in
+    /// `src-tauri/src/wrapper/protocol.rs` for the split rationale.
     #[serde(default)]
     pub summary: Option<String>,
+    /// Full post-task report from the worker, when the terse `summary`
+    /// wasn't enough to carry the whole thing. Capped at 1 MiB. Not
+    /// injected into the orchestrator's context automatically — the
+    /// orchestrator must call `task_get` to pull this (the
+    /// `has_details` flag on the `task.completed` event tells it when
+    /// there's something to fetch).
+    #[serde(default)]
+    pub details: Option<String>,
     /// Name of the project profile this task relates to; used to build a
     /// TASK BRIEF (key files, docs) that is prepended when dispatching.
     #[serde(default)]
@@ -228,6 +243,7 @@ impl Task {
             proposal_brief: None,
             proposal_diff: None,
             summary: None,
+            details: None,
             project: None,
         }
     }
@@ -980,6 +996,13 @@ impl AppState {
 
     /// Record a worker-provided summary on the task.  Capped at 1 MiB to
     /// prevent a runaway worker from ballooning the session state file.
+    ///
+    /// Note: The `MSG_TASK_COMPLETE` handler applies the protocol-level
+    /// `TASK_SUMMARY_MAX_BYTES` (512 B) cap *before* calling this, so
+    /// wrapper-driven summaries never hit the 1 MiB path in practice.
+    /// The wider cap stays as a defense-in-depth safety net for
+    /// retroactive summary writes (e.g. orch-driven
+    /// `MSG_CLI_TASK_COMPLETE` on cancelled-task promotion).
     pub fn set_task_summary(&self, id: Uuid, summary: String) {
         const MAX_SUMMARY_BYTES: usize = 1024 * 1024;
         let text = if summary.len() > MAX_SUMMARY_BYTES {
@@ -999,6 +1022,39 @@ impl AppState {
         let mut s = self.inner.lock();
         if let Some(task) = s.tasks.get_mut(&id) {
             task.summary = Some(text);
+            task.updated_at = Utc::now();
+        }
+        drop(s);
+        self.save();
+    }
+
+    /// Record a worker-provided full-details report on the task. Mirrors
+    /// `set_task_summary` but stores to the `details` field (the "full
+    /// report, retrievable via task_get" counterpart to the terse
+    /// `summary`). Capped at 1 MiB with UTF-8-boundary truncation.
+    ///
+    /// Separate setter (rather than reusing `set_task_summary`) so the
+    /// two fields have independent lifetimes — e.g. a worker that only
+    /// has a terse line skips `details` entirely; a retroactive
+    /// close-out via `cli.task.complete` updates `summary` without
+    /// overwriting a previously-stashed `details`.
+    pub fn set_task_details(&self, id: Uuid, details: String) {
+        const MAX_DETAILS_BYTES: usize = 1024 * 1024;
+        let text = if details.len() > MAX_DETAILS_BYTES {
+            tracing::warn!(task_id = %id, bytes = details.len(), "task details truncated");
+            let mut end = MAX_DETAILS_BYTES;
+            while end > 0 && !details.is_char_boundary(end) {
+                end -= 1;
+            }
+            let mut d = details;
+            d.truncate(end);
+            d
+        } else {
+            details
+        };
+        let mut s = self.inner.lock();
+        if let Some(task) = s.tasks.get_mut(&id) {
+            task.details = Some(text);
             task.updated_at = Utc::now();
         }
         drop(s);
@@ -1532,6 +1588,73 @@ mod tests {
             3,
             "agent's 3 non-terminal tasks must be in current_tasks"
         );
+    }
+
+    #[test]
+    fn set_task_details_round_trips_and_is_independent_of_summary() {
+        // Task.details is the on-demand full-report counterpart to the
+        // capped `summary`. The two fields must be independently
+        // writable: setting details doesn't clobber summary, and vice
+        // versa. Task_get returns both (the whole Task struct) so this
+        // is the contract the orch relies on when it follows the
+        // "full report via task_get" pointer.
+        let state = AppState::new();
+        let task = Task::new("title", "desc");
+        let id = task.id;
+        state.add_task(task);
+
+        // Baseline: both fields start None.
+        let t = state.get_task(id).unwrap();
+        assert!(t.summary.is_none() && t.details.is_none());
+
+        // Write summary only → details stays None.
+        state.set_task_summary(id, "terse".to_string());
+        let t = state.get_task(id).unwrap();
+        assert_eq!(t.summary.as_deref(), Some("terse"));
+        assert!(t.details.is_none());
+
+        // Write details → summary is preserved.
+        state.set_task_details(id, "full report body".to_string());
+        let t = state.get_task(id).unwrap();
+        assert_eq!(t.summary.as_deref(), Some("terse"));
+        assert_eq!(t.details.as_deref(), Some("full report body"));
+
+        // Overwrite summary → details preserved.
+        state.set_task_summary(id, "updated terse".to_string());
+        let t = state.get_task(id).unwrap();
+        assert_eq!(t.summary.as_deref(), Some("updated terse"));
+        assert_eq!(t.details.as_deref(), Some("full report body"));
+    }
+
+    #[test]
+    fn set_task_details_truncates_at_1mib_on_utf8_boundary() {
+        // The 1 MiB cap mirrors set_task_summary — defense-in-depth
+        // against a worker shoveling a core dump into the field.
+        // Protocol-level cap on summary is 512 B; this 1 MiB cap is
+        // the storage-layer backstop.
+        let state = AppState::new();
+        let task = Task::new("t", "d");
+        let id = task.id;
+        state.add_task(task);
+
+        // 1 MiB + 100 bytes of 2-byte UTF-8 so the cut can land mid-
+        // codepoint if we're sloppy about boundaries.
+        let over: String = "á".repeat((1024 * 1024 / 2) + 50);
+        assert!(over.len() > 1024 * 1024);
+        state.set_task_details(id, over);
+
+        let stored = state.get_task(id).unwrap().details.unwrap();
+        assert!(
+            stored.len() <= 1024 * 1024,
+            "details must be capped at 1 MiB; got {} bytes",
+            stored.len()
+        );
+        // Valid UTF-8 — if the truncation landed mid-codepoint, stored
+        // wouldn't be a valid String at all (impossible, it's typed).
+        // Assert structurally that char iteration completes without
+        // panic and the final byte is a char boundary.
+        assert!(stored.is_char_boundary(stored.len()));
+        let _ = stored.chars().count();
     }
 
     #[test]
