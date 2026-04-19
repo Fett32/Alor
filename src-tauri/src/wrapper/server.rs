@@ -15,7 +15,7 @@ use crate::daemon::state::{AppState, Task, TaskState};
 use crate::terminal::pane_manager::PaneManager;
 use crate::wrapper::protocol::{
     CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliDelete, CliKill, CliMemoryGet,
-    CliProjectGet, CliProjectSave, CliSpawn, CliTaskCancel, CliTaskCreate,
+    CliProjectGet, CliProjectSave, CliSpawn, CliStatus, CliTaskCancel, CliTaskCreate,
     CliTaskComplete as CliTaskCompletePayload, CliTaskGet, CliTaskInterventionClear,
     CliTaskList, Envelope, TaskAccept, TaskAssign,
     TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WorkerFrameWedged,
@@ -592,17 +592,75 @@ impl SocketServer {
 
         match env.kind.as_str() {
             MSG_CLI_STATUS => {
-                let agents = self.app_state.all_agents();
-                let tasks = self.app_state.all_tasks();
+                // View selection:
+                //   - no payload / missing `view` / "summary" / unknown
+                //     → summary (default). agents only, task_history
+                //       dropped, top-level `tasks` omitted entirely.
+                //   - "full" → backwards-compatible firehose.
+                //
+                // The orchestrator's agent_list tool calls this on
+                // every routing decision; summary keeps the per-call
+                // context cost from ballooning with each accumulated
+                // task (dogfood saw 347k+ chars at 100+ tasks, almost
+                // all of which was the top-level `tasks` array).
+                // alor-cli and any consumer that wants the firehose
+                // opts in explicitly with view=full.
+                let payload: CliStatus = env.decode_payload().unwrap_or_default();
+                let requested_view = payload.view.as_deref().unwrap_or(
+                    crate::wrapper::protocol::DEFAULT_STATUS_VIEW,
+                );
                 let connected: Vec<String> = self.writers.lock().await.keys().cloned().collect();
-                match Envelope::new(
-                    MSG_CLI_RESPONSE,
-                    json!({
-                        "agents": agents,
-                        "tasks": tasks,
-                        "connected": connected,
-                    }),
-                ) {
+
+                let response_json = match requested_view {
+                    "full" => {
+                        let agents = self.app_state.all_agents();
+                        let tasks = self.app_state.all_tasks();
+                        json!({
+                            "view": "full",
+                            "agents": agents,
+                            "tasks": tasks,
+                            "connected": connected,
+                        })
+                    }
+                    _ => {
+                        // Summary: project each agent with its set of
+                        // non-terminal assigned task ids. Compute the
+                        // mapping once from all_tasks then distribute
+                        // per-agent so the lookup is O(tasks + agents)
+                        // rather than O(tasks * agents).
+                        let all_tasks = self.app_state.all_tasks();
+                        let mut active_by_agent: HashMap<String, Vec<Uuid>> = HashMap::new();
+                        for t in &all_tasks {
+                            if t.state.is_terminal() {
+                                continue;
+                            }
+                            if let Some(ref aid) = t.assigned_to {
+                                active_by_agent
+                                    .entry(aid.clone())
+                                    .or_default()
+                                    .push(t.id);
+                            }
+                        }
+                        let agents: Vec<_> = self
+                            .app_state
+                            .all_agents()
+                            .into_iter()
+                            .map(|a| {
+                                let current = active_by_agent
+                                    .remove(&a.id)
+                                    .unwrap_or_default();
+                                a.summary(current)
+                            })
+                            .collect();
+                        json!({
+                            "view": "summary",
+                            "agents": agents,
+                            "connected": connected,
+                        })
+                    }
+                };
+
+                match Envelope::new(MSG_CLI_RESPONSE, response_json) {
                     Ok(mut e) => {
                         e.correlation_id = correlation_id;
                         e

@@ -237,8 +237,31 @@ async def task_intervention_clear(task_id: str) -> dict[str, Any]:
     )
 
 
-async def status() -> dict[str, Any]:
-    return await _one_shot("cli.status")
+async def status(view: str | None = None) -> dict[str, Any]:
+    """Fetch agent roster (+ optionally tasks).
+
+    `view`:
+      - None or "summary" (server default) → lean response:
+        `{view, agents: [AgentSummary], connected}`. Each agent
+        has `id / name / connected / project / tier /
+        max_concurrent / template / tmux_session / current_tasks`
+        (non-terminal task UUIDs only). No `tasks` firehose.
+        Use for routing decisions where only "who's online, is
+        the slot busy?" matters.
+      - "full" → backwards-compatible firehose:
+        `{view, agents, tasks, connected}` with full Agent structs
+        (including task_history) and every task in state.json
+        inline. Use when you genuinely need per-agent history or
+        cross-agent task scans; prefer `task_list(view=summary)`
+        for plain task-roster queries.
+
+    Server-side branching via `view` on `cli.status` (see
+    src-tauri/src/wrapper/protocol.rs::CliStatus).
+    """
+    payload: dict[str, Any] = {}
+    if view is not None:
+        payload["view"] = view
+    return await _one_shot("cli.status", payload if payload else None)
 
 
 async def project_get(name: str) -> dict[str, Any]:

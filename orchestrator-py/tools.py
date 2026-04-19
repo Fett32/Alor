@@ -195,15 +195,28 @@ async def task_intervention_clear(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "agent_list",
-    "List worker agents with full state (id, name, connected, project, tier, "
-    "max_concurrent, tmux_session, task_history) plus all tasks. Call before "
-    "task_assign or agent_ensure_running so you know who's online and what "
-    "each slot is scoped to.",
-    {},
+    "List worker agents. Defaults to `view='summary'` — per-agent "
+    "{id, name, connected, project, tier, max_concurrent, template, "
+    "tmux_session, current_tasks} with current_tasks holding "
+    "non-terminal task UUIDs only (no embedded task data). Use this "
+    "for routing decisions (task_assign / agent_ensure_running): "
+    "it's the right shape for \"who's online, is the slot busy?\" "
+    "and avoids the ~85k-token-per-call bloat that `view='full'` "
+    "incurs when state.json has many tasks. "
+    "Pass `view='full'` only when you genuinely need per-agent "
+    "task_history or the full cross-agent task firehose — for "
+    "plain task-roster queries, prefer task_list(view=summary) "
+    "instead.",
+    {"view": str},
 )
 async def agent_list(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        return _ok(await daemon.status())
+        # Missing/blank view → server default ("summary"). Lowercase
+        # for forgiveness on LLM typos like "Summary" or "FULL"; the
+        # server treats unknown values as summary anyway.
+        raw_view = (args.get("view") or "").strip().lower()
+        view = raw_view or None
+        return _ok(await daemon.status(view=view))
     except Exception as e:
         return _err(str(e))
 

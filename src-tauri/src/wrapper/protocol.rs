@@ -344,6 +344,38 @@ pub struct CliTaskCancel {
     pub task_id: Uuid,
 }
 
+/// Payload for `cli.status`.
+///
+/// `view` controls the response shape:
+///   - `None` or `"summary"` (default — see `DEFAULT_STATUS_VIEW`):
+///     returns a lean agent roster only (no `tasks` array, no
+///     per-agent `task_history`). Each agent is projected to the
+///     `AgentSummary` shape plus a `current_tasks` list of
+///     non-terminal task UUIDs currently assigned to the slot.
+///     Orders of magnitude smaller than the full response when
+///     many tasks exist; sized for orchestrator routing decisions
+///     that call `agent_list` per turn.
+///   - `"full"`: backwards-compatible firehose. `agents` (full
+///     `Agent` structs including task_history), `tasks` (every
+///     task in state.json inline), `connected` (list of live
+///     socket agent_ids).
+///   - Anything else: silently treated as `"summary"`. An LLM
+///     caller with a typo shouldn't blow up the response.
+///
+/// The `view` field in the response echoes back which shape the
+/// server actually applied.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CliStatus {
+    #[serde(default)]
+    pub view: Option<String>,
+}
+
+/// Default `view` for `cli.status`. "summary" keeps
+/// routing-decision calls lean; consumers that need the task
+/// firehose must opt in with `"full"` (alor-cli status does
+/// this to preserve its display).
+pub const DEFAULT_STATUS_VIEW: &str = "summary";
+
 /// Payload for `cli.task.intervention.clear`. Orchestrator-callable
 /// reset of a task's `user_intervened` flag. See
 /// `Task.user_intervened` docstring for the flag's informational-only

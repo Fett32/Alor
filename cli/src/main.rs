@@ -26,7 +26,12 @@ impl Envelope {
 }
 
 #[derive(Serialize)]
-struct CliStatusRequest {}
+struct CliStatusRequest {
+    /// Daemon defaults to `view="summary"` which omits the `tasks`
+    /// array entirely — breaks the CLI display which prints tasks.
+    /// Request full explicitly to preserve pre-view-mode behaviour.
+    view: &'static str,
+}
 #[derive(Serialize)]
 struct CliTaskList {}
 #[derive(Serialize)]
@@ -246,7 +251,7 @@ async fn cmd_init() -> Result<()> {
 }
 
 async fn cmd_status() -> Result<()> {
-    let req = Envelope::new("cli.status", CliStatusRequest {})?;
+    let req = Envelope::new("cli.status", CliStatusRequest { view: "full" })?;
     let resp = send_request(&req).await?;
     let status: StatusResponsePayload = serde_json::from_value(resp.payload)?;
     println!("=== Agents ===");

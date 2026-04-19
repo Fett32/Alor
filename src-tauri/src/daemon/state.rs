@@ -330,6 +330,61 @@ impl Agent {
             self.task_history.pop_back();
         }
     }
+
+    /// Project to the summary-view shape used by `cli.status`'s
+    /// default response. The caller supplies `current_tasks` —
+    /// the non-terminal task UUIDs currently assigned to this
+    /// agent — which replaces the `task_history` firehose for
+    /// routing-decision use cases.
+    ///
+    /// The `tasks` field on the full `cli.status` response (which
+    /// serializes every task in state.json inline) is the real
+    /// bulk cost, not task_history itself. This projection drops
+    /// task_history too for completeness since callers that want
+    /// per-agent history can fetch individual tasks via `task_get`.
+    pub fn summary(&self, current_tasks: Vec<Uuid>) -> AgentSummary {
+        AgentSummary {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            connected: self.connected,
+            project: self.project.clone(),
+            tier: self.tier.clone(),
+            max_concurrent: self.max_concurrent,
+            template: self.template.clone(),
+            tmux_session: self.tmux_session.clone(),
+            current_tasks,
+        }
+    }
+}
+
+/// Projection of `Agent` used by `cli.status` when the caller
+/// requests `view = "summary"` (the default — see
+/// `crate::wrapper::protocol::DEFAULT_STATUS_VIEW`).
+///
+/// Drops `task_history`, `socket_path`, `registered_at`,
+/// `working_dir` from the serialized shape. Adds `current_tasks`
+/// holding only the non-terminal task UUIDs assigned to this
+/// agent at response-build time — enough information for
+/// routing decisions (is this slot busy?) without dragging in
+/// every past task's description.
+///
+/// Serialize-only; reconstructing a full `Agent` from a summary
+/// on the wire is not needed. ~150-300 bytes per agent depending
+/// on project / tmux_session string lengths; orders of magnitude
+/// smaller than the full shape when state contains many tasks.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentSummary {
+    pub id: String,
+    pub name: String,
+    pub connected: bool,
+    pub project: Option<String>,
+    pub tier: String,
+    pub max_concurrent: u8,
+    pub template: Option<String>,
+    pub tmux_session: Option<String>,
+    /// Non-terminal task UUIDs currently assigned to this agent.
+    /// Empty Vec when the slot has no active work.
+    pub current_tasks: Vec<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1270,6 +1325,184 @@ mod tests {
         .copied()
         .collect();
         assert_eq!(keys, expected, "summary must serialize exactly 5 fields");
+    }
+
+    #[test]
+    fn agent_summary_projects_expected_fields_and_current_tasks() {
+        // Verify the AgentSummary shape: correct field selection,
+        // task_history dropped, current_tasks populated from the
+        // caller-supplied Vec. Mirrors the contract
+        // `server.rs::MSG_CLI_STATUS` relies on.
+        let mut a = Agent::new("cursor-alor", "@ cursor-alor");
+        a.connected = true;
+        a.project = Some("alor".to_string());
+        a.tier = "light".to_string();
+        a.max_concurrent = 1;
+        a.template = Some("cursor".to_string());
+        a.tmux_session = Some("alor-cursor-alor".to_string());
+        a.working_dir = Some("~/Projects/Alor".to_string());
+        // Populate task_history to confirm it DOESN'T flow into summary.
+        for _ in 0..AGENT_TASK_HISTORY_MAX {
+            a.push_task_history(Uuid::new_v4());
+        }
+        assert_eq!(a.task_history.len(), AGENT_TASK_HISTORY_MAX);
+
+        let active = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let s = a.summary(active.clone());
+        assert_eq!(s.id, "cursor-alor");
+        assert_eq!(s.name, "@ cursor-alor");
+        assert!(s.connected);
+        assert_eq!(s.project.as_deref(), Some("alor"));
+        assert_eq!(s.tier, "light");
+        assert_eq!(s.template.as_deref(), Some("cursor"));
+        assert_eq!(s.tmux_session.as_deref(), Some("alor-cursor-alor"));
+        assert_eq!(s.current_tasks, active);
+
+        // Serialize; confirm heavy/unneeded fields aren't on the wire.
+        let json = serde_json::to_value(&s).expect("summary serializes");
+        let obj = json.as_object().expect("is JSON object");
+        let keys: std::collections::BTreeSet<&str> =
+            obj.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "id",
+            "name",
+            "connected",
+            "project",
+            "tier",
+            "max_concurrent",
+            "template",
+            "tmux_session",
+            "current_tasks",
+        ]
+        .iter()
+        .copied()
+        .collect();
+        assert_eq!(
+            keys, expected,
+            "AgentSummary must serialize exactly these 9 fields"
+        );
+        // Specifically, task_history / socket_path / registered_at /
+        // working_dir must NOT be in the wire shape.
+        for dropped in [
+            "task_history",
+            "socket_path",
+            "registered_at",
+            "working_dir",
+        ] {
+            assert!(
+                !obj.contains_key(dropped),
+                "summary wire shape must drop `{dropped}`"
+            );
+        }
+    }
+
+    #[test]
+    fn status_summary_payload_is_at_least_10x_smaller_than_full() {
+        // Simulates what the MSG_CLI_STATUS handler serializes for
+        // each view, side-by-side, with realistic state: 1 agent +
+        // 50 tasks each carrying a description of typical size.
+        // The full response inlines every task; the summary drops
+        // them entirely. The brief sets a 10x minimum size ratio
+        // and expects the realistic case to clear it easily — this
+        // test bakes that expectation in as a regression guard.
+        use serde_json::json;
+
+        let app_state = AppState::new();
+        let mut agent = Agent::new("claude-alor", "* claude-alor");
+        agent.connected = true;
+        agent.project = Some("alor".to_string());
+        agent.tmux_session = Some("alor-claude-alor".to_string());
+        app_state.register_agent(agent);
+
+        // 50 tasks with roughly production-sized descriptions — a
+        // realistic session accumulates tasks with multi-KB briefs.
+        // Using 2 KB each: 50 tasks × 2 KB ≈ 100 KB of task body
+        // payload in the full shape.
+        let bulky_desc: String = "abcdefghij".repeat(200); // ~2 KB
+        let mut active_ids: Vec<Uuid> = Vec::new();
+        for i in 0..50 {
+            let mut t = Task::new(format!("task-{i}"), &bulky_desc);
+            if i < 3 {
+                t.state = TaskState::Accepted;
+                t.assigned_to = Some("claude-alor".to_string());
+                active_ids.push(t.id);
+            } else {
+                t.state = TaskState::Completed;
+            }
+            app_state.add_task(t);
+        }
+
+        // Full shape: what the server returns on view=full.
+        let agents = app_state.all_agents();
+        let tasks = app_state.all_tasks();
+        let connected: Vec<String> = vec!["claude-alor".to_string()];
+        let full_resp = json!({
+            "view": "full",
+            "agents": agents,
+            "tasks": tasks,
+            "connected": connected,
+        });
+        let full_bytes = serde_json::to_vec(&full_resp).expect("serialize full").len();
+
+        // Summary shape: what the server returns on view=summary.
+        // Rebuild the per-agent projection inline so the test
+        // exercises the actual projection logic + size, not just
+        // a hand-waved estimate.
+        let summary_agents: Vec<_> = app_state
+            .all_agents()
+            .into_iter()
+            .map(|a| {
+                let current: Vec<Uuid> = app_state
+                    .all_tasks()
+                    .into_iter()
+                    .filter(|t| {
+                        !t.state.is_terminal()
+                            && t.assigned_to.as_deref() == Some(&a.id)
+                    })
+                    .map(|t| t.id)
+                    .collect();
+                a.summary(current)
+            })
+            .collect();
+        let summary_resp = json!({
+            "view": "summary",
+            "agents": summary_agents,
+            "connected": connected,
+        });
+        let summary_bytes =
+            serde_json::to_vec(&summary_resp).expect("serialize summary").len();
+
+        // The brief asks for ≥10x reduction; realistic data should
+        // blow past that. Asserting the exact ratio guards against
+        // regressions where someone re-introduces a heavy field
+        // into AgentSummary.
+        let ratio = full_bytes as f64 / summary_bytes as f64;
+        assert!(
+            ratio >= 10.0,
+            "summary payload must be at least 10x smaller than full; \
+             got summary={} bytes, full={} bytes, ratio={:.1}x",
+            summary_bytes,
+            full_bytes,
+            ratio,
+        );
+
+        // Also assert the summary actually carries the active task
+        // IDs — a regression where current_tasks gets dropped would
+        // defeat the whole point of the projection.
+        let summary_obj = summary_resp
+            .as_object()
+            .unwrap();
+        let agents_json = summary_obj.get("agents").unwrap().as_array().unwrap();
+        assert_eq!(agents_json.len(), 1);
+        let current = agents_json[0]
+            .get("current_tasks")
+            .and_then(|v| v.as_array())
+            .expect("current_tasks present");
+        assert_eq!(
+            current.len(),
+            3,
+            "agent's 3 non-terminal tasks must be in current_tasks"
+        );
     }
 
     #[test]
