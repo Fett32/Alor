@@ -30,9 +30,9 @@ use crate::wrapper::protocol::{
     MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
     MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
     MSG_WORKER_FRAME_WEDGED, MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT,
-    DEFAULT_TASK_GET_VIEW, EVENT_TEXT_INJECT_MAX_BYTES, TASK_LIST_FULL_MAX_LIMIT,
-    TASK_SUMMARY_MAX_BYTES, WORKER_ECHO_SENTINEL_BEGIN, WORKER_ECHO_SENTINEL_END,
-    ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
+    DEFAULT_TASK_GET_VIEW, EVENT_TEXT_INJECT_MAX_BYTES, MEMORY_GET_WARN_BYTES,
+    TASK_LIST_FULL_MAX_LIMIT, TASK_SUMMARY_MAX_BYTES, WORKER_ECHO_SENTINEL_BEGIN,
+    WORKER_ECHO_SENTINEL_END, ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -1772,6 +1772,21 @@ impl SocketServer {
             }
 
             MSG_CLI_MEMORY_GET => {
+                // Audit 8b03cae6 bloat fix #5 (final item). Old
+                // behavior: return every file in the hub on every
+                // call. New: optional `file_names` filter pulls only
+                // the named basenames. Unknown names surface under
+                // `missing` so the caller can tell "file absent" from
+                // "file present but empty". Path-traversal attempts
+                // (`..`, `/`, `\`) are rejected as `missing` rather
+                // than silently resolved — names must be leaf file
+                // basenames, no hierarchical paths.
+                //
+                // Also: warn-log when the response exceeds
+                // MEMORY_GET_WARN_BYTES (10 KiB) so we can see in
+                // dev whether the orch keeps tripping the threshold
+                // without using the filter (signal the docstring
+                // needs more work).
                 match env.decode_payload::<CliMemoryGet>() {
                     Ok(payload) => {
                         let hub_dir = match project::memory_hub_dir(&payload.project) {
@@ -1800,6 +1815,63 @@ impl SocketServer {
                                 }
                             }
                         }
+
+                        // Partition the caller's requested names (if
+                        // any) into `safe_names` (leaf basenames we'll
+                        // actually look up) and `missing_from_filter`
+                        // (traversal attempts + anything that isn't a
+                        // plain filename). Traversal rejections join
+                        // the `missing` list in the response so the
+                        // caller gets a uniform shape — "I asked for
+                        // X; X wasn't there" — rather than a security-
+                        // flavored error that would require a separate
+                        // code path to handle.
+                        //
+                        // Treat a present-but-empty filter the same as
+                        // None: "whole hub" is the explicit escape
+                        // valve for callers that don't know file
+                        // names yet; forcing them to pass `None` vs
+                        // `[]` separately is unnecessary friction.
+                        let filter_active = payload
+                            .file_names
+                            .as_ref()
+                            .map(|v| !v.is_empty())
+                            .unwrap_or(false);
+                        let (safe_names, mut missing_from_filter): (Vec<String>, Vec<String>) =
+                            if filter_active {
+                                let requested = payload.file_names.clone().unwrap_or_default();
+                                let mut ok = Vec::new();
+                                let mut bad = Vec::new();
+                                for name in requested {
+                                    if is_safe_hub_basename(&name) {
+                                        ok.push(name);
+                                    } else {
+                                        // Path separator, `..`, empty,
+                                        // or anything that isn't a leaf
+                                        // basename. Quietly treat as
+                                        // "missing" — the caller sees
+                                        // the same shape as a genuine
+                                        // non-existent file and can
+                                        // retry with a corrected name.
+                                        // Don't log the raw input at a
+                                        // visible level; a traversal
+                                        // attempt isn't necessarily
+                                        // malicious (LLM typo of `../`)
+                                        // but `debug!` captures it for
+                                        // forensics without flooding.
+                                        debug!(
+                                            project = %payload.project,
+                                            requested_name = %name,
+                                            "memory_get: rejected non-basename from file_names filter (treated as missing)"
+                                        );
+                                        bad.push(name);
+                                    }
+                                }
+                                (ok, bad)
+                            } else {
+                                (Vec::new(), Vec::new())
+                            };
+
                         let entries = match std::fs::read_dir(&hub_dir) {
                             Ok(it) => it,
                             Err(e) => {
@@ -1810,6 +1882,15 @@ impl SocketServer {
                             }
                         };
                         let mut files = serde_json::Map::new();
+                        // Sink of names we've actually seen on disk
+                        // (post-filter), used to compute the
+                        // `missing` set for present-but-filtered
+                        // callers. Collected from the read_dir walk
+                        // rather than a pre-walk stat so a partial
+                        // read (permission denied on one entry) still
+                        // succeeds for the others.
+                        let mut seen_on_disk: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
                         for entry in entries.flatten() {
                             let path = entry.path();
                             if !path.is_file() {
@@ -1819,6 +1900,13 @@ impl SocketServer {
                                 Some(n) => n.to_string(),
                                 None => continue,
                             };
+                            seen_on_disk.insert(name.clone());
+                            // If a filter is active, drop on-disk
+                            // files the caller didn't ask for. This
+                            // is the whole bloat fix.
+                            if filter_active && !safe_names.iter().any(|n| n == &name) {
+                                continue;
+                            }
                             match std::fs::metadata(&path) {
                                 Ok(meta) if meta.len() > 1_048_576 => {
                                     files.insert(
@@ -1841,13 +1929,56 @@ impl SocketServer {
                                 }
                             }
                         }
-                        match Envelope::new(
-                            MSG_CLI_RESPONSE,
-                            json!({
-                                "project": payload.project,
-                                "files": files,
-                            }),
-                        ) {
+                        // Build the `missing` list: safe_names the
+                        // caller asked for that didn't turn up on
+                        // disk, plus any that tripped the traversal
+                        // guard. Returned even when empty (stable
+                        // shape for callers who want to branch on
+                        // `missing.is_empty()`).
+                        if filter_active {
+                            for requested in &safe_names {
+                                if !seen_on_disk.contains(requested) {
+                                    missing_from_filter.push(requested.clone());
+                                }
+                            }
+                        }
+
+                        // Telemetry: approximate response size. Sum
+                        // of file contents (the heavy part) +
+                        // negligible key / JSON overhead. Log-only
+                        // warning — not a cap — so the escape valve
+                        // stays intact.
+                        let total_bytes: usize = files
+                            .values()
+                            .map(|v| v.as_str().map(|s| s.len()).unwrap_or(0))
+                            .sum();
+                        if total_bytes > MEMORY_GET_WARN_BYTES {
+                            warn!(
+                                project = %payload.project,
+                                total_bytes,
+                                file_count = files.len(),
+                                filter_active,
+                                threshold = MEMORY_GET_WARN_BYTES,
+                                "memory_get: response exceeds warn threshold (audit 8b03cae6 fix #5; if filter_active=false, caller should switch to the file_names filter)"
+                            );
+                        }
+
+                        let mut resp = json!({
+                            "project": payload.project,
+                            "files": files,
+                        });
+                        // Only emit `missing` when a filter was
+                        // actually applied — on whole-hub reads the
+                        // concept doesn't apply (everything found is
+                        // everything that exists), and adding a
+                        // permanent empty array would churn the
+                        // wire shape for existing callers.
+                        if filter_active {
+                            let obj = resp.as_object_mut().expect("resp is JSON object");
+                            obj.insert("missing".to_string(), json!(missing_from_filter));
+                        }
+
+                        match Envelope::new(MSG_CLI_RESPONSE, resp) {
                             Ok(mut e) => {
                                 e.correlation_id = correlation_id;
                                 e
@@ -2368,6 +2499,43 @@ fn cli_error_coded(correlation_id: Uuid, code: &str, message: &str) -> Envelope 
         kind: MSG_CLI_ERROR.to_string(),
         correlation_id,
         payload: serde_json::json!({"code": code, "error": message}),
+    }
+}
+
+/// Reject names that would escape (or even address anything outside)
+/// the memory hub directory. Used by the `cli.memory.get` handler
+/// when a `file_names` filter is passed — see the `CliMemoryGet`
+/// docstring for the contract.
+///
+/// Accept only plain leaf basenames. Reject empty strings, `.`,
+/// `..`, anything containing `/` or `\` (both matter — Windows
+/// portability and raw literals that could still trip `Path::join`
+/// in edge cases), and any name that parses via `Path` as
+/// hierarchical (multiple components).
+///
+/// Deliberately stricter than strictly necessary for a Linux
+/// filesystem: better to treat "odd but legal" names as missing
+/// than to open up subtle traversal paths. Callers that need exotic
+/// filenames can rename their hub entries.
+fn is_safe_hub_basename(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    // Null bytes would also be weird but `contains('\\0')` on a
+    // regular &str is unusual — Rust strings can contain NULs. Guard
+    // belt-and-braces.
+    if name.contains('\0') {
+        return false;
+    }
+    // Final check: Path should see a single-component, Normal entry.
+    let p = std::path::Path::new(name);
+    let mut comps = p.components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(_)), None) => true,
+        _ => false,
     }
 }
 
@@ -3200,6 +3368,317 @@ mod tests {
             .expect("handler must have recorded the response before broadcast");
         assert_eq!(rec.text.len(), 4_000);
         assert_eq!(rec.agent_id, "claude-alor");
+    }
+
+    // ---------------------------------------------------------------------
+    // memory_get file_names filter (audit 8b03cae6 fix #5)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn is_safe_hub_basename_accepts_plain_filenames() {
+        // Positive cases — things callers legitimately pass.
+        assert!(super::is_safe_hub_basename("index.md"));
+        assert!(super::is_safe_hub_basename("notes.txt"));
+        assert!(super::is_safe_hub_basename("README"));
+        assert!(super::is_safe_hub_basename("file-with-dashes.md"));
+        assert!(super::is_safe_hub_basename("file.with.dots.md"));
+        assert!(super::is_safe_hub_basename(".hidden"));
+    }
+
+    #[test]
+    fn is_safe_hub_basename_rejects_traversal_and_hierarchical() {
+        // Negative cases — traversal attempts + non-basename inputs.
+        assert!(!super::is_safe_hub_basename(""), "empty name");
+        assert!(!super::is_safe_hub_basename("."), "bare dot");
+        assert!(!super::is_safe_hub_basename(".."), "bare dot-dot");
+        assert!(!super::is_safe_hub_basename("../etc/passwd"));
+        assert!(!super::is_safe_hub_basename("/etc/passwd"));
+        assert!(!super::is_safe_hub_basename("/absolute"));
+        assert!(!super::is_safe_hub_basename("sub/nested.md"));
+        assert!(!super::is_safe_hub_basename("..\\windows-style"));
+        assert!(!super::is_safe_hub_basename("back\\slash.md"));
+        // NUL bytes: belt-and-braces rejection.
+        assert!(!super::is_safe_hub_basename("file\0null.md"));
+    }
+
+    // ---------------------------------------------------------------------
+    // End-to-end handler tests. These mutate XDG_DATA_HOME (the hub
+    // dir anchor) so they MUST be serialized — the Rust test runner
+    // runs tests concurrently by default, and env-var mutation is
+    // process-global. A module-level mutex around the env+fs section
+    // keeps them from racing each other.
+    // ---------------------------------------------------------------------
+
+    static MEMORY_GET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII helper: sets `XDG_DATA_HOME` for the duration of the test,
+    /// creates the hub dir for `project`, writes the supplied files
+    /// into it, and restores the prior env on drop.
+    struct HubFixture {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        _tempdir: tempfile::TempDir,
+        prior_xdg: Option<std::ffi::OsString>,
+    }
+
+    impl HubFixture {
+        fn new(project: &str, files: &[(&str, &str)]) -> Self {
+            let guard = MEMORY_GET_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let prior_xdg = std::env::var_os("XDG_DATA_HOME");
+            std::env::set_var("XDG_DATA_HOME", tempdir.path());
+
+            // ProjectDirs resolves to {XDG_DATA_HOME}/alor on Linux,
+            // so the hub lives at {tempdir}/alor/hubs/{project}.
+            let hub = tempdir
+                .path()
+                .join("alor")
+                .join("hubs")
+                .join(project);
+            std::fs::create_dir_all(&hub).expect("mkdir hub");
+            for (name, content) in files {
+                std::fs::write(hub.join(name), content).expect("write fixture");
+            }
+
+            Self {
+                _guard: guard,
+                _tempdir: tempdir,
+                prior_xdg,
+            }
+        }
+    }
+
+    impl Drop for HubFixture {
+        fn drop(&mut self) {
+            match &self.prior_xdg {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    /// Invoke the MSG_CLI_MEMORY_GET handler with the given payload
+    /// and return the response payload as serde_json::Value.
+    async fn memory_get_payload(
+        server: &SocketServer,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        let env = Envelope::new(MSG_CLI_MEMORY_GET, body).expect("build envelope");
+        server.handle_cli_message(env).await.payload
+    }
+
+    #[tokio::test]
+    async fn memory_get_no_filter_returns_all_hub_files() {
+        // Back-compat: no file_names → return everything in the hub,
+        // same shape as pre-fix. No `missing` field on the response.
+        let _fx = HubFixture::new(
+            "alor",
+            &[
+                ("index.md", "# Index\nsee README"),
+                ("notes.md", "# Notes\none two three"),
+            ],
+        );
+        let server = server_for_test();
+
+        let payload = memory_get_payload(
+            &server,
+            serde_json::json!({"project": "alor"}),
+        )
+        .await;
+
+        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
+        assert_eq!(files.len(), 2, "all hub files returned");
+        assert!(files.get("index.md").is_some());
+        assert!(files.get("notes.md").is_some());
+        assert!(
+            payload.get("missing").is_none(),
+            "no-filter response must not carry `missing`"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_get_with_filter_returns_only_named_files() {
+        // The main fix: caller pulls one file from a hub that has
+        // several.
+        let _fx = HubFixture::new(
+            "alor",
+            &[
+                ("index.md", "# Index content"),
+                ("notes.md", "# Notes content"),
+                ("reference.md", "# Reference content"),
+            ],
+        );
+        let server = server_for_test();
+
+        let payload = memory_get_payload(
+            &server,
+            serde_json::json!({
+                "project": "alor",
+                "file_names": ["index.md"],
+            }),
+        )
+        .await;
+
+        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
+        assert_eq!(files.len(), 1, "only the named file returned");
+        assert_eq!(
+            files.get("index.md").and_then(|v| v.as_str()),
+            Some("# Index content")
+        );
+        // Filter-active path emits `missing`, empty here because the
+        // one requested file was found on disk.
+        let missing = payload
+            .get("missing")
+            .and_then(|v| v.as_array())
+            .expect("missing present (filter active)");
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_get_filter_treats_traversal_as_missing() {
+        // Path-traversal rejection: `../etc/passwd`, `/etc/passwd`,
+        // `sub/nested.md` must all surface in `missing` rather than
+        // escape the hub dir.
+        let _fx = HubFixture::new(
+            "alor",
+            &[("index.md", "# legitimate")],
+        );
+        let server = server_for_test();
+
+        let payload = memory_get_payload(
+            &server,
+            serde_json::json!({
+                "project": "alor",
+                "file_names": [
+                    "../etc/passwd",
+                    "/etc/passwd",
+                    "sub/nested.md",
+                    "..",
+                    "",
+                ],
+            }),
+        )
+        .await;
+
+        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
+        assert!(
+            files.is_empty(),
+            "no traversal-variant name must be served"
+        );
+        let missing: Vec<String> = payload
+            .get("missing")
+            .and_then(|v| v.as_array())
+            .expect("missing present")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        // All rejected names surface as missing so the caller sees a
+        // consistent "I asked for X, didn't get X" shape.
+        for bad in ["../etc/passwd", "/etc/passwd", "sub/nested.md", "..", ""] {
+            assert!(
+                missing.contains(&bad.to_string()),
+                "traversal/invalid name {bad:?} must appear in missing; got {missing:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_get_filter_reports_unknown_files_as_missing_without_panic() {
+        // Unknown but well-formed basenames → empty files, name in
+        // missing. No panic, no error envelope.
+        let _fx = HubFixture::new(
+            "alor",
+            &[("index.md", "# present")],
+        );
+        let server = server_for_test();
+
+        let payload = memory_get_payload(
+            &server,
+            serde_json::json!({
+                "project": "alor",
+                "file_names": ["nonexistent.md", "also-missing.md"],
+            }),
+        )
+        .await;
+
+        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
+        assert!(files.is_empty());
+        let missing: Vec<String> = payload
+            .get("missing")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert!(missing.contains(&"nonexistent.md".to_string()));
+        assert!(missing.contains(&"also-missing.md".to_string()));
+    }
+
+    #[tokio::test]
+    async fn memory_get_over_warn_threshold_still_serves_full_response() {
+        // The MEMORY_GET_WARN_BYTES threshold (10 KiB) is operational
+        // telemetry — a warn-log that fires when the orch keeps
+        // tripping the size ceiling without using the file_names
+        // filter — NOT a cap. Pin this contract: the response is
+        // still served in full even when it goes well over the
+        // threshold. (Capturing the warn-log itself would require
+        // another dev-dep — tracing-test — for modest value; the
+        // threshold constant lives next to the handler call-site
+        // so a visual mismatch there is the more likely regression
+        // shape anyway.)
+        //
+        // 12 KiB total across two files is comfortably over the
+        // 10 KiB threshold.
+        let body_a = "a".repeat(6_000);
+        let body_b = "b".repeat(6_000);
+        let _fx = HubFixture::new(
+            "alor",
+            &[
+                ("big-a.md", body_a.as_str()),
+                ("big-b.md", body_b.as_str()),
+            ],
+        );
+        let server = server_for_test();
+
+        let payload = memory_get_payload(
+            &server,
+            serde_json::json!({"project": "alor"}),
+        )
+        .await;
+
+        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
+        assert_eq!(files.len(), 2);
+        let got_a = files.get("big-a.md").and_then(|v| v.as_str()).expect("big-a");
+        let got_b = files.get("big-b.md").and_then(|v| v.as_str()).expect("big-b");
+        assert_eq!(got_a.len(), 6_000, "full content of big-a served");
+        assert_eq!(got_b.len(), 6_000, "full content of big-b served");
+        // Total served bytes > threshold — confirms warn is advisory
+        // rather than capping.
+        assert!(got_a.len() + got_b.len() > MEMORY_GET_WARN_BYTES);
+    }
+
+    #[tokio::test]
+    async fn memory_get_empty_filter_is_equivalent_to_no_filter() {
+        // Empty list `[]` must fall through to the whole-hub read,
+        // matching None. Different wire shape (filter_active=false)
+        // → no `missing` field emitted.
+        let _fx = HubFixture::new(
+            "alor",
+            &[("index.md", "content"), ("notes.md", "more content")],
+        );
+        let server = server_for_test();
+
+        let payload = memory_get_payload(
+            &server,
+            serde_json::json!({"project": "alor", "file_names": []}),
+        )
+        .await;
+
+        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
+        assert_eq!(files.len(), 2);
+        assert!(
+            payload.get("missing").is_none(),
+            "empty filter must be treated as no filter — no `missing` in wire shape"
+        );
     }
 
     #[tokio::test]

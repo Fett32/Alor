@@ -580,6 +580,19 @@ pub const DEFAULT_TASK_LIST_LIMIT: u32 = 20;
 /// callers that need detail must opt in with `"full"`.
 pub const DEFAULT_TASK_LIST_VIEW: &str = "summary";
 
+/// Threshold above which the daemon logs a warn when a `memory_get`
+/// call is about to return its payload. Not a cap — `memory_get` is
+/// allowed to return the whole filtered set (that's the escape
+/// valve for "give me everything"). The warn is telemetry: if the
+/// orch keeps pulling whole hubs over threshold, the MCP tool
+/// docstring needs more work to steer it toward the `file_names`
+/// filter. Audit 8b03cae6 bloat fix #5.
+///
+/// Sized at 10 KiB — roughly the "this is costing real orch context"
+/// line. Small enough that a single meaty index doc won't trip it,
+/// big enough that whole-hub reads of multi-file projects do.
+pub const MEMORY_GET_WARN_BYTES: usize = 10 * 1024;
+
 /// Soft cap (advisory) on the byte length of the `text` field the
 /// orchestrator injects into its SDK context for `worker.user_input`
 /// and `worker.orch_response` events. Enforcement lives in
@@ -680,9 +693,35 @@ pub struct CliAgentSendMessage {
     pub suppress_echo: bool,
 }
 
+/// Payload for `cli.memory.get`.
+///
+/// `project` is the profile name; the daemon resolves it to the
+/// project's Memory Hub directory via
+/// `daemon::project::memory_hub_dir`.
+///
+/// `file_names` optionally narrows the response to just the named
+/// files. Audit 8b03cae6 bloat fix #5. Semantics:
+///   - `None` / empty vec → return every file in the hub (current /
+///     back-compat behavior). Useful only when the caller genuinely
+///     doesn't know what's there; prefer `project_get` →
+///     `memory_index` → named fetch in steady state.
+///   - Populated → return only the named files. Names must be plain
+///     basenames (no `..`, no path separators, no absolute paths) —
+///     the handler rejects anything that isn't a leaf filename to
+///     prevent path traversal out of the hub directory. Unknown
+///     names don't error; they just surface under a `missing` field
+///     in the response so the caller can distinguish "file absent"
+///     from "file present but empty".
+///
+/// Back-compat: field is `#[serde(default)]` so pre-fix clients
+/// that only send `{project}` decode to `file_names = None` → full-
+/// hub read. New callers can add the filter without a coordinated
+/// daemon rollout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliMemoryGet {
     pub project: String,
+    #[serde(default)]
+    pub file_names: Option<Vec<String>>,
 }
 
 /// Payload for `cli.worker.response.get`. Retrieves the full text of

@@ -381,13 +381,40 @@ async def project_list(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "memory_get",
-    "Read Memory Hub for a project — cross-agent shared notes from prior "
-    "sessions. Check when a task might have relevant prior context.",
-    {"project": str},
+    "Read specific Memory Hub files for a project — pass "
+    "`file_names=[...]` to pull only what you need (basenames; names "
+    "with `..` or `/` are silently rejected). The Memory Hub is "
+    "cross-agent shared notes from prior sessions; checking is useful "
+    "when a task might have relevant prior context. "
+    "Discover file names via project_get (`memory_index` field) first "
+    "when possible — that's the canonical per-project index and it's "
+    "cheap. Omit `file_names` only when you genuinely don't know "
+    "what's there yet (e.g. first touch of a project); the response "
+    "is uncapped and can run 10 KB+ on hubs with accumulated notes. "
+    "Response shape: {project, files: {name → content}, missing: "
+    "[names]} — `missing` only present when `file_names` was passed.",
+    {"project": str, "file_names": list},
 )
 async def memory_get(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        return _ok(await daemon.memory_get(args["project"]))
+        # Normalize file_names: accept missing, None, empty list, or
+        # a populated list. An empty list deliberately falls through
+        # to "no filter" (same as None) — the server treats them
+        # equivalently, and forcing the LLM to distinguish None vs
+        # [] would be friction for no gain.
+        raw_names = args.get("file_names")
+        file_names: list[str] | None
+        if raw_names is None:
+            file_names = None
+        elif isinstance(raw_names, list):
+            # Keep only string entries; silently drop non-strings
+            # (LLM edge cases like passing a single string or a
+            # nested dict). Empty or non-string → None.
+            cleaned = [n for n in raw_names if isinstance(n, str) and n]
+            file_names = cleaned if cleaned else None
+        else:
+            file_names = None
+        return _ok(await daemon.memory_get(args["project"], file_names=file_names))
     except Exception as e:
         return _err(str(e))
 

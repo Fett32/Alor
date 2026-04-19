@@ -32,6 +32,12 @@ parking_lot = "0.12"
 portable-pty = "0.9"
 serde_yaml = "0.9"
 
+[dev-dependencies]
+# Used by memory_get handler tests (audit 8b03cae6 fix #5) to build
+# disposable hub fixtures under XDG_DATA_HOME. Serialized via a
+# module-level Mutex so concurrent tests don't race on the env var.
+tempfile = "3"
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

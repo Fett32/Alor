@@ -477,8 +477,34 @@ async def agent_send_message_await(
             pass
 
 
-async def memory_get(project: str) -> dict[str, Any]:
-    return await _one_shot("cli.memory.get", {"project": project})
+async def memory_get(
+    project: str,
+    file_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Read files from a project's Memory Hub.
+
+    `file_names` optionally narrows the response. Audit 8b03cae6 fix
+    #5:
+      - None / [] → return every file in the hub (back-compat).
+        Expensive when the hub has accumulated; prefer naming files
+        explicitly once you know what's there (project_get's
+        `memory_index` field is the canonical discovery path).
+      - list of plain basenames → return only those files. Names
+        containing `..`, `/`, `\\`, or otherwise non-basename are
+        silently rejected by the daemon (treated as missing) — no
+        path traversal out of the hub directory.
+
+    Response shape:
+      {project, files: {name → content | {truncated, size} |
+       {error}}, missing: [names]}
+    `missing` only appears when `file_names` was populated; it lists
+    names the caller asked for that didn't turn up on disk (either
+    genuinely absent or rejected by the basename guard).
+    """
+    payload: dict[str, Any] = {"project": project}
+    if file_names is not None:
+        payload["file_names"] = file_names
+    return await _one_shot("cli.memory.get", payload)
 
 
 async def worker_response_get(correlation_id: str) -> dict[str, Any]:
