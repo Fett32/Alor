@@ -2,9 +2,11 @@
 
 Workers get a restricted MCP surface (agent_spawn, agent_list,
 agent_ensure_running, agent_send_message, agent_kill). The
-orchestrator keeps the full 13-tool set. This file verifies the
-split — specifically the tool-name membership that flows into
-ClaudeAgentOptions.allowed_tools and create_sdk_mcp_server.
+orchestrator keeps the full orch-only tool set (currently 14 after
+audit 8b03cae6 fix #4 added `worker_response_get`). This file
+verifies the split — specifically the tool-name membership that
+flows into ClaudeAgentOptions.allowed_tools and
+create_sdk_mcp_server.
 
 Run standalone: `python3 test_tools_role_filter.py` from
 orchestrator-py/. Exits 0 on pass. No pytest dependency.
@@ -59,12 +61,16 @@ def test_worker_accessible_tools_exact_set() -> None:
     )
 
 
-def test_allowed_tool_names_orch_has_all_13() -> None:
+def test_allowed_tool_names_orch_has_all_tools() -> None:
     names = bare_names(tools.allowed_tool_names("orch"))
     expected = {t.name for t in tools.ALL_TOOLS}
     check("orch allowed_tool_names == every ALL_TOOLS name", names, expected)
     check_true("orch has task_create", "task_create" in names)
     check_true("orch has memory_get", "memory_get" in names)
+    check_true(
+        "orch has worker_response_get (bloat fix #4)",
+        "worker_response_get" in names,
+    )
 
 
 def test_allowed_tool_names_worker_is_the_five() -> None:
@@ -86,6 +92,7 @@ def test_allowed_tool_names_worker_is_the_five() -> None:
         "project_get",
         "project_list",
         "memory_get",
+        "worker_response_get",
     ):
         check(
             f"worker allowed_tool_names excludes {excluded}",
@@ -125,7 +132,7 @@ def test_build_server_tool_counts_match_allowed_names() -> None:
 
 def main() -> int:
     test_worker_accessible_tools_exact_set()
-    test_allowed_tool_names_orch_has_all_13()
+    test_allowed_tool_names_orch_has_all_tools()
     test_allowed_tool_names_worker_is_the_five()
     test_unknown_role_falls_back_to_worker()
     test_build_server_tool_counts_match_allowed_names()

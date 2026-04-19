@@ -48,6 +48,7 @@ pub const MSG_CLI_INTEGRATIONS_GET: &str = "cli.integrations.get";
 pub const MSG_CLI_AGENT_SEND_MESSAGE: &str = "cli.agent.send_message";
 pub const MSG_CLI_AGENT_ENSURE_RUNNING: &str = "cli.agent.ensure_running";
 pub const MSG_CLI_MEMORY_GET: &str = "cli.memory.get";
+pub const MSG_CLI_WORKER_RESPONSE_GET: &str = "cli.worker.response.get";
 pub const MSG_CLI_RESPONSE: &str = "cli.response";
 pub const MSG_CLI_ERROR: &str = "cli.error";
 pub const MSG_EVENT: &str = "event";
@@ -579,6 +580,24 @@ pub const DEFAULT_TASK_LIST_LIMIT: u32 = 20;
 /// callers that need detail must opt in with `"full"`.
 pub const DEFAULT_TASK_LIST_VIEW: &str = "summary";
 
+/// Soft cap (advisory) on the byte length of the `text` field the
+/// orchestrator injects into its SDK context for `worker.user_input`
+/// and `worker.orch_response` events. Enforcement lives in
+/// `orchestrator-py/main.py`'s event formatter (that's where text
+/// actually lands in the prompt); this constant is declared here so
+/// the Rust daemon + Python orchestrator agree on the threshold and
+/// so future consumers (e.g. alor-cli listening on the event stream
+/// and wanting to respect the same cap) have a single source.
+///
+/// Sized above `TASK_SUMMARY_MAX_BYTES` (512) because these events
+/// legitimately carry more than a task's terse post-run verdict: a
+/// console paste, a short agent reply, a snippet of logs. 2 KiB
+/// keeps routine replies untouched while bounding pathological
+/// multi-KB pastes. When the cap fires, the formatter appends a
+/// pointer to `worker_response_get(correlation_id=X)` so the orch
+/// can fetch the full text on demand. Audit 8b03cae6 bloat fix #4.
+pub const EVENT_TEXT_INJECT_MAX_BYTES: usize = 2048;
+
 /// Hard cap on tasks returned per `cli.task.list` call when
 /// `view = "full"`. Applied regardless of what the caller passes for
 /// `limit` — including `limit = 0` ("no limit"). Existing summary
@@ -664,6 +683,19 @@ pub struct CliAgentSendMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliMemoryGet {
     pub project: String,
+}
+
+/// Payload for `cli.worker.response.get`. Retrieves the full text of
+/// a prior `worker.orch_response` event from the daemon's bounded
+/// in-memory cache (see
+/// `daemon::state::WorkerResponseCache`). Intended use: the
+/// orchestrator saw a truncated `[Alor event]` injection carrying a
+/// `worker_response_get(correlation_id=X)` pointer and needs the
+/// full body to reason about what the worker actually replied.
+/// Audit 8b03cae6 bloat fix #4.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliWorkerResponseGet {
+    pub correlation_id: Uuid,
 }
 
 /// Idempotent spawn — if the agent is already running, this is a no-op.

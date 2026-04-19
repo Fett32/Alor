@@ -55,6 +55,56 @@ INJECTABLE_EVENTS = {
     "worker.orch_response",
 }
 
+# Audit 8b03cae6 bloat fix #4. Hard cap on the raw `text` body of
+# worker.user_input / worker.orch_response events when we inject them
+# into the orch's SDK context. Sized to match the Rust daemon's
+# `EVENT_TEXT_INJECT_MAX_BYTES` (src-tauri/src/wrapper/protocol.rs) —
+# kept in sync by convention, not cross-language binding. 2 KiB is
+# well above the task-complete summary cap (512 B) because these
+# events legitimately carry more (console pastes, short agent
+# replies, log snippets) while still bounding the pathological
+# multi-KB paste. On orch_response the orchestrator can fetch the
+# full body via `worker_response_get(correlation_id=X)` — on
+# user_input there's no correlation_id, so truncation is terminal
+# (the full text lives in the worker's own pane + SDK history).
+EVENT_TEXT_INJECT_MAX_BYTES = 2048
+
+
+def _truncate_text_for_inject(text: str, marker: str) -> str:
+    """Cap `text` at EVENT_TEXT_INJECT_MAX_BYTES on a UTF-8 char
+    boundary, appending `marker` when truncation happened.
+
+    Returns `text` verbatim when already under the cap — no marker,
+    no allocation surprises. Mirrors the Rust `truncate_summary`
+    helper's contract (UTF-8-safe, marker fits inside cap or is
+    omitted if it wouldn't fit).
+
+    The 2 KiB cap leaves ~3 KiB of headroom under the 25 KiB
+    rule-of-thumb ceiling Fett uses for lean tool output, even when
+    a dozen of these events pile up in one orch turn.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= EVENT_TEXT_INJECT_MAX_BYTES:
+        return text
+
+    marker_bytes = marker.encode("utf-8")
+    # Reserve space for the marker; if the cap is smaller than the
+    # marker itself (degenerate — won't happen with the 2 KiB cap)
+    # degrade to a bare hard-truncate.
+    if len(marker_bytes) >= EVENT_TEXT_INJECT_MAX_BYTES:
+        trimmed = encoded[:EVENT_TEXT_INJECT_MAX_BYTES]
+        while trimmed and (trimmed[-1] & 0xC0) == 0x80:
+            trimmed = trimmed[:-1]
+        return trimmed.decode("utf-8", errors="ignore")
+
+    target = EVENT_TEXT_INJECT_MAX_BYTES - len(marker_bytes)
+    trimmed = encoded[:target]
+    # Back up to a UTF-8 char boundary so we never emit an invalid
+    # sequence — continuation bytes have 10xxxxxx in the top bits.
+    while trimmed and (trimmed[-1] & 0xC0) == 0x80:
+        trimmed = trimmed[:-1]
+    return trimmed.decode("utf-8", errors="ignore") + marker
+
 
 def format_event_for_agent(evt: daemon.Event) -> str | None:
     """Render an event as a user-message injection, or None to skip."""
@@ -123,9 +173,14 @@ def format_event_for_agent(evt: daemon.Event) -> str | None:
         return f"[Alor event] wrapper error from {agent}: {msg}"
     if evt.event == "worker.user_input":
         agent = d.get("agent_id", "?")
-        text = d.get("text", "")
+        raw_text = d.get("text", "")
         during = bool(d.get("during_task"))
         task_id = str(d.get("task_id") or "")[:8]
+        # Cap the verbatim paste at EVENT_TEXT_INJECT_MAX_BYTES (audit
+        # 8b03cae6 fix #4). user_input has no correlation_id, so the
+        # marker is plain — the full text lives in the worker's pane
+        # and SDK history, not in daemon-side cache.
+        text = _truncate_text_for_inject(raw_text, marker="… [truncated]")
         if during:
             context = (
                 f"mid-task ({task_id}). SDK worker is serialized on its "
@@ -150,10 +205,28 @@ def format_event_for_agent(evt: daemon.Event) -> str | None:
         # in that path. In the fire-and-forget path it's the ONLY way the
         # orch sees the reply.
         agent = d.get("agent_id", "?")
-        corrid = str(d.get("correlation_id") or "")[:8] or "?"
-        text = d.get("text", "") or "(empty reply)"
+        corrid_full = str(d.get("correlation_id") or "")
+        corrid_short = corrid_full[:8] or "?"
+        raw_text = d.get("text", "") or "(empty reply)"
+        # Cap at EVENT_TEXT_INJECT_MAX_BYTES. orch_response carries a
+        # correlation_id — when we truncate, point the orch at
+        # `worker_response_get` so it can pull the full text on demand
+        # (daemon-side LRU; bloat fix #4). The full uuid is used in the
+        # marker so the LLM can paste it straight into a tool call.
+        if corrid_full:
+            fetch_marker = (
+                f"… [truncated; fetch full text via "
+                f'worker_response_get(correlation_id="{corrid_full}")]'
+            )
+        else:
+            # Degenerate: no correlation_id on a worker.orch_response.
+            # Shouldn't happen (the daemon always stamps one), but
+            # degrade to the plain marker rather than emitting a broken
+            # tool call hint.
+            fetch_marker = "… [truncated]"
+        text = _truncate_text_for_inject(raw_text, marker=fetch_marker)
         return (
-            f"[Alor event] {agent} replied to your send {corrid}:\n\n"
+            f"[Alor event] {agent} replied to your send {corrid_short}:\n\n"
             f"{text}"
         )
     return None

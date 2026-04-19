@@ -392,6 +392,28 @@ async def memory_get(args: dict[str, Any]) -> dict[str, Any]:
         return _err(str(e))
 
 
+@tool(
+    "worker_response_get",
+    "Fetch the full untruncated text of a prior worker.orch_response. "
+    "Use ONLY when you just saw a truncated `[Alor event]` injection "
+    "whose marker said `fetch via worker_response_get(correlation_id=X)` "
+    "and you actually need the rest of the body to reason about the "
+    "reply. Do NOT speculatively fetch — most orch_response injections "
+    "aren't truncated, and those that are usually carry enough in the "
+    "first 2 KB to route on. The daemon keeps the 100 most recent "
+    "responses in an in-memory LRU; older entries are evicted and "
+    "return a 'not found' error — treat that as 'the truncated copy is "
+    "all I'll ever see'. Returns "
+    "{correlation_id, agent_id, text, task_id, during_task, timestamp}.",
+    {"correlation_id": str},
+)
+async def worker_response_get(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _ok(await daemon.worker_response_get(args["correlation_id"]))
+    except Exception as e:
+        return _err(str(e))
+
+
 ALL_TOOLS = [
     task_create,
     task_assign,
@@ -407,6 +429,7 @@ ALL_TOOLS = [
     project_get,
     project_list,
     memory_get,
+    worker_response_get,
 ]
 
 MCP_SERVER_NAME = "alor"

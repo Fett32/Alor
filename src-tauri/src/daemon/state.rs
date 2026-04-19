@@ -491,6 +491,51 @@ pub struct AgentSummary {
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// Cached full text of a `worker.orch_response` event, keyed by the
+/// `correlation_id` the daemon embedded in the sentinel-prefixed
+/// outbound `cli.agent.send_message` that triggered the reply.
+///
+/// The orchestrator's event formatter caps injected text at
+/// `EVENT_TEXT_INJECT_MAX_BYTES` (2048) so a multi-KB reply doesn't
+/// blow up the SDK prompt. When it truncates, it appends a pointer to
+/// `worker_response_get(correlation_id)` — this record is what that
+/// tool returns. Audit 8b03cae6 bloat fix #4.
+///
+/// Not persisted to state.json: escape-valve only, naturally
+/// short-lived, no value in surviving a daemon restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerResponseRecord {
+    pub correlation_id: Uuid,
+    pub agent_id: String,
+    pub text: String,
+    pub task_id: Option<Uuid>,
+    pub during_task: bool,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Bounded LRU of recent `worker.orch_response` full texts. Capped at
+/// `WORKER_RESPONSE_CACHE_CAP` entries — when full, the oldest entry
+/// is evicted to make room. This is a context-window escape valve
+/// for the orchestrator, not an audit log; a bigger cap just wastes
+/// memory for replies the orch never comes back to fetch.
+///
+/// Hash lookup keyed by correlation_id (fast random access for the
+/// `worker_response_get` RPC); `VecDeque` on the side tracks
+/// insertion order so eviction is O(1). A per-entry write sees one
+/// hashmap insert + one deque push_back; evictions (rare — only when
+/// the cache is saturated) pop_front + remove.
+#[derive(Default)]
+struct WorkerResponseCache {
+    map: HashMap<Uuid, WorkerResponseRecord>,
+    order: VecDeque<Uuid>,
+}
+
+/// Maximum number of `worker.orch_response` full texts held in the
+/// in-memory fetch-on-demand cache. 100 is plenty for the intended
+/// use case (one or two oversized replies per session needing a
+/// follow-up fetch); bigger just wastes memory.
+pub const WORKER_RESPONSE_CACHE_CAP: usize = 100;
+
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Mutex<StateInner>>,
@@ -514,6 +559,12 @@ pub struct AppState {
     /// daemon reboot drops the tracking along with the task context
     /// that gives it meaning.
     task_spawns: Arc<Mutex<HashMap<Uuid, HashSet<String>>>>,
+    /// Fetch-on-demand cache for recent `worker.orch_response` full
+    /// texts. See `WorkerResponseCache`. Bounded LRU keyed by
+    /// correlation_id, populated in the MSG_WORKER_ORCH_RESPONSE
+    /// handler before the event goes out, queried by
+    /// `MSG_CLI_WORKER_RESPONSE_GET`.
+    worker_responses: Arc<Mutex<WorkerResponseCache>>,
 }
 
 impl Default for AppState {
@@ -523,6 +574,7 @@ impl Default for AppState {
             save_path: Arc::new(None),
             app_handle: Arc::new(Mutex::new(None)),
             task_spawns: Arc::new(Mutex::new(HashMap::new())),
+            worker_responses: Arc::new(Mutex::new(WorkerResponseCache::default())),
         }
     }
 }
@@ -616,6 +668,7 @@ impl AppState {
             save_path: Arc::new(Some(path)),
             app_handle: Arc::new(Mutex::new(None)),
             task_spawns: Arc::new(Mutex::new(HashMap::new())),
+            worker_responses: Arc::new(Mutex::new(WorkerResponseCache::default())),
         }
     }
 
@@ -947,6 +1000,50 @@ impl AppState {
                 v
             })
             .unwrap_or_default()
+    }
+
+    /// Stash a `worker.orch_response`'s full text in the fetch-on-
+    /// demand cache so the orchestrator can retrieve it via
+    /// `worker_response_get(correlation_id)` when its injected copy
+    /// was truncated. See `WorkerResponseCache` for the LRU bounds;
+    /// audit 8b03cae6 bloat fix #4 for the motivation.
+    ///
+    /// Idempotent on replay (same correlation_id overwrites the
+    /// entry in-place without re-bumping the deque — an unlikely
+    /// but benign outcome). Evicts the oldest entry when full.
+    pub fn record_worker_response(&self, record: WorkerResponseRecord) {
+        let mut cache = self.worker_responses.lock();
+        let id = record.correlation_id;
+        if cache.map.insert(id, record).is_none() {
+            cache.order.push_back(id);
+            // Enforce bound. Pop from the FRONT of the deque (oldest
+            // inserted); remove from the map. Loop so a cap change
+            // (shrink) drains extras in one call.
+            while cache.order.len() > WORKER_RESPONSE_CACHE_CAP {
+                if let Some(evict) = cache.order.pop_front() {
+                    cache.map.remove(&evict);
+                }
+            }
+        }
+        // Else: correlation_id was already present — overwrite happened
+        // in-place via HashMap::insert; don't duplicate in the deque.
+    }
+
+    /// Retrieve a cached `worker.orch_response` full text by its
+    /// correlation_id. Returns `None` when the id was never seen or
+    /// has been evicted from the LRU. The caller surfaces that to
+    /// the orch as a typed error ("correlation_id not found or
+    /// expired") rather than a silent empty string so the LLM
+    /// doesn't retry forever.
+    pub fn get_worker_response(
+        &self,
+        correlation_id: Uuid,
+    ) -> Option<WorkerResponseRecord> {
+        self.worker_responses
+            .lock()
+            .map
+            .get(&correlation_id)
+            .cloned()
     }
 
     /// Transition a task to a new state.  Returns the updated task on success.
@@ -1827,6 +1924,128 @@ mod tests {
             "summary response on a populated task must stay well under \
              the acceptance ceiling (<500 B); got {} bytes",
             summary_bytes,
+        );
+    }
+
+    #[test]
+    fn worker_response_cache_records_and_retrieves_by_correlation_id() {
+        // Audit 8b03cae6 bloat fix #4: the orchestrator-side formatter
+        // caps worker.orch_response text at 2 KiB and leaves a pointer
+        // to worker_response_get. This is the storage the pointer
+        // resolves against. Baseline round-trip: record one, fetch
+        // by the same uuid, every field comes back.
+        let state = AppState::new();
+        let cid = Uuid::new_v4();
+        let tid = Uuid::new_v4();
+        state.record_worker_response(WorkerResponseRecord {
+            correlation_id: cid,
+            agent_id: "claude-alor".to_string(),
+            text: "a".repeat(3_000),
+            task_id: Some(tid),
+            during_task: true,
+            timestamp: Utc::now(),
+        });
+
+        let got = state.get_worker_response(cid).expect("present");
+        assert_eq!(got.correlation_id, cid);
+        assert_eq!(got.agent_id, "claude-alor");
+        assert_eq!(got.text.len(), 3_000);
+        assert_eq!(got.task_id, Some(tid));
+        assert!(got.during_task);
+    }
+
+    #[test]
+    fn worker_response_cache_returns_none_for_unknown_id() {
+        // Unknown correlation_id must surface as `None` so the RPC
+        // handler can return a typed cli_error rather than an
+        // empty-string silent success.
+        let state = AppState::new();
+        let unknown = Uuid::new_v4();
+        assert!(state.get_worker_response(unknown).is_none());
+    }
+
+    #[test]
+    fn worker_response_cache_evicts_oldest_when_full() {
+        // LRU bound: insert CAP+10 entries; the first 10 must be
+        // evicted. Asserts the FIFO-by-insert order (we don't model
+        // access recency; fetch-on-demand is write-heavy read-light
+        // and a simple FIFO is cheaper + easier to reason about).
+        let state = AppState::new();
+        let n = WORKER_RESPONSE_CACHE_CAP + 10;
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let cid = Uuid::new_v4();
+            ids.push(cid);
+            state.record_worker_response(WorkerResponseRecord {
+                correlation_id: cid,
+                agent_id: "a".to_string(),
+                text: format!("entry-{i}"),
+                task_id: None,
+                during_task: false,
+                timestamp: Utc::now(),
+            });
+        }
+
+        // The first 10 (oldest) must have been evicted.
+        for (i, cid) in ids.iter().take(10).enumerate() {
+            assert!(
+                state.get_worker_response(*cid).is_none(),
+                "entry {i} (oldest) must have been evicted at cap",
+            );
+        }
+        // The most recent CAP entries must still be present.
+        for (i, cid) in ids.iter().skip(10).enumerate() {
+            assert!(
+                state.get_worker_response(*cid).is_some(),
+                "entry {} (within CAP window) must still be present",
+                i + 10,
+            );
+        }
+    }
+
+    #[test]
+    fn worker_response_cache_overwrites_same_correlation_id_without_growing() {
+        // Edge: replay or same-uuid re-record. Must overwrite the
+        // text in place without duplicating in the deque — otherwise
+        // a malicious / buggy worker spamming the same correlation_id
+        // would evict legitimate entries via fake "overwrite" pressure.
+        let state = AppState::new();
+        let cid = Uuid::new_v4();
+
+        for i in 0..20 {
+            state.record_worker_response(WorkerResponseRecord {
+                correlation_id: cid,
+                agent_id: "a".to_string(),
+                text: format!("version-{i}"),
+                task_id: None,
+                during_task: false,
+                timestamp: Utc::now(),
+            });
+        }
+
+        // 20 overwrites of the same id should leave only one entry.
+        // Fill to CAP with DIFFERENT ids and confirm our sentinel
+        // entry (still at the front of insert order) is NOT evicted
+        // until we actually overflow with unique entries.
+        for _ in 0..(WORKER_RESPONSE_CACHE_CAP - 1) {
+            state.record_worker_response(WorkerResponseRecord {
+                correlation_id: Uuid::new_v4(),
+                agent_id: "a".to_string(),
+                text: "filler".to_string(),
+                task_id: None,
+                during_task: false,
+                timestamp: Utc::now(),
+            });
+        }
+        assert!(
+            state.get_worker_response(cid).is_some(),
+            "same-id overwrites must count as one entry in the deque"
+        );
+        // Latest value wins.
+        assert_eq!(
+            state.get_worker_response(cid).unwrap().text,
+            "version-19",
+            "latest overwrite wins in the in-place update path"
         );
     }
 

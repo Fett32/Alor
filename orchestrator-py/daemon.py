@@ -481,6 +481,32 @@ async def memory_get(project: str) -> dict[str, Any]:
     return await _one_shot("cli.memory.get", {"project": project})
 
 
+async def worker_response_get(correlation_id: str) -> dict[str, Any]:
+    """Retrieve the full text of a prior `worker.orch_response` from
+    the daemon's bounded in-memory cache.
+
+    Audit 8b03cae6 bloat fix #4. The orchestrator's event formatter
+    caps injected text at EVENT_TEXT_INJECT_MAX_BYTES (2 KiB) and,
+    when it truncates, appends a
+    `worker_response_get(correlation_id=X)` pointer. This is the RPC
+    that follows that pointer.
+
+    Response shape:
+      {correlation_id, agent_id, text, task_id, during_task,
+       timestamp}
+
+    Daemon returns a `cli.error` (surfaces in Python as DaemonError)
+    when the correlation_id was never seen or has been evicted from
+    the 100-entry LRU. Callers should treat "not found" as
+    "truncated copy is all we'll ever see" — there's no retry that
+    recovers an evicted entry.
+    """
+    return await _one_shot(
+        "cli.worker.response.get",
+        {"correlation_id": correlation_id},
+    )
+
+
 async def agent_spawn(
     agent: str,
     name: str | None = None,

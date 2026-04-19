@@ -11,13 +11,13 @@
 
 use crate::daemon::config::AgentConfig;
 use crate::daemon::project;
-use crate::daemon::state::{AppState, Task, TaskState};
+use crate::daemon::state::{AppState, Task, TaskState, WorkerResponseRecord};
 use crate::terminal::pane_manager::PaneManager;
 use crate::wrapper::protocol::{
     truncate_summary, CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliDelete, CliKill,
     CliMemoryGet, CliProjectGet, CliProjectSave, CliSpawn, CliStatus, CliTaskCancel, CliTaskCreate,
     CliTaskComplete as CliTaskCompletePayload, CliTaskGet, CliTaskInterventionClear,
-    CliTaskList, Envelope, TaskAccept, TaskAssign,
+    CliTaskList, CliWorkerResponseGet, Envelope, TaskAccept, TaskAssign,
     TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WorkerFrameWedged,
     WorkerOrchResponse, WorkerUserInput, WrapperError, WrapperRegister, MSG_CLI_AGENT_ENSURE_RUNNING,
     MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_DELETE, MSG_CLI_ERROR,
@@ -25,12 +25,13 @@ use crate::wrapper::protocol::{
     MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE, MSG_CLI_RESPONSE, MSG_CLI_SPAWN,
     MSG_CLI_STATUS, MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE, MSG_CLI_TASK_CREATE,
     MSG_CLI_TASK_INTERVENTION_CLEAR,
-    MSG_CLI_TASK_GET, MSG_CLI_TASK_LIST, MSG_ERROR, MSG_EVENT, MSG_REGISTER,
+    MSG_CLI_TASK_GET, MSG_CLI_TASK_LIST, MSG_CLI_WORKER_RESPONSE_GET, MSG_ERROR, MSG_EVENT,
+    MSG_REGISTER,
     MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
     MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
     MSG_WORKER_FRAME_WEDGED, MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT,
-    DEFAULT_TASK_GET_VIEW, TASK_LIST_FULL_MAX_LIMIT, TASK_SUMMARY_MAX_BYTES,
-    WORKER_ECHO_SENTINEL_BEGIN, WORKER_ECHO_SENTINEL_END,
+    DEFAULT_TASK_GET_VIEW, EVENT_TEXT_INJECT_MAX_BYTES, TASK_LIST_FULL_MAX_LIMIT,
+    TASK_SUMMARY_MAX_BYTES, WORKER_ECHO_SENTINEL_BEGIN, WORKER_ECHO_SENTINEL_END,
     ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
 };
 use anyhow::{Context, Result};
@@ -551,13 +552,32 @@ impl SocketServer {
                 // daemon embedded in the outbound sentinel so orch can match
                 // the reply to its originating send.
                 if let Ok(payload) = env.decode_payload::<WorkerOrchResponse>() {
+                    let will_truncate_in_orch =
+                        payload.text.len() > EVENT_TEXT_INJECT_MAX_BYTES;
                     info!(
                         agent_id,
                         correlation_id = %payload.correlation_id,
                         during_task = payload.during_task,
                         bytes = payload.text.len(),
+                        will_truncate_in_orch,
                         "worker orch response received"
                     );
+                    // Stash the full text in the fetch-on-demand cache
+                    // BEFORE broadcasting. Orch's event formatter caps
+                    // the injected text at EVENT_TEXT_INJECT_MAX_BYTES
+                    // (2 KiB) and appends a
+                    // `worker_response_get(correlation_id=X)` pointer
+                    // when it truncates — this record is what the
+                    // subsequent `cli.worker.response.get` returns.
+                    // Audit 8b03cae6 bloat fix #4.
+                    self.app_state.record_worker_response(WorkerResponseRecord {
+                        correlation_id: payload.correlation_id,
+                        agent_id: agent_id.to_string(),
+                        text: payload.text.clone(),
+                        task_id: payload.task_id,
+                        during_task: payload.during_task,
+                        timestamp: chrono::Utc::now(),
+                    });
                     self.broadcast_event(
                         "worker.orch_response",
                         json!({
@@ -1839,6 +1859,47 @@ impl SocketServer {
                 }
             }
 
+            MSG_CLI_WORKER_RESPONSE_GET => {
+                // Audit 8b03cae6 bloat fix #4: fetch-on-demand
+                // counterpart to the orchestrator's injected-text cap.
+                // The orch saw a truncated `worker.orch_response`
+                // event that carried a
+                // `worker_response_get(correlation_id=X)` pointer; now
+                // it's asking for the full body. Returns the cached
+                // `WorkerResponseRecord` or a clear error when the id
+                // is unknown / has been evicted from the LRU.
+                match env.decode_payload::<CliWorkerResponseGet>() {
+                    Ok(payload) => match self.app_state.get_worker_response(payload.correlation_id) {
+                        Some(record) => match Envelope::new(
+                            MSG_CLI_RESPONSE,
+                            json!({
+                                "correlation_id": record.correlation_id.to_string(),
+                                "agent_id": record.agent_id,
+                                "text": record.text,
+                                "task_id": record.task_id.map(|t| t.to_string()),
+                                "during_task": record.during_task,
+                                "timestamp": record.timestamp.to_rfc3339(),
+                            }),
+                        ) {
+                            Ok(mut e) => {
+                                e.correlation_id = correlation_id;
+                                e
+                            }
+                            Err(_) => cli_error(correlation_id, "failed to serialize worker response"),
+                        },
+                        None => cli_error(
+                            correlation_id,
+                            &format!(
+                                "worker response {} not found (unknown correlation_id or evicted from the {}-entry LRU)",
+                                payload.correlation_id,
+                                crate::daemon::state::WORKER_RESPONSE_CACHE_CAP,
+                            ),
+                        ),
+                    },
+                    Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),
+                }
+            }
+
             MSG_CLI_INTEGRATIONS_GET => {
                 let config_dir = match crate::daemon::session::config_dir() {
                     Ok(d) => d,
@@ -3003,6 +3064,142 @@ mod tests {
             100,
         );
         assert!(payload.get("limit_clamped_from").is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // worker_response_get fetch-on-demand (audit 8b03cae6 fix #4)
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn worker_response_get_returns_cached_text_by_correlation_id() {
+        // End-to-end: seed a response in the cache, fire
+        // MSG_CLI_WORKER_RESPONSE_GET, confirm the response envelope
+        // carries the full text + metadata. This is the path the
+        // orchestrator hits after seeing a truncated worker.orch_response
+        // event carrying a worker_response_get(correlation_id=X) pointer.
+        let server = server_for_test();
+        let cid = Uuid::new_v4();
+        let tid = Uuid::new_v4();
+        let full_text = "x".repeat(5_000);
+        server.app_state.record_worker_response(WorkerResponseRecord {
+            correlation_id: cid,
+            agent_id: "claude-mandaforge".to_string(),
+            text: full_text.clone(),
+            task_id: Some(tid),
+            during_task: true,
+            timestamp: chrono::Utc::now(),
+        });
+
+        let env = Envelope::new(
+            MSG_CLI_WORKER_RESPONSE_GET,
+            serde_json::json!({"correlation_id": cid}),
+        )
+        .expect("build envelope");
+        let resp = server.handle_cli_message(env).await;
+
+        assert_eq!(resp.kind, MSG_CLI_RESPONSE);
+        let payload = resp.payload;
+        assert_eq!(
+            payload.get("correlation_id").and_then(|v| v.as_str()),
+            Some(cid.to_string().as_str())
+        );
+        assert_eq!(
+            payload.get("agent_id").and_then(|v| v.as_str()),
+            Some("claude-mandaforge")
+        );
+        // The whole 5 KB round-trips — that's the entire point of
+        // the cache (orch already has a 2 KB truncated copy; it's
+        // here to recover the full body).
+        assert_eq!(
+            payload.get("text").and_then(|v| v.as_str()).map(str::len),
+            Some(5_000)
+        );
+        assert_eq!(
+            payload.get("task_id").and_then(|v| v.as_str()),
+            Some(tid.to_string().as_str())
+        );
+        assert_eq!(
+            payload.get("during_task").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        // Timestamp is an RFC3339 string; just confirm it's non-empty.
+        assert!(
+            payload
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "timestamp must be present + non-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_response_get_unknown_correlation_id_returns_cli_error() {
+        // Not-found path. Must be a typed cli_error envelope (so
+        // Python-side DaemonError fires) rather than a silent empty
+        // text — otherwise the LLM would think the response genuinely
+        // came back empty and not retry / ask Fett directly.
+        let server = server_for_test();
+        let unknown = Uuid::new_v4();
+
+        let env = Envelope::new(
+            MSG_CLI_WORKER_RESPONSE_GET,
+            serde_json::json!({"correlation_id": unknown}),
+        )
+        .expect("build envelope");
+        let resp = server.handle_cli_message(env).await;
+
+        assert_eq!(resp.kind, MSG_CLI_ERROR);
+        let err_msg = resp
+            .payload
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            err_msg.contains("not found"),
+            "error prose must say 'not found'; got {:?}",
+            err_msg
+        );
+        // Include the id in the prose so logs / LLM context can
+        // distinguish which id failed when multiple fetches race.
+        assert!(
+            err_msg.contains(&unknown.to_string()),
+            "error prose must echo the unknown correlation_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn msg_worker_orch_response_handler_stashes_before_broadcast() {
+        // Integration: the full handler path records to the cache so
+        // a subsequent fetch resolves. Separate from the
+        // cache-unit-tests above (which exercise AppState directly) —
+        // this one pins the MSG_WORKER_ORCH_RESPONSE → cache write
+        // wire-up.
+        let server = server_for_test();
+        let cid = Uuid::new_v4();
+        let env = Envelope::new(
+            MSG_WORKER_ORCH_RESPONSE,
+            WorkerOrchResponse {
+                agent_id: "ignored-per-connection-bound-rule".to_string(),
+                correlation_id: cid,
+                text: "y".repeat(4_000),
+                during_task: false,
+                task_id: None,
+            },
+        )
+        .expect("build envelope");
+        server.handle_message("claude-alor", env).await;
+
+        // Cache populated with the full body — this is what the fetch
+        // RPC would return. The agent_id on the record reflects the
+        // connection-bound agent (security: workers can't forge a
+        // reply on behalf of another agent).
+        let rec = server
+            .app_state
+            .get_worker_response(cid)
+            .expect("handler must have recorded the response before broadcast");
+        assert_eq!(rec.text.len(), 4_000);
+        assert_eq!(rec.agent_id, "claude-alor");
     }
 
     #[tokio::test]

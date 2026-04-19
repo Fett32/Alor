@@ -82,6 +82,11 @@ _WORKER_DENIED_ALOR_TOOLS: frozenset[str] = frozenset(
         "project_get",
         "project_list",
         "memory_get",
+        # Fetch-on-demand for truncated orch-injected event text
+        # (audit 8b03cae6 fix #4). Orchestrator-only — workers have
+        # no notion of "my orch context was truncated"; the full
+        # reply text lives in their own SDK history already.
+        "worker_response_get",
     }
 )
 
