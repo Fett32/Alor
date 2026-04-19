@@ -165,8 +165,34 @@ async def task_assign(task_id: str, agent_id: str) -> dict[str, Any]:
     return await _one_shot("cli.assign", {"task_id": task_id, "agent_id": agent_id})
 
 
-async def task_get(task_id: str) -> dict[str, Any]:
-    return await _one_shot("cli.task.get", {"task_id": task_id})
+async def task_get(task_id: str, view: str | None = None) -> dict[str, Any]:
+    """Fetch one task's state, projected per `view`.
+
+    `view` selects the response shape:
+      - None (falls through to server default, "summary") / "summary"
+        → routing-useful scalars (id, title, state, assigned_to,
+        project, parent_task_id, created_at, updated_at,
+        user_intervened) plus `has_*` booleans for the heavy fields
+        (description, summary, details, proposal_brief,
+        proposal_diff). ~300–500 B. Use for routine state checks.
+      - "full" → every Task field including the heavy text bodies.
+        Use when a `has_*` flag on a prior summary tells you
+        something's worth pulling, or when you need the brief /
+        proposal / full post-task report.
+      - Any other string: the server silently treats it as "summary".
+
+    Response shape: `{task: ..., view: str}`. `view` echoes back
+    which shape the server actually applied.
+
+    Server-side projection via `view` on `cli.task.get`. See
+    `src-tauri/src/wrapper/protocol.rs::CliTaskGet`. Sized off audit
+    8b03cae6 fix #2 — `task_get` was a P0 bloat source before the
+    split.
+    """
+    payload: dict[str, Any] = {"task_id": task_id}
+    if view is not None:
+        payload["view"] = view
+    return await _one_shot("cli.task.get", payload)
 
 
 async def task_list(

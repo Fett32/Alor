@@ -29,8 +29,8 @@ use crate::wrapper::protocol::{
     MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
     MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
     MSG_WORKER_FRAME_WEDGED, MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT,
-    TASK_SUMMARY_MAX_BYTES, WORKER_ECHO_SENTINEL_BEGIN, WORKER_ECHO_SENTINEL_END,
-    ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
+    DEFAULT_TASK_GET_VIEW, TASK_SUMMARY_MAX_BYTES, WORKER_ECHO_SENTINEL_BEGIN,
+    WORKER_ECHO_SENTINEL_END, ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -821,17 +821,47 @@ impl SocketServer {
             }
 
             MSG_CLI_TASK_GET => {
+                // Audit 8b03cae6 bloat fix #2: `task_get` used to
+                // unconditionally return the full Task — description +
+                // summary + details + proposal_brief + proposal_diff —
+                // which the orchestrator paid for on every routine
+                // "has this completed?" check (2–10 KB; up to 10 MB if
+                // proposal_diff was populated near its cap). Summary
+                // view is the lean default now; consumers that need
+                // the heavy bodies opt into `view="full"` — and the
+                // `has_*` flags on the summary tell them when that's
+                // worth doing.
                 match env.decode_payload::<CliTaskGet>() {
-                    Ok(payload) => match self.app_state.get_task(payload.task_id) {
-                        Some(task) => match Envelope::new(MSG_CLI_RESPONSE, json!({"task": task})) {
-                            Ok(mut e) => {
-                                e.correlation_id = correlation_id;
-                                e
+                    Ok(payload) => {
+                        let requested_view = payload.view.as_deref().unwrap_or(
+                            DEFAULT_TASK_GET_VIEW,
+                        );
+                        match self.app_state.get_task(payload.task_id) {
+                            Some(task) => {
+                                let response_json = match requested_view {
+                                    "full" => json!({
+                                        "view": "full",
+                                        "task": task,
+                                    }),
+                                    _ => json!({
+                                        "view": "summary",
+                                        "task": task.get_summary(),
+                                    }),
+                                };
+                                match Envelope::new(MSG_CLI_RESPONSE, response_json) {
+                                    Ok(mut e) => {
+                                        e.correlation_id = correlation_id;
+                                        e
+                                    }
+                                    Err(_) => cli_error(correlation_id, "failed to serialize task"),
+                                }
                             }
-                            Err(_) => cli_error(correlation_id, "failed to serialize task"),
-                        },
-                        None => cli_error(correlation_id, &format!("task {} not found", payload.task_id)),
-                    },
+                            None => cli_error(
+                                correlation_id,
+                                &format!("task {} not found", payload.task_id),
+                            ),
+                        }
+                    }
                     Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),
                 }
             }
@@ -2565,6 +2595,144 @@ mod tests {
         assert!(
             t.details.is_none(),
             "server must not synthesize details from a truncated summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_get_default_view_returns_summary_shape_with_has_flags() {
+        // Default (no `view` field on the payload) must resolve to
+        // the "summary" projection: lean scalars + has_* booleans,
+        // heavy bodies dropped. This is the fix's default contract.
+        let server = server_for_test();
+        let mut t = Task::new("title", "non-empty description");
+        t.summary = Some("ok".to_string());
+        t.details = Some("long report".to_string());
+        let id = t.id;
+        server.app_state.add_task(t);
+
+        let env = Envelope::new(
+            MSG_CLI_TASK_GET,
+            serde_json::json!({"task_id": id}),
+        )
+        .expect("build envelope");
+        let resp = server.handle_cli_message(env).await;
+
+        let payload = resp.payload;
+        assert_eq!(payload.get("view").and_then(|v| v.as_str()), Some("summary"));
+        let task = payload.get("task").expect("task present").as_object().expect("object");
+        // Summary-shape affordances.
+        assert_eq!(task.get("has_description"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(task.get("has_summary"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(task.get("has_details"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(task.get("has_proposal_brief"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(task.get("has_proposal_diff"), Some(&serde_json::Value::Bool(false)));
+        // Heavy bodies must not be present.
+        assert!(task.get("description").is_none(), "summary must not carry description");
+        assert!(task.get("summary").is_none(), "summary view must not carry the summary body");
+        assert!(task.get("details").is_none(), "summary view must not carry details");
+        assert!(task.get("proposal_diff").is_none());
+    }
+
+    #[tokio::test]
+    async fn task_get_full_view_returns_entire_task() {
+        // Explicit opt-in to `view="full"` must return the full Task
+        // including heavy bodies. Back-compat for alor-cli (which
+        // now passes view="full" explicitly) + the orch's follow-up
+        // fetch path after a has_* flag told it there's something
+        // to pull.
+        let server = server_for_test();
+        let mut t = Task::new("title", "the description body");
+        t.summary = Some("ok".to_string());
+        t.details = Some("the long report".to_string());
+        t.proposal_diff = Some("--- a/x\n+++ b/x".to_string());
+        let id = t.id;
+        server.app_state.add_task(t);
+
+        let env = Envelope::new(
+            MSG_CLI_TASK_GET,
+            serde_json::json!({"task_id": id, "view": "full"}),
+        )
+        .expect("build envelope");
+        let resp = server.handle_cli_message(env).await;
+
+        let payload = resp.payload;
+        assert_eq!(payload.get("view").and_then(|v| v.as_str()), Some("full"));
+        let task = payload.get("task").expect("task present").as_object().expect("object");
+        // Heavy bodies round-trip.
+        assert_eq!(
+            task.get("description").and_then(|v| v.as_str()),
+            Some("the description body")
+        );
+        assert_eq!(task.get("summary").and_then(|v| v.as_str()), Some("ok"));
+        assert_eq!(
+            task.get("details").and_then(|v| v.as_str()),
+            Some("the long report")
+        );
+        assert_eq!(
+            task.get("proposal_diff").and_then(|v| v.as_str()),
+            Some("--- a/x\n+++ b/x")
+        );
+        // has_* flags are NOT on the full view — they're a summary-
+        // shape affordance, redundant once the bodies are inline.
+        assert!(
+            task.get("has_description").is_none(),
+            "full view must not carry the has_* affordance flags"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_get_unknown_view_falls_through_to_summary() {
+        // LLM typo forgiveness: `view="Summary"`, `view="FULL"`,
+        // `view="whatever"` all resolve to the safe default
+        // (summary) rather than error. Mirrors the agent_list /
+        // task_list silent fallback.
+        let server = server_for_test();
+        let t = Task::new("title", "desc");
+        let id = t.id;
+        server.app_state.add_task(t);
+
+        let env = Envelope::new(
+            MSG_CLI_TASK_GET,
+            serde_json::json!({"task_id": id, "view": "whatever-typo"}),
+        )
+        .expect("build envelope");
+        let resp = server.handle_cli_message(env).await;
+
+        let payload = resp.payload;
+        assert_eq!(
+            payload.get("view").and_then(|v| v.as_str()),
+            Some("summary"),
+            "unknown view string must fall through to summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_get_missing_task_returns_cli_error() {
+        // Regression guard: not-found path must still return a
+        // cli.error (not a summary of a default Task). Shape this
+        // test to the error envelope kind rather than content so a
+        // future error-prose change doesn't flap.
+        let server = server_for_test();
+        let missing = Uuid::new_v4();
+
+        let env = Envelope::new(
+            MSG_CLI_TASK_GET,
+            serde_json::json!({"task_id": missing}),
+        )
+        .expect("build envelope");
+        let resp = server.handle_cli_message(env).await;
+
+        // cli_error produces an MSG_CLI_ERROR envelope with the
+        // prose in payload.error. Confirm shape.
+        assert_eq!(resp.kind, MSG_CLI_ERROR);
+        assert!(
+            resp.payload
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("not found"),
+            "missing-task error payload must say 'not found'; got {:?}",
+            resp.payload
         );
     }
 

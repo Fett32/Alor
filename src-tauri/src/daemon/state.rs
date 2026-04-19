@@ -213,6 +213,57 @@ pub struct TaskSummary {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Single-task summary projection used by `cli.task.get` when the
+/// caller passes `view = "summary"` (the default — see
+/// `src-tauri/src/wrapper/protocol.rs::DEFAULT_TASK_GET_VIEW`).
+///
+/// Different shape from `TaskSummary` (which is for list scans and is
+/// deliberately minimal). `TaskGetSummary` is a richer projection
+/// sized for routine orchestrator queries — "has this completed? who
+/// owns it? is there a proposal waiting? is there a details body I
+/// should pull?" — without paying for the heavy text bodies.
+///
+/// The `has_*` flags are the key affordance: they tell the caller
+/// which heavy fields are populated, so it can opt into a follow-up
+/// `view = "full"` call only when there's actually something to
+/// fetch. `has_summary` / `has_details` come directly from audit
+/// 8b03cae6 fix #1's split: the orch's `task.completed` event tells
+/// it `has_details` already, and `task_get(view="summary")` re-
+/// confirms that flag (plus the others) for later follow-ups.
+///
+/// Serialize-only; no round-trip use case.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskGetSummary {
+    pub id: Uuid,
+    pub title: String,
+    pub state: TaskState,
+    pub assigned_to: Option<String>,
+    pub project: Option<String>,
+    pub parent_task_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub user_intervened: bool,
+    /// True when `Task.description` is non-empty. `description` is
+    /// set at task creation time (the brief) and is typically the
+    /// bulkiest field on a fresh task — the flag lets the orch skip
+    /// a follow-up `view="full"` when it already has the brief in
+    /// its own context.
+    pub has_description: bool,
+    /// True when `Task.summary` is populated. Set by worker
+    /// completion (terse, ≤512 B cap) or by retroactive close-out
+    /// via `cli.task.complete`.
+    pub has_summary: bool,
+    /// True when `Task.details` is populated — the full post-task
+    /// report when the worker split it out from the terse summary
+    /// (audit 8b03cae6 fix #1). This is what the orch's event
+    /// injection points at with "(Full report available via
+    /// task_get)"; the flag re-confirms availability on follow-up
+    /// get calls.
+    pub has_details: bool,
+    pub has_proposal_brief: bool,
+    pub has_proposal_diff: bool,
+}
+
 impl Task {
     /// Project to the summary-view shape. Called by the server after
     /// filtering + pagination when `view = "summary"`.
@@ -223,6 +274,36 @@ impl Task {
             state: self.state.clone(),
             assigned_to: self.assigned_to.clone(),
             updated_at: self.updated_at,
+        }
+    }
+
+    /// Project to the single-task summary-view shape used by
+    /// `cli.task.get` (see `TaskGetSummary` for the rationale).
+    ///
+    /// The `has_*` flags inspect each heavy field:
+    ///   - `description` is a `String`, never `None` — treat an empty
+    ///     string as "not really populated" so the flag reflects
+    ///     user-visible content rather than struct initialization.
+    ///   - The `Option<String>` fields (summary / details / proposal_*)
+    ///     use `Option::is_some` and ignore whether the inner string
+    ///     is empty: an empty-string summary is genuinely rare and a
+    ///     caller that wrote one probably wants to pull it.
+    pub fn get_summary(&self) -> TaskGetSummary {
+        TaskGetSummary {
+            id: self.id,
+            title: self.title.clone(),
+            state: self.state.clone(),
+            assigned_to: self.assigned_to.clone(),
+            project: self.project.clone(),
+            parent_task_id: self.parent_task_id,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            user_intervened: self.user_intervened,
+            has_description: !self.description.is_empty(),
+            has_summary: self.summary.is_some(),
+            has_details: self.details.is_some(),
+            has_proposal_brief: self.proposal_brief.is_some(),
+            has_proposal_diff: self.proposal_diff.is_some(),
         }
     }
 
@@ -1587,6 +1668,165 @@ mod tests {
             current.len(),
             3,
             "agent's 3 non-terminal tasks must be in current_tasks"
+        );
+    }
+
+    #[test]
+    fn task_get_summary_projects_expected_shape_and_has_flags() {
+        // Audit 8b03cae6 fix #2 (task_get view modes). The summary
+        // shape covers routine routing/state-check calls: scalar
+        // fields the orch always wants + `has_*` booleans that tell
+        // it which heavy fields exist without pulling them. This
+        // test pins (a) the serialized key set and (b) the has_*
+        // booleans for an unpopulated task.
+        use std::collections::BTreeSet;
+        let t = Task::new("title", "a description");
+        let s = t.get_summary();
+
+        assert_eq!(s.id, t.id);
+        assert_eq!(s.title, "title");
+        assert_eq!(s.state, TaskState::Pending);
+        assert!(s.assigned_to.is_none());
+        assert!(s.project.is_none());
+        assert!(s.parent_task_id.is_none());
+        assert_eq!(s.created_at, t.created_at);
+        assert_eq!(s.updated_at, t.updated_at);
+        assert!(!s.user_intervened);
+        // Fresh-from-new task — description is non-empty, heavy
+        // fields are all None.
+        assert!(s.has_description);
+        assert!(!s.has_summary);
+        assert!(!s.has_details);
+        assert!(!s.has_proposal_brief);
+        assert!(!s.has_proposal_diff);
+
+        // Serialize and confirm the exact wire shape. The `has_*`
+        // flags are the key affordance — regressing any of them
+        // (typo in the field name, accidental rename) would silently
+        // break the orch's "is there something worth fetching?"
+        // decision.
+        let json = serde_json::to_value(&s).expect("serializes");
+        let obj = json.as_object().expect("JSON object");
+        let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        let expected: BTreeSet<&str> = [
+            "id",
+            "title",
+            "state",
+            "assigned_to",
+            "project",
+            "parent_task_id",
+            "created_at",
+            "updated_at",
+            "user_intervened",
+            "has_description",
+            "has_summary",
+            "has_details",
+            "has_proposal_brief",
+            "has_proposal_diff",
+        ]
+        .iter()
+        .copied()
+        .collect();
+        assert_eq!(
+            keys, expected,
+            "TaskGetSummary wire shape must carry exactly these 14 keys"
+        );
+        // Specifically, the heavy bodies must NOT be in the wire
+        // shape — they're the whole reason this projection exists.
+        for dropped in ["description", "summary", "details", "proposal_brief", "proposal_diff"] {
+            assert!(
+                !obj.contains_key(dropped),
+                "TaskGetSummary must NOT serialize `{dropped}`"
+            );
+        }
+    }
+
+    #[test]
+    fn task_get_summary_has_flags_flip_true_when_fields_populated() {
+        // All heavy fields populated → every has_* flag true.
+        // Pins the "is the field populated?" logic for each flag so
+        // a future refactor (e.g. swapping Option for String with
+        // sentinel-empty) doesn't silently break the affordance.
+        let mut t = Task::new("title", "a real description");
+        t.summary = Some("terse line".to_string());
+        t.details = Some("full report body".to_string());
+        t.proposal_brief = Some("what this will do".to_string());
+        t.proposal_diff = Some("--- a/x.rs\n+++ b/x.rs".to_string());
+        t.project = Some("alor".to_string());
+        t.assigned_to = Some("claude-alor".to_string());
+        t.user_intervened = true;
+
+        let s = t.get_summary();
+        assert!(s.has_description);
+        assert!(s.has_summary);
+        assert!(s.has_details);
+        assert!(s.has_proposal_brief);
+        assert!(s.has_proposal_diff);
+        assert!(s.user_intervened);
+        assert_eq!(s.project.as_deref(), Some("alor"));
+        assert_eq!(s.assigned_to.as_deref(), Some("claude-alor"));
+
+        // Edge: description is a `String`, never None, so an empty
+        // string must read as "not populated" — otherwise every
+        // freshly-created task without a brief would claim to have
+        // one and the orch would waste a view=full call fetching
+        // nothing.
+        let empty = Task::new("title", "");
+        assert!(
+            !empty.get_summary().has_description,
+            "empty description must not set has_description"
+        );
+    }
+
+    #[test]
+    fn task_get_summary_is_at_least_5x_smaller_than_full_for_populated_task() {
+        // Acceptance criterion from the task spec: "full-view payload
+        // is at least 5× larger than summary-view for a task with
+        // populated description + summary + details + proposal_brief
+        // + proposal_diff". Simulates what the MSG_CLI_TASK_GET
+        // handler serializes for each view, side-by-side, with a
+        // realistic populated task.
+        use serde_json::json;
+
+        let mut t = Task::new("title", "a".repeat(500)); // ~500 B description
+        t.state = TaskState::Accepted;
+        t.assigned_to = Some("claude-alor".to_string());
+        t.project = Some("alor".to_string());
+        t.summary = Some("b".repeat(400)); // near the 512 B cap
+        t.details = Some("c".repeat(2_000)); // realistic worker report
+        t.proposal_brief = Some("d".repeat(300));
+        t.proposal_diff = Some("e".repeat(4_000)); // a modest diff
+
+        // Full shape: what the handler returns on view=full.
+        let full_resp = json!({"view": "full", "task": &t});
+        let full_bytes = serde_json::to_vec(&full_resp).expect("full serializes").len();
+
+        // Summary shape: what the handler returns on view=summary.
+        let summary_resp = json!({"view": "summary", "task": t.get_summary()});
+        let summary_bytes = serde_json::to_vec(&summary_resp)
+            .expect("summary serializes")
+            .len();
+
+        let ratio = full_bytes as f64 / summary_bytes as f64;
+        assert!(
+            ratio >= 5.0,
+            "summary payload must be at least 5x smaller than full; \
+             got summary={} bytes, full={} bytes, ratio={:.1}x",
+            summary_bytes,
+            full_bytes,
+            ratio,
+        );
+
+        // Additionally: the acceptance criterion in the task spec is
+        // "Routine `task_get` call on an ACCEPTED task drops from
+        // ~2–10 KB response to <400 B". Our projection under a
+        // realistic populated task must clear that bar. 500 B of
+        // leeway for timestamps + long strings.
+        assert!(
+            summary_bytes < 500,
+            "summary response on a populated task must stay well under \
+             the acceptance ceiling (<500 B); got {} bytes",
+            summary_bytes,
         );
     }
 

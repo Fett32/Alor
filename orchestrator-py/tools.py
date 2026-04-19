@@ -95,13 +95,29 @@ async def task_assign(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "task_get",
-    "Get full state of a task: state, assigned_to, proposal_brief, "
-    "proposal_diff, user_intervened flag.",
-    {"task_id": str},
+    "Get one task's state. Defaults to `view='summary'` — routing-"
+    "useful scalars (id, title, state, assigned_to, project, "
+    "parent_task_id, created_at, updated_at, user_intervened) plus "
+    "`has_description` / `has_summary` / `has_details` / "
+    "`has_proposal_brief` / `has_proposal_diff` booleans that tell "
+    "you which heavy fields are populated. ~300–500 B per call — use "
+    "this for routine state checks (has it completed? who owns it? "
+    "is there a proposal waiting?). "
+    "Pass `view='full'` ONLY when you need the heavy bodies — "
+    "description, summary, details, proposal_brief, proposal_diff — "
+    "typically after a `has_*` flag on a summary call told you "
+    "there's something to fetch. A full call on a task with a "
+    "populated proposal_diff can run into multi-KB territory.",
+    {"task_id": str, "view": str},
 )
 async def task_get(args: dict[str, Any]) -> dict[str, Any]:
     try:
-        return _ok(await daemon.task_get(args["task_id"]))
+        # Missing/blank view → server default ("summary"). Lowercase
+        # for forgiveness on LLM typos like "Summary" or "FULL"; the
+        # server treats unknown values as summary anyway.
+        raw_view = (args.get("view") or "").strip().lower()
+        view = raw_view or None
+        return _ok(await daemon.task_get(args["task_id"], view=view))
     except Exception as e:
         return _err(str(e))
 

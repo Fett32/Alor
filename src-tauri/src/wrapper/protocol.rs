@@ -467,10 +467,45 @@ pub struct CliTaskInterventionClear {
     pub task_id: Uuid,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Payload for `cli.task.get`.
+///
+/// `view` controls the response shape:
+///   - `None` or `"summary"` (default — see `DEFAULT_TASK_GET_VIEW`):
+///     return a lean projection — routing-useful scalars plus `has_*`
+///     booleans for the heavy fields (description, summary, details,
+///     proposal_brief, proposal_diff). Sized for the common case where
+///     the orchestrator just needs "has this completed?" / "who's it
+///     assigned to?" / "is there a proposal waiting?" without paying
+///     for the full body. ~300–500 B per task.
+///   - `"full"` → backwards-compatible firehose: every `Task` field
+///     including description, summary, details, proposal_brief,
+///     proposal_diff. Used by alor-cli, debug inspection, and the
+///     orch's follow-up fetch when a `has_*` flag tells it there's
+///     something worth pulling.
+///   - Anything else: silently treated as `"summary"`. An LLM caller
+///     with a typo shouldn't blow up the response.
+///
+/// The `view` field in the response envelope echoes back which shape
+/// the server actually applied.
+///
+/// Sized off audit 8b03cae6 fix #2: `task_get` was reported as a
+/// high-frequency bloat source — 2–10 KB per call (up to 10 MB if
+/// proposal_diff was populated near its cap), often just to check
+/// state. Summary view is the lean default; full view stays available
+/// for the orch to opt into when a `has_*` flag says a heavy body
+/// exists.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CliTaskGet {
     pub task_id: Uuid,
+    #[serde(default)]
+    pub view: Option<String>,
 }
+
+/// Default `view` for `cli.task.get`. "summary" keeps routine
+/// state-check calls lean; callers that need the full Task
+/// (description / summary / details / proposal_brief / proposal_diff)
+/// must opt in with `"full"`.
+pub const DEFAULT_TASK_GET_VIEW: &str = "summary";
 
 /// Payload for `cli.task.list`.
 ///

@@ -81,7 +81,17 @@ struct CliProjectSave {
 #[derive(Serialize)]
 struct CliAssign { task_id: Uuid, agent_id: String }
 #[derive(Serialize)]
-struct CliTaskGet { task_id: Uuid }
+struct CliTaskGet {
+    task_id: Uuid,
+    // alor-cli renders description in its single-task printout
+    // (see cmd_task_get). Server default is now `view="summary"`
+    // (bloat fix #2, commit after 7aec211) which drops description
+    // to a `has_description` boolean. CLI opts into `view="full"`
+    // so the TaskInfo deserialization still finds the description
+    // string. Orchestrator callers don't set this; they get the
+    // cheaper default.
+    view: &'static str,
+}
 
 #[derive(Deserialize)]
 struct AgentInfo { id: String, name: String, connected: bool, tmux_session: Option<String> }
@@ -279,7 +289,13 @@ async fn cmd_task_list() -> Result<()> {
 }
 
 async fn cmd_task_get(task_id: Uuid) -> Result<()> {
-    let req = Envelope::new("cli.task.get", CliTaskGet { task_id })?;
+    let req = Envelope::new(
+        "cli.task.get",
+        CliTaskGet {
+            task_id,
+            view: "full",
+        },
+    )?;
     let resp = send_request(&req).await?;
     let info: TaskResponsePayload = serde_json::from_value(resp.payload)?;
     println!("ID:          {}\nTitle:       {}\nState:       {}\nDescription: {}", info.task.id, info.task.title, info.task.state, info.task.description);
