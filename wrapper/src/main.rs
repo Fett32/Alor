@@ -19,6 +19,14 @@ use tracing::{debug, error, info, warn};
 
 const DAEMON_SOCK: &str = "/tmp/alor/daemon.sock";
 const CAPTURE_LINES: usize = 50;
+/// Deeper pane capture taken at `task.complete` fire time specifically
+/// for reply extraction. The idle-detection loop uses `CAPTURE_LINES`
+/// (50) which is plenty to see the footer + input line, but long
+/// replies (multi-paragraph prose, code blocks) scroll the top half
+/// out of a 50-line window. tmux history-limit is 50000 (set by
+/// `ensure_session_defaults`) so capturing 400 is essentially free.
+/// Tune upward if real replies regularly truncate.
+const EXTRACT_CAPTURE_LINES: usize = 400;
 const POLL_INTERVAL_MS: u64 = 500;
 /// Idle pattern must be stable for this many seconds before marking complete.
 ///
@@ -510,6 +518,15 @@ async fn run_loop(
     let mut last_injection: Option<Instant> = None;
     let mut last_intervention_sent: Option<Instant> = None;
     let mut prev_fingerprint: Option<String> = None;
+    // Tracks the previous poll's `is_idle` result. Intervention
+    // detection fires only when the pane was idle on the PRIOR poll
+    // and then changes — agent-driven animation (cursor TUI spinners,
+    // codex `Working…` counters) has is_idle=false throughout, so
+    // prev_is_idle stays false and no false-positive intervention
+    // fires. See the live cursor-alor bug write-up: pre-fix the
+    // check was `content_changed && !is_idle` which misclassified
+    // every animation frame past INJECTION_GRACE as user input.
+    let mut prev_is_idle: bool = false;
     let mut last_heartbeat = Instant::now();
 
     // Log every fresh run_loop entry — including reconnects —
@@ -600,69 +617,71 @@ async fn run_loop(
             let task_id = *task_id;
             match tmux::capture_pane(session, CAPTURE_LINES) {
                 Ok(lines) => {
-                    // -- user intervention detection --
-                    // Fingerprint window uses the detector's tail
-                    // window so it stays in sync with idle scanning:
-                    // cursor (wider window) hashes more of the pane,
-                    // shell-prompt runtimes hash the last 5 lines.
-                    // Keeps "did the pane change?" aligned with
-                    // "is the runtime idle?" — a change that only
-                    // touches the cursor UI region (e.g. a spinner
-                    // appearing above the Composer footer) now
+                    // Fingerprint window tracks the detector's tail
+                    // window so "did the pane change?" aligns with
+                    // "is the runtime idle?" — a change in only the
+                    // TUI region (spinner above Composer, `Working`
+                    // ticker, streaming lines above codex's `›`)
                     // correctly registers as content_changed.
                     let tail_n = detector.tail_window();
-                    let tail: Vec<&str> = lines.iter().rev().take(tail_n).map(|s| s.as_str()).collect();
+                    let tail: Vec<&str> = lines
+                        .iter()
+                        .rev()
+                        .take(tail_n)
+                        .map(|s| s.as_str())
+                        .collect();
                     let fingerprint = tail.join("\n");
-                    let content_changed = prev_fingerprint.as_deref() != Some(&fingerprint);
+                    let content_changed =
+                        prev_fingerprint.as_deref() != Some(&fingerprint);
                     prev_fingerprint = Some(fingerprint);
 
-                    if content_changed {
-                        let now = Instant::now();
-                        let past_injection_grace = last_injection
-                            .map(|t| now.duration_since(t).as_secs_f64() >= INJECTION_GRACE_SECS)
-                            .unwrap_or(true);
-                        let past_cooldown = last_intervention_sent
-                            .map(|t| now.duration_since(t).as_secs_f64() >= INTERVENTION_COOLDOWN_SECS)
-                            .unwrap_or(true);
-                        let is_idle = detector.is_idle_tail(&lines);
-
-                        if past_injection_grace && past_cooldown && !is_idle {
-                            info!("detected user intervention in tmux pane");
-                            let interv_env = Envelope::new(
-                                MSG_USER_INTERVENTION,
-                                UserIntervention { agent_id: agent.to_owned() },
-                            )?;
-                            client.send(&interv_env).await?;
-                            last_intervention_sent = Some(now);
-                        }
-                    }
-
-                    // -- idle detection --
-                    // Skip idle detection during injection grace period to avoid
-                    // false positives while the agent processes injected text.
+                    let is_idle = detector.is_idle_tail(&lines);
                     let now = Instant::now();
                     let past_idle_grace = last_injection
-                        .map(|t| now.duration_since(t).as_secs_f64() >= INJECTION_GRACE_SECS)
+                        .map(|t| {
+                            now.duration_since(t).as_secs_f64() >= INJECTION_GRACE_SECS
+                        })
                         .unwrap_or(true);
-                    // Re-call is_idle_tail once so both the branch decision and
-                    // the debug log see the same value — cheap (regex match
-                    // over <=15 lines) and avoids the "detector evaluated
-                    // twice in the same poll with a fresh pane capture" class
-                    // of mismatch.
-                    let is_idle = detector.is_idle_tail(&lines);
+                    let past_cooldown = last_intervention_sent
+                        .map(|t| {
+                            now.duration_since(t).as_secs_f64()
+                                >= INTERVENTION_COOLDOWN_SECS
+                        })
+                        .unwrap_or(true);
+                    let idle_accumulated_secs = idle_since
+                        .map(|t| now.duration_since(t).as_secs_f64());
                     let last_inj_secs = last_injection
                         .map(|t| now.duration_since(t).as_secs_f64());
 
-                    if past_idle_grace && is_idle {
+                    let inputs = PollInputs {
+                        is_idle,
+                        was_idle_previously: prev_is_idle,
+                        content_changed,
+                        past_idle_grace,
+                        past_cooldown,
+                        idle_accumulated_secs,
+                        idle_stable_secs: IDLE_STABLE_SECS,
+                    };
+                    let decision = decide_poll_actions(inputs);
+
+                    // ---- fire intervention if flagged ----
+                    if decision.fire_intervention {
+                        info!("detected user intervention in tmux pane");
+                        let interv_env = Envelope::new(
+                            MSG_USER_INTERVENTION,
+                            UserIntervention { agent_id: agent.to_owned() },
+                        )?;
+                        client.send(&interv_env).await?;
+                        last_intervention_sent = Some(now);
+                    }
+
+                    // ---- idle-timer bookkeeping + task.complete fire ----
+                    if decision.keep_idle_timer {
+                        // Start (or keep) the accumulation clock.
                         let first_seen = *idle_since.get_or_insert(now);
                         let elapsed = now.duration_since(first_seen).as_secs_f64();
 
-                        if elapsed >= IDLE_STABLE_SECS {
-                            // Firing: log at info level (matches the existing
-                            // "idle pattern stable, task complete" line) and
-                            // also emit a structured debug record so a
-                            // post-mortem log trail can tie the fire to the
-                            // preceding accumulation polls.
+                        if decision.fire_complete {
                             info!(
                                 stable_for = format!("{elapsed:.1}s"),
                                 "idle pattern stable, task complete"
@@ -675,17 +694,73 @@ async fn run_loop(
                                 idle_since_secs = Some(elapsed),
                                 last_inj_secs,
                                 content_changed,
-                                decision = "fire",
+                                decision = decision.decision,
                                 "idle_poll"
                             );
                             *state = AgentState::Idle;
                             idle_since = None;
+
+                            // Capture the assistant's reply for
+                            // task.details. The stability gate above
+                            // guarantees the pane has been quiet for
+                            // IDLE_STABLE_SECS, so the capture should
+                            // reflect a complete (not mid-stream)
+                            // reply. Deeper window than the poll's
+                            // CAPTURE_LINES because long replies
+                            // scroll out of the 50-line view.
+                            //
+                            // Fallback ladder:
+                            //   1. deep capture + extract → reply body
+                            //   2. deep capture fails        → reuse `lines`
+                            //   3. extract returns None      → synthetic
+                            //      EMPTY_CAPTURE_PLACEHOLDER so the
+                            //      orch sees a distinguishable
+                            //      "captured nothing" signal rather
+                            //      than the pre-fix null.
+                            let kind = AgentKind::from_name(agent);
+                            let deep_lines = match tmux::capture_pane(session, EXTRACT_CAPTURE_LINES) {
+                                Ok(ls) => ls,
+                                Err(e) => {
+                                    warn!(error = %e, "deep pane capture failed at task.complete; falling back to idle-poll capture");
+                                    lines.clone()
+                                }
+                            };
+                            let extracted = kind.extract_reply(&deep_lines);
+                            if let Some(ref body) = extracted {
+                                if detector::looks_truncated(body) {
+                                    warn!(
+                                        agent,
+                                        task_id = %task_id,
+                                        "extracted reply has odd code-fence count — may be partial; consider tuning IDLE_STABLE_SECS"
+                                    );
+                                }
+                            }
+                            let body = extracted.unwrap_or_else(||
+                                detector::EMPTY_CAPTURE_PLACEHOLDER.to_string()
+                            );
+                            let (summary, details) = detector::split_summary_details(&body);
+                            // split returns (None, None) only on an
+                            // all-whitespace input. Since `body` is
+                            // either the placeholder string or a
+                            // non-empty extracted body, one of
+                            // `summary` / `details` is guaranteed
+                            // Some — but the match defends against
+                            // future placeholder changes that might
+                            // drift the invariant.
+                            let (summary, details) = match (summary, details) {
+                                (None, None) => (
+                                    Some(detector::EMPTY_CAPTURE_PLACEHOLDER.to_string()),
+                                    None,
+                                ),
+                                other => other,
+                            };
+
                             let complete_env = Envelope::new(
                                 MSG_TASK_COMPLETE,
                                 TaskComplete {
                                     task_id,
-                                    summary: None,
-                                    details: None,
+                                    summary,
+                                    details,
                                     output: None,
                                 },
                             )?;
@@ -699,32 +774,17 @@ async fn run_loop(
                                 idle_since_secs = Some(elapsed),
                                 last_inj_secs,
                                 content_changed,
-                                decision = "accumulate",
+                                decision = decision.decision,
                                 "idle_poll"
                             );
                         }
                     } else {
-                        // Not idle, or still in injection grace — reset the
-                        // stability timer. Log which condition caused the
-                        // reset so a stuck task can be diagnosed: we saw in
-                        // bd61772a that the pane LOOKED idle but the detector
-                        // was apparently returning false (or the branch
-                        // wasn't reached). The `decision` field pins down
-                        // which of the two sub-conditions tripped.
+                        // Reset the stability timer. The `decision`
+                        // label narrows down which sub-condition
+                        // killed it — critical for diagnosing stuck
+                        // tasks (see bd61772a).
                         let had_timer = idle_since.is_some();
                         idle_since = None;
-                        let decision = if !past_idle_grace {
-                            "reset(grace)"
-                        } else {
-                            // past_idle_grace is true but is_idle false
-                            "reset(not-idle)"
-                        };
-                        // Only log on state changes or on rising edge — at
-                        // trace level, log every poll; at debug level, log
-                        // only when the decision bit changes (had_timer
-                        // transition). Keeps debug output bounded but still
-                        // catches the critical "timer keeps getting reset"
-                        // repeating pattern.
                         if had_timer {
                             debug!(
                                 agent,
@@ -733,7 +793,7 @@ async fn run_loop(
                                 past_idle_grace,
                                 last_inj_secs,
                                 content_changed,
-                                decision,
+                                decision = decision.decision,
                                 "idle_poll: timer reset"
                             );
                         } else {
@@ -744,17 +804,361 @@ async fn run_loop(
                                 past_idle_grace,
                                 last_inj_secs,
                                 content_changed,
-                                decision,
+                                decision = decision.decision,
                                 "idle_poll"
                             );
                         }
                     }
+
+                    // Track is_idle for the NEXT poll's intervention
+                    // gate. Agent-driven state (animation, spinner)
+                    // keeps this false → no false-positive fires;
+                    // genuine user input against an idle prompt
+                    // transitions true → false (or true → true with
+                    // content_changed) → intervention fires
+                    // correctly.
+                    prev_is_idle = is_idle;
                 }
                 Err(e) => {
                     warn!("capture_pane error: {e:#}");
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-poll decision logic (pure)
+// ---------------------------------------------------------------------------
+
+/// Per-poll input snapshot handed to [`decide_poll_actions`]. All
+/// fields are plain data — no `Instant` / I/O — so tests can drive
+/// the full matrix (idle / active / grace / cooldown / content-
+/// changed) deterministically from fixtures.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PollInputs {
+    /// `IdleDetector::is_idle_tail(&lines)` for the current poll.
+    pub is_idle: bool,
+    /// Previous poll's `is_idle`. Defaults false on the very first
+    /// poll — safe because `past_idle_grace` blocks intervention for
+    /// `INJECTION_GRACE_SECS` anyway.
+    pub was_idle_previously: bool,
+    /// True if the tail-window fingerprint changed since last poll.
+    pub content_changed: bool,
+    /// True once `INJECTION_GRACE_SECS` has elapsed since the last
+    /// task.assign injection (or if nothing was ever injected).
+    pub past_idle_grace: bool,
+    /// True once `INTERVENTION_COOLDOWN_SECS` has elapsed since the
+    /// last user.intervention fire (or if none has fired yet).
+    pub past_cooldown: bool,
+    /// Seconds of idle accumulation so far. `None` if the idle
+    /// timer hasn't started yet this run.
+    pub idle_accumulated_secs: Option<f64>,
+    /// Threshold for firing task.complete — wired from the
+    /// `IDLE_STABLE_SECS` constant in production, passed through so
+    /// unit tests can pick their own.
+    pub idle_stable_secs: f64,
+}
+
+/// Output of [`decide_poll_actions`]. Caller interprets these flags
+/// into I/O actions — send user.intervention, send task.complete,
+/// reset/keep the idle timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PollDecision {
+    pub fire_intervention: bool,
+    pub fire_complete: bool,
+    /// True → caller should `get_or_insert(now)` on the idle-timer;
+    /// false → caller should clear it to `None`.
+    pub keep_idle_timer: bool,
+    /// Human-readable label for the `decision` field in `idle_poll`
+    /// log lines. Mirrors the prior inline decisions (`reset(grace)`,
+    /// `reset(not-idle)`, `accumulate`, `fire`) plus a new
+    /// `reset(content-changed)` case introduced by the stability
+    /// guard.
+    pub decision: &'static str,
+}
+
+/// Pure per-poll rule engine. Kept free of state and time so tests
+/// can assert each branch with plain `PollInputs` records.
+///
+/// Rules, in effect:
+///   - **Intervention**: fires when the pane changed AND the runtime
+///     was idle LAST poll AND we're past both grace and cooldown.
+///     Crucially, the gate is `was_idle_previously` — NOT `!is_idle`
+///     as before. Previously, every agent-driven animation poll
+///     registered as intervention (cursor `ctrl+c to stop` etc.
+///     keep is_idle false throughout generation). Now only genuine
+///     idle→active transitions fire.
+///
+///   - **Task complete**: requires a *stable* idle — is_idle AND
+///     !content_changed. On TUIs whose idle prompt stays visible
+///     during streaming (codex 0.120: `›` input line + footer are
+///     always on screen, with streaming tokens rendered above),
+///     is_idle alone isn't enough: the wrapper was firing
+///     task.complete as soon as the token stream started. Adding
+///     the `!content_changed` guard gates completion on the pane
+///     actually having settled.
+pub(crate) fn decide_poll_actions(p: PollInputs) -> PollDecision {
+    // Pane is genuinely at rest: runtime idle AND content unchanging.
+    let stable_idle = p.is_idle && !p.content_changed;
+    // Only accumulate the completion timer after the post-injection
+    // grace window. Grace suppresses early false-fires while the
+    // agent is still processing the injected prompt.
+    let keep_idle_timer = stable_idle && p.past_idle_grace;
+
+    let fire_complete = keep_idle_timer
+        && p.idle_accumulated_secs
+            .map(|s| s >= p.idle_stable_secs)
+            .unwrap_or(false);
+
+    // Intervention: agent was idle last poll, now something changed.
+    // By requiring `was_idle_previously`, we ensure agent-driven
+    // animation never counts: animating runs have is_idle=false on
+    // prior polls, so prev_is_idle=false, so this branch stays cold.
+    let fire_intervention = p.content_changed
+        && p.was_idle_previously
+        && p.past_idle_grace
+        && p.past_cooldown;
+
+    // Ordered label — "fire" wins over "accumulate", both win over
+    // the reset variants. Matches the prior log-line taxonomy plus
+    // the new `reset(content-changed)` case.
+    let decision = if fire_complete {
+        "fire"
+    } else if keep_idle_timer {
+        "accumulate"
+    } else if !p.past_idle_grace {
+        "reset(grace)"
+    } else if !p.is_idle {
+        "reset(not-idle)"
+    } else {
+        // is_idle=true but content_changed=true — the new codex-
+        // streaming case. Pane pattern-matches idle but tokens are
+        // still arriving, so the timer resets.
+        "reset(content-changed)"
+    };
+
+    PollDecision {
+        fire_intervention,
+        fire_complete,
+        keep_idle_timer,
+        decision,
+    }
+}
+
+#[cfg(test)]
+mod poll_decision_tests {
+    //! Unit tests for [`decide_poll_actions`]. One test per rule
+    //! branch, each asserting the one output bit that branch
+    //! uniquely controls — keeps regressions pinned to the specific
+    //! rule that broke.
+
+    use super::*;
+
+    /// Baseline inputs: agent is running, post-grace, no cooldown
+    /// active, idle-timer hasn't started, IDLE_STABLE_SECS = 3.0
+    /// (prod value). Each test tweaks specific fields.
+    fn baseline() -> PollInputs {
+        PollInputs {
+            is_idle: false,
+            was_idle_previously: false,
+            content_changed: false,
+            past_idle_grace: true,
+            past_cooldown: true,
+            idle_accumulated_secs: None,
+            idle_stable_secs: IDLE_STABLE_SECS,
+        }
+    }
+
+    // ---- task.complete rules ----
+
+    #[test]
+    fn fire_complete_when_stable_idle_past_threshold() {
+        let d = decide_poll_actions(PollInputs {
+            is_idle: true,
+            content_changed: false,
+            idle_accumulated_secs: Some(IDLE_STABLE_SECS + 0.5),
+            ..baseline()
+        });
+        assert!(d.fire_complete);
+        assert!(d.keep_idle_timer);
+        assert_eq!(d.decision, "fire");
+    }
+
+    #[test]
+    fn accumulate_when_stable_idle_below_threshold() {
+        let d = decide_poll_actions(PollInputs {
+            is_idle: true,
+            content_changed: false,
+            idle_accumulated_secs: Some(IDLE_STABLE_SECS - 0.5),
+            ..baseline()
+        });
+        assert!(!d.fire_complete);
+        assert!(d.keep_idle_timer);
+        assert_eq!(d.decision, "accumulate");
+    }
+
+    #[test]
+    fn no_complete_when_content_changed_even_if_idle() {
+        // This is the codex-streaming bug. The input prompt + footer
+        // are always visible → is_idle=true — but tokens are
+        // streaming above, so content_changed=true every poll.
+        // Without the stability guard, task.complete fires as soon
+        // as IDLE_STABLE_SECS elapses mid-stream.
+        let d = decide_poll_actions(PollInputs {
+            is_idle: true,
+            content_changed: true,
+            idle_accumulated_secs: Some(IDLE_STABLE_SECS + 10.0),
+            ..baseline()
+        });
+        assert!(!d.fire_complete);
+        assert!(!d.keep_idle_timer);
+        assert_eq!(d.decision, "reset(content-changed)");
+    }
+
+    #[test]
+    fn no_complete_during_injection_grace() {
+        let d = decide_poll_actions(PollInputs {
+            is_idle: true,
+            content_changed: false,
+            past_idle_grace: false,
+            idle_accumulated_secs: Some(IDLE_STABLE_SECS + 5.0),
+            ..baseline()
+        });
+        assert!(!d.fire_complete);
+        assert!(!d.keep_idle_timer);
+        assert_eq!(d.decision, "reset(grace)");
+    }
+
+    #[test]
+    fn no_complete_when_not_idle() {
+        let d = decide_poll_actions(PollInputs {
+            is_idle: false,
+            content_changed: false,
+            idle_accumulated_secs: Some(IDLE_STABLE_SECS + 5.0),
+            ..baseline()
+        });
+        assert!(!d.fire_complete);
+        assert!(!d.keep_idle_timer);
+        assert_eq!(d.decision, "reset(not-idle)");
+    }
+
+    // ---- user.intervention rules ----
+
+    #[test]
+    fn fire_intervention_when_idle_then_pane_changes() {
+        // Canonical user intervention: agent was idle last poll
+        // (prev_is_idle = true), pane changed this poll, past both
+        // grace and cooldown. This is the case the original logic
+        // was meant to detect.
+        let d = decide_poll_actions(PollInputs {
+            was_idle_previously: true,
+            content_changed: true,
+            ..baseline()
+        });
+        assert!(d.fire_intervention);
+    }
+
+    #[test]
+    fn no_intervention_during_cursor_long_task_animation() {
+        // The original cursor-alor false-positive bug. During a
+        // long cursor task: ctrl+c-to-stop visible → is_idle=false
+        // throughout → prev_is_idle stays false across many polls.
+        // Every animation frame has content_changed=true, but with
+        // was_idle_previously=false no intervention fires.
+        let d = decide_poll_actions(PollInputs {
+            is_idle: false,
+            was_idle_previously: false,
+            content_changed: true,
+            ..baseline()
+        });
+        assert!(!d.fire_intervention);
+    }
+
+    #[test]
+    fn no_intervention_during_injection_grace() {
+        // Even if the pane changes and was idle before, grace
+        // suppresses intervention while the agent is still
+        // processing the injected prompt.
+        let d = decide_poll_actions(PollInputs {
+            was_idle_previously: true,
+            content_changed: true,
+            past_idle_grace: false,
+            ..baseline()
+        });
+        assert!(!d.fire_intervention);
+    }
+
+    #[test]
+    fn no_intervention_during_cooldown() {
+        let d = decide_poll_actions(PollInputs {
+            was_idle_previously: true,
+            content_changed: true,
+            past_cooldown: false,
+            ..baseline()
+        });
+        assert!(!d.fire_intervention);
+    }
+
+    #[test]
+    fn no_intervention_when_pane_unchanged() {
+        let d = decide_poll_actions(PollInputs {
+            was_idle_previously: true,
+            content_changed: false,
+            ..baseline()
+        });
+        assert!(!d.fire_intervention);
+    }
+
+    // ---- multi-poll sequence smoke ----
+
+    #[test]
+    fn codex_streaming_sequence_never_fires_complete() {
+        // Simulate a realistic codex streaming sequence: 15 polls,
+        // is_idle=true (prompt + footer visible), content_changed=true
+        // every poll (new tokens streaming). IDLE_STABLE_SECS=3
+        // would trigger at poll ~6 without the stability guard.
+        // With the guard, no poll should fire or keep the timer.
+        let mut accumulated: Option<f64> = None;
+        for poll_i in 0..15 {
+            let d = decide_poll_actions(PollInputs {
+                is_idle: true,
+                content_changed: true,
+                idle_accumulated_secs: accumulated,
+                ..baseline()
+            });
+            assert!(!d.fire_complete, "streaming poll {poll_i} must not fire");
+            assert!(!d.keep_idle_timer, "streaming poll {poll_i} must not keep timer");
+            // Caller would clear accumulated to None — simulate.
+            accumulated = if d.keep_idle_timer {
+                Some(accumulated.map(|s| s + 0.5).unwrap_or(0.0))
+            } else {
+                None
+            };
+        }
+    }
+
+    #[test]
+    fn cursor_long_task_never_fires_intervention_even_over_many_frames() {
+        // Simulate 60 animation frames during a long cursor task:
+        // is_idle always false (ctrl+c to stop visible),
+        // content_changed true every frame (spinner ticks). Must
+        // produce zero interventions.
+        let mut prev_is_idle = false;
+        let mut intervention_count = 0;
+        for _ in 0..60 {
+            let d = decide_poll_actions(PollInputs {
+                is_idle: false,
+                was_idle_previously: prev_is_idle,
+                content_changed: true,
+                ..baseline()
+            });
+            if d.fire_intervention {
+                intervention_count += 1;
+            }
+            prev_is_idle = false; // is_idle stayed false this poll
+        }
+        assert_eq!(intervention_count, 0);
     }
 }
 
