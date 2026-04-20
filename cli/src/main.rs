@@ -202,7 +202,32 @@ async fn send_request_inner(envelope: &Envelope) -> Result<Envelope> {
     let mut response_line = String::new();
     let n = reader.read_line(&mut response_line).await?;
     if n == 0 { anyhow::bail!("daemon closed connection"); }
-    Ok(serde_json::from_str(response_line.trim())?)
+    let resp: Envelope = serde_json::from_str(response_line.trim())?;
+    reject_error_envelope(resp)
+}
+
+/// Convert a daemon error envelope (`cli.error` / `error`) into a Rust
+/// `Err`, so command-specific success-payload deserialization sees only
+/// success envelopes and doesn't misreport structured daemon errors
+/// (e.g. "no config found for agent 'cursor-alor'") as generic serde
+/// field-missing gibberish ("missing field `spawned`"). Mirrors the
+/// Python client's handling in `orchestrator-py/daemon.py::_one_shot`
+/// so every CLI surface — Rust `alor-cli` and Python orchestrator —
+/// lifts daemon errors to typed caller-visible exceptions the same way.
+fn reject_error_envelope(env: Envelope) -> Result<Envelope> {
+    if env.kind == "cli.error" || env.kind == "error" {
+        // Try to pull `payload.error` (the documented shape — see
+        // `src-tauri/src/wrapper/protocol.rs::MSG_CLI_ERROR` docstring).
+        // Fall back to a generic message + the raw payload when the
+        // shape is unexpected, so we never mask a malformed-error with
+        // a useless parse panic.
+        let message = match serde_json::from_value::<ErrorResponsePayload>(env.payload.clone()) {
+            Ok(e) => e.error,
+            Err(_) => format!("daemon error (unparseable payload): {}", env.payload),
+        };
+        anyhow::bail!("{message}");
+    }
+    Ok(env)
 }
 
 #[tokio::main]
@@ -409,4 +434,84 @@ async fn cmd_integrations() -> Result<()> {
     let resp = send_request(&req).await?;
     println!("{}", serde_json::to_string_pretty(&resp.payload)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(kind: &str, payload: serde_json::Value) -> Envelope {
+        Envelope {
+            kind: kind.to_string(),
+            correlation_id: Uuid::nil(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn success_envelope_passes_through() {
+        let e = env("cli.response", serde_json::json!({"spawned": "cursor-alor", "pid": 12345}));
+        let got = reject_error_envelope(e).expect("success envelope should pass through");
+        assert_eq!(got.kind, "cli.response");
+        assert_eq!(got.payload["spawned"], "cursor-alor");
+    }
+
+    #[test]
+    fn cli_error_envelope_surfaces_error_string() {
+        // Regression for T8: pre-fix the CLI tried to deserialize a
+        // `cli.error` payload `{"error": "no config found for agent
+        // 'cursor-alor'"}` as `SpawnResponsePayload { spawned, pid }`
+        // and reported "missing field `spawned`" — hiding the real
+        // daemon message. Post-fix the actual error prose is surfaced.
+        let e = env(
+            "cli.error",
+            serde_json::json!({"error": "no config found for agent 'cursor-alor'"}),
+        );
+        let err = reject_error_envelope(e).expect_err("cli.error should be rejected");
+        assert_eq!(err.to_string(), "no config found for agent 'cursor-alor'");
+    }
+
+    #[test]
+    fn legacy_error_kind_also_rejected() {
+        // Back-compat: the daemon's `cli_error` emits `cli.error`, but
+        // `orchestrator-py/daemon.py` also accepts the bare `error`
+        // kind for older callers. Match that tolerance on the Rust
+        // side so both clients behave identically against any daemon
+        // rev that happens to still emit the legacy shape.
+        let e = env("error", serde_json::json!({"error": "stale-daemon legacy error"}));
+        let err = reject_error_envelope(e).expect_err("legacy error kind should be rejected");
+        assert!(err.to_string().contains("stale-daemon legacy error"));
+    }
+
+    #[test]
+    fn malformed_error_payload_still_errs_without_panic() {
+        // If the daemon ever emits a malformed `cli.error` (no `error`
+        // field, or a non-object payload), the CLI must still bail
+        // loudly — not panic on unwrap, and not silently succeed. The
+        // message falls back to showing the raw payload so a user can
+        // diagnose the drift.
+        let e = env("cli.error", serde_json::json!({"unexpected": "shape"}));
+        let err = reject_error_envelope(e).expect_err("malformed error payload should still bail");
+        let s = err.to_string();
+        assert!(s.contains("daemon error") && s.contains("unexpected"),
+            "fallback should mention it's a daemon error and dump the payload: {s}");
+    }
+
+    #[test]
+    fn coded_cli_error_surfaces_human_prose_not_code() {
+        // Coded errors (ERR_CODE_* in the daemon protocol) carry both
+        // `code` and `error`. The CLI surfaces `error` — the human
+        // prose — to match what the Python client shows users. `code`
+        // would be useful for typed exception routing but the CLI
+        // doesn't have per-error-type handling, so prose wins.
+        let e = env(
+            "cli.error",
+            serde_json::json!({
+                "code": "framed_send_not_supported",
+                "error": "wrapper runtime can't decode BEGIN/END framing",
+            }),
+        );
+        let err = reject_error_envelope(e).expect_err("coded error should still be rejected");
+        assert_eq!(err.to_string(), "wrapper runtime can't decode BEGIN/END framing");
+    }
 }
