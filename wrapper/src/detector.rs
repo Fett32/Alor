@@ -214,10 +214,25 @@ impl AgentKind {
         // markdown indentation (code blocks, lists) is meaningful.
         let trimmed = joined.trim_end();
         if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
+            return None;
         }
+        // Peel CLI banner + echoed task brief off the top. A fresh-
+        // session cursor pane (the live smoke-test shape from T5)
+        // looks like:
+        //   "Cursor Agent / v<ver> / hint: …"   ← banner
+        //   <2 blank lines>
+        //   "[TASK TITLE] / <echoed description>"  ← brief echo
+        //   <2 blank lines>
+        //   "<worker reply>"
+        // with TWO blank lines between each segment. Intra-reply
+        // paragraph breaks use ONE blank line (standard markdown),
+        // so splitting on "\n\n\n" (three-or-more consecutive
+        // newlines == turn boundary) cleanly isolates the worker's
+        // reply from the banner + echoed brief sitting above it.
+        // Multi-turn panes with several prior request/reply pairs
+        // visible also collapse to the most recent reply via the
+        // same rule — rsplit_once anchors on the LAST boundary.
+        Some(strip_to_last_turn(trimmed).to_string())
     }
 
     /// Prompts to auto-acknowledge on startup, in the order the runtime
@@ -288,6 +303,34 @@ impl AgentKind {
 // Placed alongside the per-runtime TUI knowledge so everything the
 // wrapper knows about a given CLI's pane shape lives in one file.
 // ---------------------------------------------------------------------------
+
+/// Peel CLI banner + any prior-turn echoes off the top of a captured
+/// reply body. Called from `extract_reply` after blank-line trimming.
+///
+/// Heuristic: TUIs separate turns (banner, echoed task brief, worker
+/// reply, subsequent turns) with TWO blank lines, which renders as
+/// three consecutive newlines in the joined body. Intra-reply
+/// paragraph breaks use ONE blank line (two newlines). So a split on
+/// `\n\n\n` identifies turn boundaries without false-splitting
+/// multi-paragraph replies. Keeping the last chunk isolates the most
+/// recent worker reply.
+///
+/// If no triple-newline exists (single-turn, no banner — the shape
+/// already exercised by pre-polish tests), returns the body unchanged.
+/// This keeps the helper safe to apply universally across cursor /
+/// codex / gemini rather than gating per-runtime — the hot cases for
+/// codex and gemini don't have triple newlines and fall through.
+fn strip_to_last_turn(body: &str) -> &str {
+    match body.rsplit_once("\n\n\n") {
+        // Strip any remaining leading newlines from the tail — a
+        // separator of 4+ newlines leaves one behind after `rsplit_once`.
+        // Preserve other leading whitespace (indentation is meaningful
+        // inside markdown code blocks / lists; see `extract_reply`'s
+        // "we keep leading whitespace" contract).
+        Some((_prior, tail)) => tail.trim_start_matches('\n').trim_end(),
+        None => body,
+    }
+}
 
 /// Terse-summary byte target. Matches `orchestrator-py/worker.py`'s
 /// `TERSE_TARGET = 400` so wrapper-runtime completions and claude-sdk
@@ -1091,6 +1134,156 @@ mod tests {
             "leading indentation preserved: {body:?}");
         assert!(body.ends_with("    code block line 2"),
             "trailing blank stripped, last indented line kept: {body:?}");
+    }
+
+    // ---- strip_to_last_turn ----
+
+    #[test]
+    fn strip_to_last_turn_splits_on_triple_newline() {
+        // Turn boundary: two blank lines between segments ⇒ three
+        // consecutive newlines in the joined body. `rsplit_once`
+        // anchors on the LAST boundary, so multi-segment bodies
+        // collapse to the most recent segment.
+        let body = "banner\n\n\nbrief echo\n\n\nworker reply";
+        assert_eq!(strip_to_last_turn(body), "worker reply");
+    }
+
+    #[test]
+    fn strip_to_last_turn_preserves_intra_reply_paragraph_break() {
+        // Intra-reply paragraph break: one blank line = two newlines.
+        // Must NOT trigger the split — otherwise legitimate multi-
+        // paragraph replies would be truncated to their last paragraph.
+        let body = "Reply paragraph 1.\n\nReply paragraph 2 with details.";
+        assert_eq!(strip_to_last_turn(body), body,
+            "single blank line between paragraphs is not a turn boundary");
+    }
+
+    #[test]
+    fn strip_to_last_turn_no_boundary_returns_unchanged() {
+        // No triple newline anywhere — pre-polish shape (codex /
+        // gemini post-boot fixtures, short single-turn cursor reply).
+        // Must pass through verbatim.
+        assert_eq!(strip_to_last_turn("just a single line"), "just a single line");
+        assert_eq!(strip_to_last_turn("line1\nline2"), "line1\nline2");
+        assert_eq!(strip_to_last_turn(""), "");
+    }
+
+    #[test]
+    fn strip_to_last_turn_handles_extra_separator_newlines() {
+        // A separator of 4+ newlines leaves one behind in the tail
+        // after `rsplit_once` on the 3-newline needle. The helper's
+        // `trim_start_matches('\n')` mops that up so the returned
+        // body has no leading blank line.
+        let body = "banner\n\n\n\nreply";
+        assert_eq!(strip_to_last_turn(body), "reply");
+        let body5 = "banner\n\n\n\n\nreply";
+        assert_eq!(strip_to_last_turn(body5), "reply");
+    }
+
+    #[test]
+    fn strip_to_last_turn_preserves_markdown_indent() {
+        // Markdown code-block / list indentation inside the last turn
+        // survives. Only the leading BLANK / newline slice is trimmed,
+        // not leading spaces on the first content line.
+        let body = "banner\n\n\n    code_block_line\n    second_line";
+        assert_eq!(
+            strip_to_last_turn(body),
+            "    code_block_line\n    second_line"
+        );
+    }
+
+    #[test]
+    fn extract_cursor_fresh_session_strips_banner_and_brief_echo() {
+        // Verbatim shape of the T5 smoke-test capture that motivated
+        // T7. Pre-polish extract_reply returned the whole banner +
+        // echoed task brief + reply concatenation (390 B body, summary
+        // paragraph = just the banner). Post-polish only the worker's
+        // reply survives.
+        let lines = lines(&[
+            "  Cursor Agent",
+            "  v2026.04.17-479fd04",
+            "  hint: /auto-run to skip all approvals",
+            "",
+            "",
+            "  [VALIDATE] T7 smoke test",
+            "  Just print 'T7 smoke ok' and stop.",
+            "",
+            "",
+            "  T7 smoke ok",
+            "",
+            "",
+            "  → Add a follow-up",
+            "",
+            "",
+            "  Composer 2 Fast",
+            "  /home/fett/Projects/Alor",
+        ]);
+        let body = AgentKind::Cursor.extract_reply(&lines)
+            .expect("reply extractable");
+        // Only the worker reply survives. 2-space cursor-TUI indent
+        // is preserved (it's the pane's left margin; stripping it
+        // risks losing legitimate markdown indentation in other
+        // replies — pre-existing contract).
+        assert_eq!(body, "  T7 smoke ok",
+            "banner + brief echo stripped, reply survives: {body:?}");
+    }
+
+    #[test]
+    fn extract_cursor_multi_task_history_keeps_only_last_reply() {
+        // Multi-task pane: T5 reply + T8 brief + T8 reply all visible
+        // above the current `→` input. Worker's MOST RECENT reply is
+        // what the orchestrator wants — prior completions already
+        // have their own task records. `rsplit_once` at the LAST
+        // triple-newline gives that.
+        let lines = lines(&[
+            "  Cursor Agent",
+            "  v2026.04.17-479fd04",
+            "",
+            "",
+            "  [T5] smoke",
+            "  Print 'T5 ok'.",
+            "",
+            "",
+            "  T5 ok",
+            "",
+            "",
+            "  [T8] later smoke",
+            "  Print 'T8 ok'.",
+            "",
+            "",
+            "  T8 ok",
+            "",
+            "",
+            "  → Add a follow-up",
+        ]);
+        let body = AgentKind::Cursor.extract_reply(&lines).expect("has reply");
+        assert_eq!(body, "  T8 ok",
+            "rsplit_once isolates the last turn even with 3+ prior turns in scrollback: {body:?}");
+    }
+
+    #[test]
+    fn extract_multi_paragraph_reply_survives_intact() {
+        // Regression guard: the T7 polish must NOT truncate a reply
+        // whose own paragraphs are separated by a single blank line.
+        // This fixture has a 3-paragraph reply above the cursor cutoff;
+        // all three paragraphs must survive extraction.
+        let lines = lines(&[
+            "First paragraph of the reply.",
+            "",
+            "Second paragraph with more detail.",
+            "",
+            "Third paragraph concluding.",
+            "",
+            "",
+            "  → Add a follow-up",
+        ]);
+        let body = AgentKind::Cursor.extract_reply(&lines).expect("has reply");
+        assert!(body.contains("First paragraph"),
+            "multi-paragraph reply: para 1 survives: {body:?}");
+        assert!(body.contains("Second paragraph"),
+            "multi-paragraph reply: para 2 survives: {body:?}");
+        assert!(body.contains("Third paragraph"),
+            "multi-paragraph reply: para 3 survives: {body:?}");
     }
 
     // ---- split_summary_details ----
