@@ -403,8 +403,24 @@ async fn run_main() -> Result<()> {
             for i in 0..30 {
                 if let Ok(lines) = tmux::capture_pane(&session, 20) {
                     let text = lines.join("\n");
-                    // Look for common prompts: " > ", "❯", "$ ", or "% "
-                    if text.contains(" > ") || text.contains("❯") || text.contains("$ ") || text.contains("% ") {
+                    // Look for common prompts across the supported CLIs:
+                    //   - shell-style (gemini's " > Type your message",
+                    //     claude's "❯", default "$ ", zsh "% ")
+                    //   - TUI input markers (cursor's "→", codex 0.120's
+                    //     "›" U+203A). Pre-T11 these Unicode markers
+                    //     weren't in the match list — the wrapper would
+                    //     burn the full 15 s budget and `warn!("timed
+                    //     out waiting for prompt, skipping briefing")`,
+                    //     so startup_file-driven preambles for cursor /
+                    //     codex silently never landed. T9 diagnosis
+                    //     flagged the miss; T11 closes it here.
+                    if text.contains(" > ")
+                        || text.contains("❯")
+                        || text.contains("$ ")
+                        || text.contains("% ")
+                        || text.contains("→")
+                        || text.contains("›")
+                    {
                         info!("detected prompt after {}ms, sending briefing", i * 500);
                         ready = true;
                         break;
