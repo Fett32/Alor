@@ -50,11 +50,28 @@ struct CliTaskComplete {
     summary: Option<String>,
 }
 #[derive(Serialize)]
-struct CliSpawn { 
-    agent: String, 
+struct CliSpawn {
+    agent: String,
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String> 
+    name: Option<String>,
+    /// Runtime project override for template spawns. Daemon's
+    /// `CliSpawn.project` (`src-tauri/src/wrapper/protocol.rs`) maps
+    /// directly; when set alongside a template `agent`, handle_spawn
+    /// derives the instance id `<agent>-<project>` (e.g. cursor +
+    /// alor → cursor-alor). Without this (or `working_dir`), template
+    /// spawns fail with "template needs override" because bare
+    /// templates can't be instantiated. Unset here when spawning a
+    /// fixed yaml slot or a non-template agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    /// Runtime working-dir override. Same parameterization role as
+    /// `project`; either is sufficient to satisfy the daemon's
+    /// template guard. Prefer passing both when available so the
+    /// spawned instance lands in the right workdir AND gets the
+    /// project label for auto-distill routing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_dir: Option<String>,
 }
 #[derive(Serialize)]
 struct CliKill { instance: String }
@@ -139,6 +156,21 @@ enum Commands {
         role: String,
         #[arg(long)]
         name: Option<String>,
+        /// Project label for template spawns. Derives instance id
+        /// `<agent>-<project>` and seeds the spawned instance's
+        /// `project` field so auto-distill routes its task.complete
+        /// summaries into the right hub. Required (or `--working-dir`)
+        /// when `agent` is a template yaml like `claude` / `cursor` /
+        /// `codex` / `gemini`; ignored for fixed yaml slots.
+        #[arg(long)]
+        project: Option<String>,
+        /// Working directory for the spawned instance. Alternative (or
+        /// complement) to `--project` for satisfying the daemon's
+        /// template-override requirement. Pass both when available so
+        /// the agent lands in the right workdir AND the project label
+        /// flows through to auto-distill / memory hub routing.
+        #[arg(long = "working-dir")]
+        working_dir: Option<String>,
     },
     Event { #[command(subcommand)] action: EventAction },
     Kill { instance: String },
@@ -254,7 +286,9 @@ async fn main() {
         Commands::Event { action } => match action {
             EventAction::Stream => cmd_event_stream().await,
         },
-        Commands::Spawn { agent, role, name } => cmd_spawn(agent, role, name).await,
+        Commands::Spawn { agent, role, name, project, working_dir } => {
+            cmd_spawn(agent, role, name, project, working_dir).await
+        }
         Commands::Kill { instance } => cmd_kill(instance).await,
         Commands::Integrations => cmd_integrations().await,
     };
@@ -414,8 +448,17 @@ async fn cmd_event_stream() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_spawn(agent: String, role: String, name: Option<String>) -> Result<()> {
-    let req = Envelope::new("cli.spawn", CliSpawn { agent, role, name })?;
+async fn cmd_spawn(
+    agent: String,
+    role: String,
+    name: Option<String>,
+    project: Option<String>,
+    working_dir: Option<String>,
+) -> Result<()> {
+    let req = Envelope::new(
+        "cli.spawn",
+        CliSpawn { agent, role, name, project, working_dir },
+    )?;
     let resp = send_request(&req).await?;
     let info: SpawnResponsePayload = serde_json::from_value(resp.payload)?;
     println!("Spawned instance: {} (pid {})", info.spawned, info.pid);
