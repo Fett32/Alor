@@ -1,6 +1,7 @@
 mod client;
 mod detector;
 mod protocol;
+mod staleness;
 mod tmux;
 
 use anyhow::{bail, Context, Result};
@@ -274,6 +275,51 @@ async fn main() -> Result<()> {
         .with_default_directive("alor_wrapper=info".parse().unwrap())
         .from_env_lossy();
     tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    // T6 staleness guard. Warn (never fail) if any wrapper/src/*.rs is
+    // newer than the build timestamp stamped by build.rs. Catches the
+    // "cargo test without cargo build" (or the inverse) class of bug
+    // that motivated T4's diagnosis (a5060a1f-6e53-46d8-81aa-7bc47ad0ee5d)
+    // — T2's pane-capture ship compiled + tested green but ran from a
+    // stale binary, looking like a framing bug for a full diagnosis
+    // round. See staleness.rs for the C.1 design rationale (warn-only,
+    // source-mtime vs. build-ts, single-box assumption). Runs after
+    // logging init so the warn actually surfaces.
+    {
+        let build_ts: u64 = env!("WRAPPER_BUILD_TIMESTAMP_SECS")
+            .parse()
+            .unwrap_or(0);
+        let source_dir = env!("WRAPPER_SOURCE_DIR");
+        if build_ts > 0 && !source_dir.is_empty() {
+            match staleness::check_staleness(build_ts, std::path::Path::new(source_dir)) {
+                staleness::StalenessReport::Fresh => {}
+                staleness::StalenessReport::SourceDirUnavailable(_) => {
+                    debug!(
+                        source_dir,
+                        "wrapper staleness check skipped: source dir not present \
+                         (distributed install or relocated binary)"
+                    );
+                }
+                staleness::StalenessReport::Stale {
+                    newest_file,
+                    newest_mtime_secs,
+                    build_ts_secs,
+                    drift_secs,
+                } => {
+                    warn!(
+                        newest_file = %newest_file.display(),
+                        newest_mtime_secs,
+                        build_ts_secs,
+                        drift_secs,
+                        "alor-wrapper binary appears stale: source edited {drift_secs}s \
+                         after the last build. Rebuild with `cargo build -p alor-wrapper` \
+                         (and `--release` for the production binary) before relying on \
+                         recent changes. See T6."
+                    );
+                }
+            }
+        }
+    }
 
     if let Err(e) = run_main().await {
         error!("alor-wrapper fatal error: {e:#}");
