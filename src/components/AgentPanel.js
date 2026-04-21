@@ -12,6 +12,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { toastIpcError } from "../toast.js";
 
 // ---------------------------------------------------------------------------
 // Data model (mirrors Rust Agent struct via serde JSON)
@@ -90,7 +91,7 @@ export function initAgentPanel() {
         $form.classList.add("hidden");
       } catch (err) {
         console.error("[AgentPanel] spawn_agent failed:", err);
-        alert(`Failed to spawn agent: ${err}`);
+        toastIpcError("Failed to spawn agent", err);
       }
     });
 
@@ -273,7 +274,7 @@ async function handleRegister() {
     $form.classList.add("hidden");
   } catch (err) {
     console.error("[AgentPanel] register_agent failed:", err);
-    alert(`Failed to register agent: ${err}`);
+    toastIpcError("Failed to register agent", err);
   }
 }
 
@@ -355,8 +356,8 @@ function buildAgentItem(agent) {
       btnStart.textContent = "Starting...";
       console.log("[AgentPanel] starting orchestrator brain...");
       invoke("spawn_agent", { agent: "orchestrator", role: "orchestrator" })
-        .catch(err => {
-          alert(`Failed to start orchestrator: ${err}`);
+        .catch((err) => {
+          toastIpcError("Failed to start orchestrator", err);
           btnStart.disabled = false;
           btnStart.textContent = "Start Brain";
         });
@@ -373,8 +374,9 @@ function buildAgentItem(agent) {
     btnKill.addEventListener("click", (e) => {
       e.stopPropagation();
       if (confirm(`Kill ${agent.id} session?`)) {
-        invoke("kill_agent", { id: agent.id })
-          .catch(err => alert(`Failed to kill agent: ${err}`));
+        invoke("kill_agent", { id: agent.id }).catch((err) =>
+          toastIpcError("Failed to kill agent", err),
+        );
       }
     });
     item.appendChild(btnKill);
@@ -392,8 +394,9 @@ function buildAgentItem(agent) {
     btnDelete.addEventListener("click", (e) => {
       e.stopPropagation();
       if (confirm(`Permanently delete ${agent.id}? This cannot be undone.`)) {
-        invoke("delete_agent", { id: agent.id })
-          .catch(err => alert(`Failed to delete agent: ${err}`));
+        invoke("delete_agent", { id: agent.id }).catch((err) =>
+          toastIpcError("Failed to delete agent", err),
+        );
       }
     });
     item.appendChild(btnDelete);

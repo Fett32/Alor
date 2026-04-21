@@ -13,6 +13,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { toastIpcError } from "../toast.js";
 
 // ---------------------------------------------------------------------------
 // State
@@ -226,7 +227,7 @@ async function handleSubmit() {
     closeModal();
   } catch (err) {
     console.error("[TaskList] assign_task failed:", err);
-    alert(`Failed to create task: ${err}`);
+    toastIpcError("Failed to create task", err);
   }
 }
 
@@ -252,7 +253,7 @@ async function cancelTask(id) {
     renderTasks();
   } catch (err) {
     console.error("[TaskList] cancel_task failed:", err);
-    alert(`Failed to cancel task: ${err}`);
+    toastIpcError("Failed to cancel task", err);
   }
 }
 
@@ -279,7 +280,7 @@ async function approveTask(id) {
     closeProposalModal();
   } catch (err) {
     console.error("[TaskList] approve_task failed:", err);
-    alert(`Failed to approve task: ${err}`);
+    toastIpcError("Failed to approve task", err);
   }
 }
 

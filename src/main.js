@@ -12,6 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { initAgentPanel } from "./components/AgentPanel.js";
 import { initTaskList }   from "./components/TaskList.js";
 import { initTerminal }   from "./components/Terminal.js";
+import { toastIpcError } from "./toast.js";
 
 // ---------------------------------------------------------------------------
 // Session header
@@ -71,6 +72,7 @@ async function wireSpawnWorkspace() {
       });
     } catch (err) {
       console.error("[settings] save failed:", err);
+      toastIpcError("Failed to save spawn workspace setting", err);
     }
   };
 
@@ -101,7 +103,7 @@ async function init() {
           console.log("[main] kill_all_agents successful");
         } catch (err) {
           console.error("[main] kill_all_agents failed:", err);
-          alert(`Failed to kill sessions: ${err}`);
+          toastIpcError("Failed to kill sessions", err);
         }
       }
     });
@@ -116,7 +118,7 @@ async function init() {
         console.log("[main] pane_rebalance successful");
       } catch (err) {
         console.error("[main] pane_rebalance failed:", err);
-        alert(`Failed to rebalance: ${err}`);
+        toastIpcError("Failed to rebalance panes", err);
       }
     });
   }
