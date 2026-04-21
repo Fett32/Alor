@@ -145,9 +145,22 @@ export function initTaskList() {
       });
     }
 
-    // Keyboard: Escape closes modal.
+    const $proposalOverlay = document.getElementById("proposal-overlay");
+    if ($proposalOverlay) {
+      $proposalOverlay.addEventListener("click", (e) => {
+        if (e.target === $proposalOverlay) closeProposalModal();
+      });
+    }
+
+    // Keyboard: Escape closes proposal review first, then new-task modal.
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && $overlay?.classList.contains("open")) closeModal();
+      if (e.key !== "Escape") return;
+      const $po = document.getElementById("proposal-overlay");
+      if ($po?.classList.contains("open")) {
+        closeProposalModal();
+        return;
+      }
+      if ($overlay?.classList.contains("open")) closeModal();
     });
 
     if ($search) {
@@ -272,6 +285,10 @@ function labelForState(state) {
 }
 
 async function approveTask(id) {
+  const approveBtn = document.querySelector(
+    "#proposal-modal .btn-proposal-approve",
+  );
+  if (approveBtn) approveBtn.disabled = true;
   try {
     const updated = await invoke("approve_task", { id });
     const idx = tasks.findIndex((t) => t.id === id);
@@ -281,6 +298,38 @@ async function approveTask(id) {
   } catch (err) {
     console.error("[TaskList] approve_task failed:", err);
     toastIpcError("Failed to approve task", err);
+  } finally {
+    if (approveBtn) approveBtn.disabled = false;
+  }
+}
+
+/**
+ * Operator rejects the proposal — transitions task to Cancelled (valid
+ * from PROPOSED / STAGED in the state machine).
+ */
+async function declineProposal(id) {
+  if (
+    !confirm(
+      "Decline this proposal? The task will be cancelled and the agent will not apply the diff.",
+    )
+  ) {
+    return;
+  }
+  const declineBtn = document.querySelector(
+    "#proposal-modal .btn-decline-proposal",
+  );
+  if (declineBtn) declineBtn.disabled = true;
+  try {
+    const updated = await invoke("cancel_task", { id });
+    const idx = tasks.findIndex((t) => t.id === id);
+    if (idx >= 0) tasks[idx] = updated;
+    renderTasks();
+    closeProposalModal();
+  } catch (err) {
+    console.error("[TaskList] decline proposal (cancel_task) failed:", err);
+    toastIpcError("Failed to decline proposal", err);
+  } finally {
+    if (declineBtn) declineBtn.disabled = false;
   }
 }
 
@@ -317,25 +366,32 @@ function closeModal() {
 
 function showProposal(task) {
   const $title = document.getElementById("proposal-title");
+  const $meta = document.getElementById("proposal-meta");
   const $brief = document.getElementById("proposal-brief");
-  const $diff  = document.getElementById("proposal-diff");
-  const $btnApprove = document.getElementById("btn-approve-task");
+  const $diff = document.getElementById("proposal-diff");
   const $modal = document.getElementById("proposal-overlay");
 
   if ($title) $title.textContent = task.title;
-  if ($brief) $brief.textContent = task.proposal_brief || "(No logic brief provided)";
-  if ($diff)  $diff.textContent  = task.proposal_diff  || "(No diff provided)";
-
-  if ($btnApprove) {
-    // Remove old listeners
-    const newBtn = $btnApprove.cloneNode(true);
-    $btnApprove.parentNode.replaceChild(newBtn, $btnApprove);
-    newBtn.addEventListener("click", () => approveTask(task.id));
+  if ($meta) {
+    const agent = task.assigned_to || "unassigned";
+    $meta.textContent = `${task.id} · ${agent}`;
   }
+  if ($brief) $brief.textContent = task.proposal_brief || "(No logic brief provided)";
+  if ($diff) $diff.textContent = task.proposal_diff || "(No diff provided)";
 
-  const $btnClose = document.getElementById("btn-close-proposal");
-  if ($btnClose) {
-    $btnClose.addEventListener("click", closeProposalModal);
+  const $actions = document.querySelector("#proposal-modal .proposal-modal-actions");
+  if ($actions) {
+    const fresh = $actions.cloneNode(true);
+    $actions.replaceWith(fresh);
+    fresh
+      .querySelector(".btn-proposal-dismiss")
+      ?.addEventListener("click", closeProposalModal);
+    fresh
+      .querySelector(".btn-decline-proposal")
+      ?.addEventListener("click", () => declineProposal(task.id));
+    fresh
+      .querySelector(".btn-proposal-approve")
+      ?.addEventListener("click", () => approveTask(task.id));
   }
 
   $modal.classList.add("open");
@@ -365,7 +421,7 @@ function renderTasks() {
       (t) =>
         t.title.toLowerCase().includes(filterSearch) ||
         t.description.toLowerCase().includes(filterSearch) ||
-        t.id.toLowerCase().includes(filterSearch)
+        t.id.toLowerCase().includes(filterSearch),
     );
   }
 
@@ -469,12 +525,13 @@ function buildTaskCard(task) {
   metaEl.append(badge, agentSpan, timeSpan);
 
   // Actions:
-  //   - Review: only for PROPOSED.
+  //   - Review: PROPOSED and STAGED (proposal review / approval queue).
   //   - Cancel: every state except CANCELLED. Terminal non-Cancelled
   //     states (Stale/Completed/Rejected/TimedOut) get it too so the
   //     user can tidy them up; cancelTask() surfaces a confirm prompt
   //     before firing the RPC on those.
-  const hasReview = task.state === "PROPOSED";
+  const hasReview =
+    task.state === "PROPOSED" || task.state === "STAGED";
   const hasCancel = task.state !== "CANCELLED";
 
   if (hasReview || hasCancel) {

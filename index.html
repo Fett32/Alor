@@ -117,10 +117,11 @@
     </div>
 
     <!-- ── Proposal Review modal ────────────────────────────────────── -->
-    <div id="proposal-overlay" class="modal-overlay" role="dialog" aria-modal="true">
+    <div id="proposal-overlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="proposal-title">
       <div id="proposal-modal">
         <h2 id="proposal-title">Review Proposal</h2>
-        
+        <p id="proposal-meta" class="proposal-meta" aria-live="polite"></p>
+
         <div class="proposal-section">
           <h3>Logic Brief</h3>
           <div id="proposal-brief" class="code-font"></div>
@@ -131,9 +132,10 @@
           <pre id="proposal-diff" class="code-font"></pre>
         </div>
 
-        <div class="modal-actions">
-          <button type="button" class="btn-cancel-modal" id="btn-close-proposal">Close</button>
-          <button type="button" class="btn-submit"       id="btn-approve-task">Approve & Apply</button>
+        <div class="modal-actions proposal-modal-actions">
+          <button type="button" class="btn-cancel-modal btn-proposal-dismiss">Close</button>
+          <button type="button" class="btn-decline-proposal">Decline</button>
+          <button type="button" class="btn-submit btn-proposal-approve">Approve &amp; Apply</button>
         </div>
       </div>
     </div>
