@@ -295,7 +295,20 @@ impl AgentKind {
         // Multi-turn panes with several prior request/reply pairs
         // visible also collapse to the most recent reply via the
         // same rule — rsplit_once anchors on the LAST boundary.
-        Some(strip_to_last_turn(trimmed).to_string())
+        let stripped = strip_to_last_turn(trimmed);
+        // T15: cursor-agent's default reply shape trails its
+        // `Verdict:` line AFTER opening narration + tool-use dumps.
+        // `split_summary_details` would otherwise pick the narration
+        // as summary (see task 1da1a584 symptom). Promote the
+        // verdict to the top so summary selection lands correctly.
+        // Cursor-only — other runtimes either already verdict-first
+        // (claude/gemini preambles) or emit no Verdict: marker
+        // (codex). See `promote_cursor_verdict` for the contract.
+        let body = match self {
+            AgentKind::Cursor => promote_cursor_verdict(stripped),
+            _ => stripped.to_string(),
+        };
+        Some(body)
     }
 
     /// Prompts to auto-acknowledge on startup, in the order the runtime
@@ -403,6 +416,128 @@ pub fn pick_pending_trust_ack<'a>(
 // Placed alongside the per-runtime TUI knowledge so everything the
 // wrapper knows about a given CLI's pane shape lives in one file.
 // ---------------------------------------------------------------------------
+
+/// Promote a trailing `Verdict:` paragraph to the top of a cursor
+/// reply body, so `split_summary_details` picks the verdict as the
+/// summary instead of cursor-agent's default opening reasoning.
+///
+/// ## Motivation (T15)
+///
+/// Observed on task `1da1a584-0586-4745-864f-f7386ddafcbe` (the
+/// frontend alert→toast ship): summary was `"Searching the frontend
+/// for alert() usage and inspecting how IPC errors are surfaced so
+/// we can add\n   a toast system."` — cursor-agent's opening
+/// narration of intent — while the actual verdict
+/// (`"Verdict: Implemented a stacked toast system in src/toast.js
+/// + CSS..."`) sat at byte 31119 of `details`.
+///
+/// Cursor-agent's natural reply shape opens with a one-liner
+/// narrating what it's about to do, then embeds tool-use summaries
+/// and file diffs, then closes with a `Verdict:` paragraph. Because
+/// cursor uses `\n\n` (single blank line) between sections rather
+/// than `\n\n\n` (double blank), `strip_to_last_turn` is a no-op and
+/// `split_summary_details` picks the first paragraph as summary —
+/// which is the opening narration, not the verdict.
+///
+/// Other runtimes don't need this:
+///   - claude / gemini workers follow a verdict-first preamble (per
+///     `~/.config/alor/*_worker_preamble.md`), so their first
+///     paragraph is already the verdict.
+///   - codex-cli doesn't emit a `Verdict:` marker at all.
+/// Hence cursor-only, dispatched from `extract_reply`'s match arm.
+///
+/// ## Semantics
+///
+/// 1. Find the LAST line matching `^\s*Verdict:` (multiline). Cursor
+///    replies can reference the word "verdict" in earlier prose
+///    ("…and write a verdict at the end"), so the trailing match is
+///    the real marker. `^\s*` tolerates cursor's 2-space continuation
+///    indent.
+/// 2. If the match is already part of the body's leading whitespace /
+///    first paragraph, no-op — don't duplicate content.
+/// 3. Extract the verdict paragraph (up to the next `\n\n` or EOF).
+/// 4. Cut the paragraph out (plus surrounding blank-line whitespace)
+///    and prepend it, separated from the reasoning body by `\n\n`.
+/// 5. If the body was just a verdict with no other content, return
+///    the verdict alone.
+///
+/// Pure function, unit-tested against the verbatim 1da1a584 shape.
+fn promote_cursor_verdict(body: &str) -> String {
+    // Reuse a module-level compiled regex would be cleaner; for one
+    // runtime and one call per task.complete the one-off compile is
+    // not a hot path and keeps the function self-contained.
+    //
+    // `[ \t]*` rather than `\s*`: in `(?m)` multiline mode, `^` can
+    // match the position right after a newline, and `\s*` would then
+    // greedily consume THAT newline (since `\s` includes `\n`),
+    // dragging the match start one byte behind the actual line. That
+    // would leave a stray leading `\n` in the promoted verdict. The
+    // tab/space class fixes the match start to the real line start
+    // (or the first indent byte on indented replies).
+    let re = match Regex::new(r"(?m)^[ \t]*Verdict:") {
+        Ok(r) => r,
+        Err(_) => return body.to_string(),
+    };
+    let last = match re.find_iter(body).last() {
+        Some(m) => m,
+        None => return body.to_string(),
+    };
+    let verdict_start = last.start();
+
+    // Already in the leading whitespace / first line? → no-op.
+    // Find the first non-whitespace byte; if the verdict match
+    // starts at or before it, the verdict is already at the top
+    // (possibly with a leading indent) and we must NOT duplicate.
+    let first_nonws = body
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(body.len());
+    if verdict_start <= first_nonws {
+        return body.to_string();
+    }
+
+    // Verdict paragraph ends at the next `\n\n` after the match, or
+    // at EOF. Bytes are safe here — we're scanning for ASCII `\n`.
+    let rel_end = body[verdict_start..]
+        .find("\n\n")
+        .unwrap_or(body.len() - verdict_start);
+    let verdict_end = verdict_start + rel_end;
+    let verdict_para = body[verdict_start..verdict_end].trim_end().to_string();
+
+    // Cut the verdict paragraph from its original position, including
+    // the surrounding blank-line gap so the rejoin doesn't leave a
+    // double blank line behind.
+    let mut cut_start = verdict_start;
+    while cut_start > 0
+        && matches!(body.as_bytes()[cut_start - 1], b' ' | b'\t' | b'\n' | b'\r')
+    {
+        cut_start -= 1;
+    }
+    let mut cut_end = verdict_end;
+    while cut_end < body.len()
+        && matches!(body.as_bytes()[cut_end], b' ' | b'\t' | b'\n' | b'\r')
+    {
+        cut_end += 1;
+    }
+    let before = body[..cut_start].trim_end();
+    let after = body[cut_end..].trim_start();
+
+    // Rebuild the reasoning body from the two slices around the
+    // excised verdict. Rejoin with a single blank line when both
+    // halves carry content; otherwise whichever half is non-empty.
+    let rest = if before.is_empty() {
+        after.to_string()
+    } else if after.is_empty() {
+        before.to_string()
+    } else {
+        format!("{before}\n\n{after}")
+    };
+
+    if rest.is_empty() {
+        verdict_para
+    } else {
+        format!("{verdict_para}\n\n{rest}")
+    }
+}
 
 /// Peel CLI banner + any prior-turn echoes off the top of a captured
 /// reply body. Called from `extract_reply` after blank-line trimming.
@@ -1546,6 +1681,217 @@ mod tests {
             "multi-paragraph reply: para 2 survives: {body:?}");
         assert!(body.contains("Third paragraph"),
             "multi-paragraph reply: para 3 survives: {body:?}");
+    }
+
+    // ---- T15 promote_cursor_verdict ----
+
+    #[test]
+    fn promote_cursor_verdict_moves_trailing_verdict_to_top() {
+        // Minimal case: two-paragraph reasoning + trailing verdict.
+        // Post-T15 the verdict must lead and reasoning must follow.
+        let body = "Searching the frontend for alert() usage.\n\nFound 5 call sites.\n\nVerdict: Replaced all alert() calls with toast.";
+        let out = promote_cursor_verdict(body);
+        assert!(
+            out.starts_with("Verdict: Replaced all alert() calls with toast."),
+            "verdict leads: {out:?}"
+        );
+        assert!(out.contains("Searching the frontend"),
+            "reasoning preserved below verdict: {out:?}");
+        assert!(out.contains("Found 5 call sites"),
+            "middle reasoning preserved: {out:?}");
+    }
+
+    #[test]
+    fn promote_cursor_verdict_noop_when_verdict_already_leads() {
+        // Claude/gemini-style reply with verdict already first. Must
+        // NOT duplicate the verdict — the head-of-body short-circuit
+        // returns the input unchanged.
+        let body = "Verdict: Did the thing.\n\nImplementation details below.";
+        assert_eq!(promote_cursor_verdict(body), body);
+    }
+
+    #[test]
+    fn promote_cursor_verdict_noop_when_verdict_leads_with_indent() {
+        // Cursor's 2-space pane indent means the verdict line may be
+        // `"  Verdict: …"` at the top. The leading-whitespace short-
+        // circuit must catch this as "already at top" — no duplicate.
+        let body = "  Verdict: Shipped.\n\n  Reasoning body.";
+        assert_eq!(promote_cursor_verdict(body), body);
+    }
+
+    #[test]
+    fn promote_cursor_verdict_noop_when_no_verdict_marker() {
+        // cursor-agent can emit replies without a `Verdict:` block
+        // (short tool-use-only tasks). Must be a true pass-through —
+        // the fix adds the anchor, never rearranges non-verdict
+        // bodies.
+        let body = "Searched for foo.\n\nFound 3 matches in bar.rs.\n\nNo code changes made.";
+        assert_eq!(promote_cursor_verdict(body), body);
+    }
+
+    #[test]
+    fn promote_cursor_verdict_handles_multi_line_verdict_paragraph() {
+        // Verdict paragraph with cursor's 2-space continuation indent
+        // (soft-wrapped across multiple pane lines). The whole
+        // paragraph up to the next blank line must move as a unit;
+        // post-verdict content (Files:, Notes:) stays in the body.
+        let body = "Opening narration.\n\n  Grepped + read files.\n\n  Verdict: Shipped the toast system in src/toast.js + CSS,\n  removed alert() from main.js / TaskList.js / AgentPanel.js,\n  kept prompt/confirm for destructive flows.\n\n  Files: src/toast.js (new), src/style.css, src/main.js.\n\n  Notes: auto-dismiss 8s.";
+        let out = promote_cursor_verdict(body);
+        assert!(
+            out.starts_with("  Verdict: Shipped the toast system"),
+            "verdict leads with its original indent: {out:?}"
+        );
+        assert!(
+            out.contains("kept prompt/confirm for destructive flows."),
+            "wrapped verdict continuation lines travel with the verdict: {out:?}"
+        );
+        assert!(out.contains("Files: src/toast.js"),
+            "post-verdict sections preserved in body: {out:?}");
+        assert!(out.contains("Notes: auto-dismiss"),
+            "notes section preserved: {out:?}");
+        assert!(out.contains("Opening narration"),
+            "opening reasoning preserved below promoted verdict: {out:?}");
+        // Verdict must not appear twice.
+        assert_eq!(
+            out.matches("Verdict:").count(),
+            1,
+            "verdict moved, not duplicated: {out:?}"
+        );
+    }
+
+    #[test]
+    fn promote_cursor_verdict_picks_last_when_multiple_markers() {
+        // Early prose can mention the word "verdict" in a sentence
+        // (e.g. "write a verdict at the end") that happens to match
+        // the anchor. The LAST match is the real marker; earlier
+        // matches stay where they are.
+        let body = "Opening. The worker preamble says: 'Verdict: lines should lead.'\n\nMiddle reasoning.\n\nVerdict: Actual shipped work.";
+        let out = promote_cursor_verdict(body);
+        assert!(
+            out.starts_with("Verdict: Actual shipped work."),
+            "last Verdict: promoted as the real marker: {out:?}"
+        );
+        // The false match in prose stays in the body, untouched.
+        assert!(
+            out.contains("The worker preamble says: 'Verdict: lines should lead.'"),
+            "earlier prose containing 'Verdict:' survives intact in body: {out:?}"
+        );
+    }
+
+    #[test]
+    fn promote_cursor_verdict_verdict_only_body_returns_verdict() {
+        // Body consists solely of a verdict line — should pass
+        // through unchanged (already leading, nothing to rearrange).
+        let body = "Verdict: Only output.";
+        assert_eq!(promote_cursor_verdict(body), body);
+    }
+
+    #[test]
+    fn extract_cursor_promotes_verdict_like_real_1da1a584_shape() {
+        // Verbatim-style fixture modelled on task
+        // `1da1a584-0586-4745-864f-f7386ddafcbe` — the alert→toast
+        // ship whose summary field was the opening narration
+        // ("Searching the frontend for alert() usage…") instead of
+        // the actual verdict (byte 31119 of its details). Post-T15
+        // the extracted body must lead with the verdict so
+        // `split_summary_details` picks it.
+        let lines = lines(&[
+            "  Searching the frontend for alert() usage and inspecting how IPC errors are surfaced so we can add",
+            "     a toast system.",
+            "",
+            "    Grepped, globbed, read 1 grep, 2 globs, 4 files",
+            "    Read src/components/AgentPanel.js",
+            "",
+            "  Implementing src/toast.js, adding styles, and replacing all alert() calls with the toast API.",
+            "",
+            "    Read package.json",
+            "    $ npm run build 14s",
+            "",
+            "  Verdict: Implemented a stacked toast system in src/toast.js + CSS (showToast, toastIpcError,",
+            "  formatIpcError), removed every frontend alert() from main.js, TaskList.js, and AgentPanel.js,",
+            "  kept prompt/confirm for destructive flows, and surfaced spawn-workspace save IPC failures via",
+            "  toast. npm run build succeeds. No commits.",
+            "",
+            "  Files: src/toast.js (new), src/style.css, src/main.js, src/components/TaskList.js,",
+            "  src/components/AgentPanel.js.",
+            "",
+            "",
+            "  → Add a follow-up",
+            "",
+            "",
+            "  Composer 2 Fast",
+            "  /home/fett/Projects/Alor",
+        ]);
+
+        let body = AgentKind::Cursor
+            .extract_reply(&lines)
+            .expect("cursor reply extractable");
+
+        // Verdict must lead the extracted body.
+        assert!(
+            body.trim_start().starts_with("Verdict: Implemented a stacked toast system"),
+            "verdict promoted to top of extracted body: {body:?}"
+        );
+
+        // Integration with split_summary_details — the summary field
+        // the daemon actually ships. Must be the verdict paragraph,
+        // NOT the opening narration. This assertion is the real
+        // regression lock for T15; the body-shape asserts above are
+        // intermediate diagnostics.
+        let (summary, _details) = split_summary_details(&body);
+        let summary = summary.expect("summary populated");
+        assert!(
+            summary.contains("Implemented a stacked toast system"),
+            "summary is the verdict, not opening narration: {summary:?}"
+        );
+        assert!(
+            !summary.contains("Searching the frontend for alert"),
+            "opening narration must NOT be the summary: {summary:?}"
+        );
+
+        // Reasoning + file list preserved in the body (and thus in
+        // details once split).
+        assert!(body.contains("Searching the frontend"),
+            "opening reasoning preserved in full body: {body:?}");
+        assert!(body.contains("Files: src/toast.js"),
+            "post-verdict file list preserved: {body:?}");
+        // Cursor TUI chrome still stripped.
+        assert!(!body.contains("Add a follow-up"),
+            "`→` input line stripped: {body:?}");
+        assert!(!body.contains("Composer"),
+            "Composer footer stripped: {body:?}");
+    }
+
+    #[test]
+    fn extract_non_cursor_runtimes_do_not_rearrange_verdict() {
+        // Scope guard: the promote-verdict pass must be cursor-only.
+        // A gemini reply with a trailing Verdict: paragraph must be
+        // returned in its original order — gemini / claude workers
+        // follow a verdict-first preamble and rearrangement would
+        // duplicate or reorder their verdicts incorrectly.
+        let lines = lines(&[
+            "Opening gemini reasoning line.",
+            "",
+            "Middle details.",
+            "",
+            "Verdict: Gemini shipped the thing.",
+            "",
+            "",
+            " > Type your message or @path/to/file",
+            "",
+        ]);
+        let body = AgentKind::Gemini.extract_reply(&lines).expect("gemini reply");
+        // Gemini body must retain its original ordering — opening
+        // line first, verdict last.
+        assert!(body.starts_with("Opening gemini reasoning line"),
+            "gemini body order preserved: {body:?}");
+        assert!(body.trim_end().ends_with("Verdict: Gemini shipped the thing."),
+            "gemini verdict stays where it was: {body:?}");
+        assert_eq!(
+            body.matches("Verdict:").count(),
+            1,
+            "no duplication in non-cursor runtime: {body:?}"
+        );
     }
 
     // ---- split_summary_details ----
