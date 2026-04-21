@@ -1,4 +1,5 @@
 use regex::Regex;
+use std::collections::HashSet;
 
 /// Known agent types with their idle-prompt patterns and trust-dialog
 /// handling data. Adding a new runtime is a single match-arm addition
@@ -358,6 +359,43 @@ impl AgentKind {
             AgentKind::Default => &[],
         }
     }
+}
+
+/// Pick the next trust prompt to ack from `prompts`, given the current
+/// pane capture `pane_lines` and the set of hints already acked in
+/// this wrapper session. Returns the first entry (in `prompts` order)
+/// whose hint is visible in the pane AND is NOT yet in `acked_hints`.
+///
+/// T13 fix: the polling loop in `main.rs` previously scanned the
+/// prompt list inline and fired an ack on every poll where the hint
+/// was visible. Codex's "Update available!" banner stays on the pane
+/// for ~10 seconds after the first keypress dismisses it internally
+/// (TUI doesn't redraw immediately), so that loop re-fired the `3`
+/// ack 12 extra times — splatting keystrokes into the pane and
+/// resetting the no-hit-streak so the loop couldn't exit toward
+/// briefing injection. The debounce is a single-shot per hint for the
+/// wrapper's lifetime: first detection fires once and registers the
+/// hint; subsequent detections of the same hint return None *for that
+/// entry* and the search advances to later entries (so codex's trust-
+/// dir dialog still gets picked up when it renders after the update
+/// banner).
+///
+/// Returning `None` means either (a) no prompt visible, (b) all
+/// visible prompts are already acked, or (c) prompts list is empty.
+/// The caller treats all three the same way: increment its
+/// no-hit streak toward loop exit.
+///
+/// Pure function — no IO, no state mutation. Unit-tested below to
+/// lock both the first-match-wins ordering and the debounce
+/// semantics.
+pub fn pick_pending_trust_ack<'a>(
+    pane_lines: &[String],
+    prompts: &'a [(&'static str, &'static str)],
+    acked_hints: &HashSet<&'static str>,
+) -> Option<&'a (&'static str, &'static str)> {
+    prompts.iter().find(|(hint, _)| {
+        !acked_hints.contains(hint) && pane_lines.iter().any(|l| l.contains(hint))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1668,5 +1706,163 @@ mod tests {
             AgentKind::Default.trust_prompts(),
             &[] as &[(&str, &str)]
         );
+    }
+
+    // ---- pick_pending_trust_ack (T13 debounce) ----
+
+    #[test]
+    fn pick_pending_trust_ack_first_visible_match_when_none_acked() {
+        // Baseline: codex "Update available!" banner visible, nothing
+        // acked yet. First-match-wins over the ordered prompt list —
+        // update banner sits at index 0, so it's picked (and will be
+        // acked with "3") before the trust dialog (not visible anyway).
+        let prompts = AgentKind::Codex.trust_prompts();
+        let acked: HashSet<&'static str> = HashSet::new();
+        let pane = lines(&[
+            "╭──────────────────────────────────────╮",
+            "│ ✨ Update available! 0.120.0 → 0.121.0 │",
+            "│ 1. Yes, auto-update                  │",
+            "│ 2. No, skip this version             │",
+            "│ 3. Skip until next version           │",
+            "╰──────────────────────────────────────╯",
+        ]);
+        let picked = pick_pending_trust_ack(&pane, prompts, &acked)
+            .expect("visible + unacked → pick");
+        assert_eq!(picked.0, "Update available!");
+        assert_eq!(picked.1, "3");
+    }
+
+    #[test]
+    fn pick_pending_trust_ack_debounces_already_acked_hint() {
+        // T13 core case: codex acked "Update available!" on a prior
+        // poll. The banner is STILL visible because codex's TUI hasn't
+        // redrawn yet. Without debounce the inline loop would re-fire
+        // `3` on every subsequent poll (empirically 12 extra times
+        // across ~10s). With the debounce set populated, this returns
+        // None — the caller's no-hit-streak increments normally and
+        // the loop progresses toward exit.
+        let prompts = AgentKind::Codex.trust_prompts();
+        let mut acked: HashSet<&'static str> = HashSet::new();
+        acked.insert("Update available!");
+        let pane = lines(&[
+            "│ ✨ Update available! 0.120.0 → 0.121.0 │",
+            "│ 3. Skip until next version (selected) │",
+        ]);
+        assert!(
+            pick_pending_trust_ack(&pane, prompts, &acked).is_none(),
+            "already-acked hint still visible must NOT re-trigger"
+        );
+    }
+
+    #[test]
+    fn pick_pending_trust_ack_advances_past_acked_to_next_visible_prompt() {
+        // TUI-lag + sequential prompts case: the update banner is still
+        // visible from earlier in the poll loop AND the trust-dir
+        // dialog has now rendered. Debounce must not short-circuit the
+        // whole search — it skips the acked entry at index 0 and
+        // returns the unacked match at index 1 so the wrapper can ack
+        // the trust dialog. This is the reason the fix is a per-hint
+        // skip rather than a first-visible-already-acked early exit.
+        let prompts = AgentKind::Codex.trust_prompts();
+        let mut acked: HashSet<&'static str> = HashSet::new();
+        acked.insert("Update available!");
+        let pane = lines(&[
+            "│ ✨ Update available! 0.120.0 → 0.121.0 │",
+            "",
+            "Do you trust the contents of this directory?",
+            "  1. Yes, continue",
+            "  2. No, exit",
+        ]);
+        let picked = pick_pending_trust_ack(&pane, prompts, &acked)
+            .expect("index-0 acked, index-1 visible+unacked → advance");
+        assert_eq!(picked.0, "Do you trust the contents");
+        assert_eq!(picked.1, "1");
+    }
+
+    #[test]
+    fn pick_pending_trust_ack_returns_none_when_no_hint_visible() {
+        // Idle pane with codex's input prompt but no dialog: nothing
+        // to ack. Caller's no-hit-streak increments and the loop
+        // exits normally.
+        let prompts = AgentKind::Codex.trust_prompts();
+        let acked: HashSet<&'static str> = HashSet::new();
+        let pane = lines(&[
+            "› Find and fix a bug in @filename",
+            "",
+            "  gpt-5.4 default · ~/Projects/Alor",
+        ]);
+        assert!(pick_pending_trust_ack(&pane, prompts, &acked).is_none());
+    }
+
+    #[test]
+    fn pick_pending_trust_ack_returns_none_when_all_visible_prompts_acked() {
+        // Both codex prompts visible on the pane simultaneously AND
+        // both already acked. Caller treats this as "nothing pending"
+        // and the no-hit-streak exits the polling loop — we don't
+        // stall forever just because stale banner chrome lingers.
+        let prompts = AgentKind::Codex.trust_prompts();
+        let mut acked: HashSet<&'static str> = HashSet::new();
+        acked.insert("Update available!");
+        acked.insert("Do you trust the contents");
+        let pane = lines(&[
+            "│ ✨ Update available! 0.120.0 → 0.121.0 │",
+            "Do you trust the contents of this directory?",
+        ]);
+        assert!(pick_pending_trust_ack(&pane, prompts, &acked).is_none());
+    }
+
+    #[test]
+    fn pick_pending_trust_ack_respects_prompt_ordering() {
+        // Both prompts visible AND none acked (e.g. codex rendered
+        // both at once on a slow redraw). Ordering is security-
+        // correctness-relevant: acking the trust prompt with the
+        // update prompt's "3" key maps to a non-existent option, and
+        // acking the update prompt with the trust prompt's "1" would
+        // auto-update codex (violates our "never auto-update" policy,
+        // see trust_prompts() doc). So the update banner MUST win
+        // when both are visible. This test locks the ordering against
+        // a refactor that reorders the list or uses a HashMap iter.
+        let prompts = AgentKind::Codex.trust_prompts();
+        let acked: HashSet<&'static str> = HashSet::new();
+        let pane = lines(&[
+            "│ ✨ Update available! 0.120.0 → 0.121.0 │",
+            "Do you trust the contents of this directory?",
+        ]);
+        let picked = pick_pending_trust_ack(&pane, prompts, &acked)
+            .expect("both visible, none acked → first");
+        assert_eq!(picked.0, "Update available!",
+            "update banner must ack before trust dialog: {:?}", picked);
+    }
+
+    #[test]
+    fn pick_pending_trust_ack_empty_prompts_list_is_none() {
+        // Default runtime has an empty prompt list. The polling loop
+        // in main.rs short-circuits before calling this helper, but
+        // the helper itself must stay well-defined if a future caller
+        // invokes it with an empty slice.
+        let prompts: &[(&'static str, &'static str)] = &[];
+        let acked: HashSet<&'static str> = HashSet::new();
+        let pane = lines(&["anything"]);
+        assert!(pick_pending_trust_ack(&pane, prompts, &acked).is_none());
+    }
+
+    #[test]
+    fn pick_pending_trust_ack_substring_match_mirrors_main_loop() {
+        // The helper uses `line.contains(hint)` — same semantics as
+        // the pre-T13 inline loop. Box-drawing characters, leading
+        // whitespace, or trailing TUI decoration around the hint must
+        // not block the match. Fixture taken from the verbatim
+        // codex_fresh_session capture used in codex_idle tests.
+        let prompts = AgentKind::Codex.trust_prompts();
+        let acked: HashSet<&'static str> = HashSet::new();
+        let pane = lines(&[
+            "╭─────────────────────────────────────────────────╮",
+            "│ ✨ Update available! 0.120.0 -> 0.121.0         │",
+            "│ Run npm install -g @openai/codex to update.     │",
+            "╰─────────────────────────────────────────────────╯",
+        ]);
+        let picked = pick_pending_trust_ack(&pane, prompts, &acked)
+            .expect("substring match across box-drawing chrome");
+        assert_eq!(picked.0, "Update available!");
     }
 }

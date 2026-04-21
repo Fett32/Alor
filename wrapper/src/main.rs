@@ -4,13 +4,14 @@ mod protocol;
 mod tmux;
 
 use anyhow::{bail, Context, Result};
-use detector::{AgentKind, IdleDetector};
+use detector::{pick_pending_trust_ack, AgentKind, IdleDetector};
 use protocol::{
     AgentState, DaemonShutdown, Envelope, StatusRequest, StatusResponse, TaskAccept, TaskAssign,
     TaskComplete, UserIntervention, WrapperError, WrapperRegister, MSG_REGISTER, MSG_SHUTDOWN,
     MSG_STATUS_REQUEST, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN, MSG_TASK_COMPLETE,
     MSG_ERROR, MSG_USER_INTERVENTION,
 };
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -336,6 +337,19 @@ async fn run_main() -> Result<()> {
         const STABLE_THRESHOLD: u32 = 4;      // 4 polls (~2s) with no hit → done
         let mut no_hit_streak: u32 = 0;
         let mut acked_any = false;
+        // T13: single-shot-per-hint debounce. Codex's "Update
+        // available!" banner lingers on the pane for ~10s after the
+        // first `3` keypress dismisses it internally (TUI doesn't
+        // redraw immediately), and the pre-T13 loop re-fired the ack
+        // on every subsequent poll (13 total) — splatting unwanted
+        // keystrokes and preventing briefing injection until the
+        // banner finally cleared. The set tracks hints already acked
+        // in THIS wrapper-lifetime so repeats become no-ops at the
+        // helper level while still letting the search advance to
+        // later prompts in the list (e.g. codex's trust-dir dialog
+        // rendered after the update banner). Decision logic lives in
+        // `pick_pending_trust_ack` (detector.rs) — unit-tested there.
+        let mut acked_hints: HashSet<&'static str> = HashSet::new();
         for attempt in 0..MAX_POLLS {
             sleep(Duration::from_millis(500)).await;
             let lines = match tmux::capture_pane(&session, 30) {
@@ -353,25 +367,24 @@ async fn run_main() -> Result<()> {
                     continue;
                 }
             };
-            // First-match-wins across the ordered prompt list. The
-            // continue after an ack lets the next poll re-capture and
-            // catch any follow-up prompt.
+            // Delegate to the pure helper: returns the first visible
+            // AND not-yet-acked prompt (None if all visible prompts
+            // are stale-acked or nothing is visible at all).
+            let picked = pick_pending_trust_ack(&lines, prompts, &acked_hints);
             let mut acked = false;
-            for (hint, ack) in prompts {
-                if lines.iter().any(|l| l.contains(hint)) {
-                    info!(
-                        hint,
-                        ack,
-                        attempt,
-                        "trust prompt visible; sending ack key"
-                    );
-                    if let Err(e) = tmux::send_keys(&session, ack) {
-                        warn!(error = ?e, hint, "send_keys failed during trust-ack");
-                    }
-                    acked = true;
-                    acked_any = true;
-                    break;
+            if let Some((hint, ack)) = picked {
+                info!(
+                    hint,
+                    ack,
+                    attempt,
+                    "trust prompt visible; sending ack key"
+                );
+                if let Err(e) = tmux::send_keys(&session, ack) {
+                    warn!(error = ?e, hint, "send_keys failed during trust-ack");
                 }
+                acked_hints.insert(*hint);
+                acked = true;
+                acked_any = true;
             }
             if acked {
                 no_hit_streak = 0;
