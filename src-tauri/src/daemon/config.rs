@@ -22,6 +22,103 @@ fn dirs_home() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Daemon-wide config
+// ---------------------------------------------------------------------------
+
+/// Daemon-level operator knobs, loaded from `~/.config/alor/daemon.yaml`.
+///
+/// Distinct from the per-agent YAMLs in `~/.config/alor/agents/*.yaml`
+/// — this file (if present) tunes the daemon as a whole, not any one
+/// slot. Absent file = defaults. Parse failure = defaults with a warn
+/// log; startup must not block on a malformed config.
+///
+/// Example `~/.config/alor/daemon.yaml`:
+/// ```yaml
+/// max_terminal_tasks_retained: 500
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct DaemonConfig {
+    /// Maximum terminal-state tasks retained in live `state.json`.
+    /// Oldest-first eviction by `updated_at` (UUID tiebreak) on every
+    /// save. `0` = no cap (unbounded growth, pre-T14 behaviour).
+    /// Default `1000`.
+    ///
+    /// Size rationale: 1000 terminals ≈ 2 MiB of state.json assuming
+    /// ~2 KiB per serialized task. Cheap to load on boot and cheap
+    /// to serialize on every persist; leaves plenty of headroom for
+    /// the orchestrator's routine `task_list` scans without dragging
+    /// the whole tail along.
+    #[serde(default = "default_max_terminal_tasks_retained")]
+    pub max_terminal_tasks_retained: usize,
+}
+
+fn default_max_terminal_tasks_retained() -> usize {
+    // Matches `state.rs::DEFAULT_MAX_TERMINAL_RETAINED`. Kept as a
+    // free fn here rather than a re-export so serde can resolve it
+    // from the #[serde(default = "...")] attribute without a
+    // path-visibility dance.
+    1000
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            max_terminal_tasks_retained: default_max_terminal_tasks_retained(),
+        }
+    }
+}
+
+/// Load `~/.config/alor/daemon.yaml` into a `DaemonConfig`, falling
+/// back to `DaemonConfig::default()` on any non-fatal error (absent
+/// file, parse error, unreadable). Errors are logged at `warn!` so
+/// an operator can see the config wasn't picked up without the
+/// daemon refusing to start.
+pub fn load_daemon_config() -> DaemonConfig {
+    let config_dir = match session::config_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("could not resolve config dir for daemon.yaml: {e:#}");
+            return DaemonConfig::default();
+        }
+    };
+    let path = config_dir.join("daemon.yaml");
+    if !path.exists() {
+        tracing::debug!(
+            path = %path.display(),
+            "no daemon.yaml present; using default daemon config"
+        );
+        return DaemonConfig::default();
+    }
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                "failed to read daemon.yaml: {e}; using defaults"
+            );
+            return DaemonConfig::default();
+        }
+    };
+    match serde_yaml::from_str::<DaemonConfig>(&contents) {
+        Ok(cfg) => {
+            tracing::info!(
+                max_terminal_tasks_retained = cfg.max_terminal_tasks_retained,
+                "loaded daemon config from {}",
+                path.display()
+            );
+            cfg
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                "failed to parse daemon.yaml: {e}; using defaults"
+            );
+            DaemonConfig::default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Config structs
 // ---------------------------------------------------------------------------
 

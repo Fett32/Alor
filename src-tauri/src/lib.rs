@@ -54,6 +54,15 @@ pub fn run() {
             daemon::state::AppState::new()
         }
     };
+    // T14: apply daemon-wide config. Currently just the terminal-task
+    // retention cap; any future operator knobs flow through the same
+    // DaemonConfig → setter path so the wiring stays in one place.
+    // Absent / malformed config → defaults (see load_daemon_config
+    // for fallback semantics).
+    {
+        let daemon_cfg = daemon::config::load_daemon_config();
+        app_state.set_max_terminal_retained(daemon_cfg.max_terminal_tasks_retained);
+    }
     // One-shot archive migration: rehydrate legacy tasks-archive.json into
     // live state, then rename the archive → `.migrated` so subsequent
     // boots skip. After b4102e92 terminal tasks stay in state.json

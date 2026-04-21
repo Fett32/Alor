@@ -490,6 +490,7 @@ pub struct AgentSummary {
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Cached full text of a `worker.orch_response` event, keyed by the
 /// `correlation_id` the daemon embedded in the sentinel-prefixed
@@ -536,6 +537,20 @@ struct WorkerResponseCache {
 /// follow-up fetch); bigger just wastes memory.
 pub const WORKER_RESPONSE_CACHE_CAP: usize = 100;
 
+/// Default cap on terminal-state tasks retained in live `state.json`.
+/// When the count exceeds this value, `prune_terminal_overflow` evicts
+/// the oldest (by `updated_at`, UUID tiebreak) until the cap is met.
+/// `0` means "no cap" — unbounded growth, pre-T14 behaviour.
+///
+/// 1000 is sized off operator expectation rather than a specific
+/// benchmark: at ~2 KiB per serialized terminal task it's ~2 MiB of
+/// state.json terminals, cheap to load on boot and cheap to serialize
+/// on every save. Adjust via `DaemonConfig::max_terminal_tasks_retained`
+/// in `~/.config/alor/daemon.yaml` without a recompile. Config knob,
+/// not a build-time constant, so an operator can bump it mid-session
+/// by restarting the daemon with a different value.
+pub const DEFAULT_MAX_TERMINAL_RETAINED: usize = 1000;
+
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Mutex<StateInner>>,
@@ -565,6 +580,18 @@ pub struct AppState {
     /// handler before the event goes out, queried by
     /// `MSG_CLI_WORKER_RESPONSE_GET`.
     worker_responses: Arc<Mutex<WorkerResponseCache>>,
+    /// T14: live-retention cap for terminal tasks. Every `save()`
+    /// calls `prune_terminal_overflow(cap)` before serializing so the
+    /// cap is always enforced at rest. `0` means "no cap" (unbounded).
+    /// Populated at startup from `DaemonConfig::max_terminal_tasks_retained`
+    /// via `set_max_terminal_retained`; defaults to
+    /// `DEFAULT_MAX_TERMINAL_RETAINED` if config is absent.
+    ///
+    /// `AtomicUsize` because `save()` reads with a shared `&self` and
+    /// the setter runs once at startup — atomic Relaxed loads are
+    /// strictly cheaper than wrapping a scalar in a Mutex we'd hold
+    /// only for the 8-byte read.
+    max_terminal_retained: Arc<AtomicUsize>,
 }
 
 impl Default for AppState {
@@ -575,6 +602,7 @@ impl Default for AppState {
             app_handle: Arc::new(Mutex::new(None)),
             task_spawns: Arc::new(Mutex::new(HashMap::new())),
             worker_responses: Arc::new(Mutex::new(WorkerResponseCache::default())),
+            max_terminal_retained: Arc::new(AtomicUsize::new(DEFAULT_MAX_TERMINAL_RETAINED)),
         }
     }
 }
@@ -585,11 +613,16 @@ struct StateInner {
     agents: HashMap<String, Agent>,
 }
 
-/// On-disk layout of `tasks-archive.json`.  Terminal tasks are swept out of
-/// live state into this file on every daemon startup so the running state
-/// file stays lean.  Schema intentionally matches the format of the existing
-/// hand-curated archive: a `tasks` map keyed by UUID plus an RFC3339
-/// `last_archive_run` timestamp.
+/// Legacy on-disk layout of `tasks-archive.json`. Written historically
+/// by the pre-b4102e92 startup sweep; **no longer written** as of T14.
+/// After b4102e92 terminal tasks stay live and queryable in
+/// `state.json`, and T14 caps that growth via `prune_terminal_overflow`
+/// instead of offloading. This struct exists only to deserialize any
+/// archive file that survives on disk so `migrate_archive` can
+/// rehydrate it back into live state and mark the file `.migrated`.
+///
+/// Schema matches the original hand-curated archive: a `tasks` map
+/// keyed by UUID plus an RFC3339 `last_archive_run` timestamp.
 #[derive(Default, Serialize, Deserialize)]
 struct TasksArchive {
     #[serde(default)]
@@ -669,13 +702,41 @@ impl AppState {
             app_handle: Arc::new(Mutex::new(None)),
             task_spawns: Arc::new(Mutex::new(HashMap::new())),
             worker_responses: Arc::new(Mutex::new(WorkerResponseCache::default())),
+            max_terminal_retained: Arc::new(AtomicUsize::new(DEFAULT_MAX_TERMINAL_RETAINED)),
         }
+    }
+
+    /// Set the terminal-retention cap. Called once at startup from
+    /// `lib.rs` after loading `DaemonConfig`. `0` disables the cap.
+    /// See `prune_terminal_overflow` for semantics.
+    pub fn set_max_terminal_retained(&self, cap: usize) {
+        self.max_terminal_retained.store(cap, Ordering::Relaxed);
+    }
+
+    /// Current terminal-retention cap. `0` = unbounded. Exposed for
+    /// tests and introspection.
+    pub fn max_terminal_retained(&self) -> usize {
+        self.max_terminal_retained.load(Ordering::Relaxed)
     }
 
     /// Persist current state to disk. Called automatically after mutations.
     /// Clones data under the lock, then writes outside the lock using
     /// atomic rename to prevent corruption.
+    ///
+    /// T14: before serializing, prunes excess terminal tasks via
+    /// `prune_terminal_overflow` so the cap is enforced at rest. The
+    /// prune runs in its own lock cycle (acquire, mutate, release)
+    /// before the snapshot-under-lock below. Two cycles rather than
+    /// one keeps the mutation path and the read-only serialization
+    /// path isolated — the serializer never sees a partial prune —
+    /// and typical saves that don't evict fast-exit inside the prune
+    /// on a `len()` check before any sorting.
     pub fn save(&self) {
+        // Prune terminal overflow first. No-op when cap == 0 or the
+        // terminal count is already at/below the cap.
+        let cap = self.max_terminal_retained.load(Ordering::Relaxed);
+        self.prune_terminal_overflow(cap);
+
         if let Some(path) = self.save_path.as_ref() {
             // Clone data under lock, then release immediately.
             let json = {
@@ -716,113 +777,105 @@ impl AppState {
         }
     }
 
-    /// Sweep terminal tasks out of live state into `archive_path`. Kept
-    /// here for future reuse by a capped auto-archive pass (not wired up
-    /// yet — b4102e92 accepts unbounded state.json growth for now).
-    /// Marked `#[allow(dead_code)]` so `cargo check` stays clean.
-    #[allow(dead_code)]
-    pub fn archive_terminal_tasks(&self, archive_path: &Path) -> usize {
-        // Snapshot terminal tasks under lock without removing yet.
-        let terminal: Vec<(Uuid, Task)> = {
-            let s = self.inner.lock();
-            s.tasks
-                .iter()
-                .filter(|(_, t)| t.state.is_terminal())
-                .map(|(id, t)| (*id, t.clone()))
-                .collect()
-        };
+    /// Evict oldest-first terminal tasks from live state when the
+    /// terminal count exceeds `cap`. Called from `save()` on every
+    /// persist so the cap is always enforced at rest.
+    ///
+    /// ## Semantics
+    ///
+    /// - `cap == 0` → no-op (unbounded). Matches the documented
+    ///   `DaemonConfig::max_terminal_tasks_retained = 0` contract.
+    /// - `terminal_count <= cap` → no-op. Fast path: one `len()`
+    ///   filter count inside the lock, no sort.
+    /// - Otherwise, sort terminal tasks by `(updated_at ASC, id ASC)`
+    ///   and drop the first `terminal_count - cap` from the live
+    ///   map. Non-terminal tasks are never touched.
+    ///
+    /// ## Eviction order rationale
+    ///
+    /// Oldest-first by `updated_at` picks the task that became
+    /// terminal the *earliest* — the freshly-cancelled task at the
+    /// cap boundary is more likely to still be relevant to an
+    /// operator reviewing what just happened than a two-week-old
+    /// completed task. `transition_task` bumps `updated_at` on every
+    /// legal transition (state.rs:408), and terminal-bookkeeping
+    /// re-labels (`Completed → Cancelled` etc., line 91–101) also
+    /// bump it, so "terminal age" is correctly the age of the
+    /// terminal-entry state.
+    ///
+    /// UUID tiebreak on timestamp collision makes eviction
+    /// deterministic in tests — production collisions are rare (ns
+    /// clock granularity + single-threaded transition path) but a
+    /// mis-synced test wall-clock (CI containers with coarse time)
+    /// can produce ties, and non-deterministic eviction would turn
+    /// the test into a flake.
+    ///
+    /// ## Idempotence
+    ///
+    /// Second call on an already-capped state is a no-op (the
+    /// `len() <= cap` early-exit). Means `save()` can invoke this
+    /// every persist without per-call bookkeeping.
+    ///
+    /// ## Return
+    ///
+    /// Number of tasks evicted (0 on any no-op path).
+    pub fn prune_terminal_overflow(&self, cap: usize) -> usize {
+        if cap == 0 {
+            return 0;
+        }
+        let mut s = self.inner.lock();
 
-        if terminal.is_empty() {
+        // Fast path: count terminal-state tasks; skip the sort if
+        // we're at or under the cap. Typical production saves never
+        // cross the threshold, so this is the hot path.
+        let terminal_count = s
+            .tasks
+            .values()
+            .filter(|t| t.state.is_terminal())
+            .count();
+        if terminal_count <= cap {
             return 0;
         }
 
-        // Load existing archive (if any).
-        let mut archive: TasksArchive = if archive_path.exists() {
-            match std::fs::read_to_string(archive_path) {
-                Ok(json) => match serde_json::from_str(&json) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::warn!(
-                            "failed to parse {}: {e}; starting a fresh archive",
-                            archive_path.display()
-                        );
-                        TasksArchive::default()
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to read {}: {e}; starting a fresh archive",
-                        archive_path.display()
-                    );
-                    TasksArchive::default()
+        // Collect (updated_at, id) pairs for terminal tasks. Clone-
+        // free — we only need the fields we sort on.
+        let mut terminal: Vec<(DateTime<Utc>, Uuid)> = s
+            .tasks
+            .iter()
+            .filter_map(|(id, t)| {
+                if t.state.is_terminal() {
+                    Some((t.updated_at, *id))
+                } else {
+                    None
                 }
-            }
-        } else {
-            TasksArchive::default()
-        };
+            })
+            .collect();
 
-        let terminal_ids: Vec<Uuid> = terminal.iter().map(|(id, _)| *id).collect();
-        for (id, task) in terminal {
-            archive.tasks.insert(id, task);
-        }
-        archive.last_archive_run = Some(Utc::now());
+        // Oldest first, UUID tiebreak.
+        terminal.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-        // Serialize + atomic write (tmp + fsync + rename), same pattern as save().
-        let json = match serde_json::to_string_pretty(&archive) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!("failed to serialize archive: {e}");
-                return 0;
-            }
-        };
-        let tmp_path = archive_path.with_extension("json.tmp");
-        match std::fs::File::create(&tmp_path) {
-            Ok(mut f) => {
-                use std::io::Write;
-                if let Err(e) = f.write_all(json.as_bytes()) {
-                    tracing::warn!("failed to write temp archive file: {e}");
-                    return 0;
-                }
-                if let Err(e) = f.sync_all() {
-                    tracing::warn!("failed to fsync archive file: {e}");
-                    return 0;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "failed to open temp archive file {}: {e}",
-                    tmp_path.display()
-                );
-                return 0;
+        let to_evict = terminal_count - cap;
+        let mut evicted = 0;
+        for (_, id) in terminal.iter().take(to_evict) {
+            // Re-check is_terminal under the same lock we're
+            // mutating — paranoia against a concurrent transition we
+            // don't expect here (all mutation goes through this
+            // Mutex), but cheap.
+            if s.tasks.get(id).map_or(false, |t| t.state.is_terminal()) {
+                s.tasks.remove(id);
+                evicted += 1;
             }
         }
-        if let Err(e) = std::fs::rename(&tmp_path, archive_path) {
-            tracing::warn!("failed to rename archive file: {e}");
-            return 0;
+
+        if evicted > 0 {
+            tracing::info!(
+                evicted,
+                cap,
+                terminal_count,
+                "prune_terminal_overflow evicted oldest terminal tasks"
+            );
         }
-
-        // Archive durable — now drop these from live state.  Re-check is_terminal()
-        // per id in case something mutated between snapshot and now (shouldn't
-        // happen during startup, but the check is cheap).
-        let removed = {
-            let mut s = self.inner.lock();
-            let mut n = 0;
-            for id in &terminal_ids {
-                if let Some(task) = s.tasks.get(id) {
-                    if task.state.is_terminal() {
-                        s.tasks.remove(id);
-                        n += 1;
-                    }
-                }
-            }
-            n
-        };
-
-        // Persist the shrunken live state.  No event emit here: this runs at
-        // startup before the app handle is wired up, and nothing's listening.
-        self.save();
-
-        removed
+        evicted
     }
 
     /// One-shot migration: absorb the legacy `tasks-archive.json` into
@@ -2522,101 +2575,319 @@ mod tests {
         let _ = std::fs::remove_file(&state_path);
     }
 
-    #[test]
-    fn archive_terminal_tasks_sweeps_only_terminal_states_and_is_idempotent() {
-        use std::collections::HashSet;
+    // ---- T14 prune_terminal_overflow ----
 
-        // Unique per-test tmp paths so parallel runs don't collide.
+    /// Helper: build a terminal-state task with a synthetic `updated_at`
+    /// so eviction-order tests don't rely on real-clock ordering of
+    /// `transition_task` calls (which would be racy on a fast machine).
+    fn terminal_task_at(state: TaskState, updated_at: DateTime<Utc>) -> Task {
+        assert!(
+            state.is_terminal(),
+            "helper is only for terminal states, got {state:?}"
+        );
+        let mut t = Task::new(format!("{state:?}"), "test");
+        t.state = state;
+        t.updated_at = updated_at;
+        t
+    }
+
+    /// Helper: non-terminal task so we can verify the prune leaves
+    /// live work untouched even when its `updated_at` is older than
+    /// the evicted terminals.
+    fn pending_task_at(updated_at: DateTime<Utc>) -> Task {
+        let mut t = Task::new("pending", "test");
+        t.state = TaskState::Pending;
+        t.updated_at = updated_at;
+        t
+    }
+
+    #[test]
+    fn prune_terminal_overflow_evicts_oldest_first_beyond_cap() {
+        // 5 terminal tasks + 2 live, cap=3 → oldest 2 terminals
+        // evicted, live untouched even though they're older still.
+        let app = AppState::new();
+        let base = Utc::now();
+        // Seed in shuffled insertion order to prove we sort, not
+        // rely on HashMap iteration order.
+        let t_old_live = pending_task_at(base - chrono::Duration::hours(24));
+        let t_oldest = terminal_task_at(TaskState::Completed, base - chrono::Duration::hours(10));
+        let t_mid2 = terminal_task_at(TaskState::Cancelled, base - chrono::Duration::hours(4));
+        let t_mid1 = terminal_task_at(TaskState::Stale, base - chrono::Duration::hours(8));
+        let t_old2 = terminal_task_at(TaskState::TimedOut, base - chrono::Duration::hours(9));
+        let t_live = pending_task_at(base - chrono::Duration::hours(12));
+        let t_fresh = terminal_task_at(TaskState::Rejected, base - chrono::Duration::hours(1));
+
+        let oldest_id = t_oldest.id;
+        let old2_id = t_old2.id;
+        let mid1_id = t_mid1.id;
+        let mid2_id = t_mid2.id;
+        let fresh_id = t_fresh.id;
+        let live_id = t_live.id;
+        let old_live_id = t_old_live.id;
+
+        for task in [t_old_live, t_oldest, t_mid2, t_mid1, t_old2, t_live, t_fresh] {
+            app.add_task(task);
+        }
+
+        let evicted = app.prune_terminal_overflow(3);
+        assert_eq!(evicted, 2, "cap=3 over 5 terminals must evict 2");
+
+        let live_ids: std::collections::HashSet<Uuid> =
+            app.all_tasks().into_iter().map(|t| t.id).collect();
+        // Evicted: the two OLDEST terminal tasks (10h, 9h).
+        assert!(!live_ids.contains(&oldest_id), "oldest terminal evicted");
+        assert!(!live_ids.contains(&old2_id), "second-oldest terminal evicted");
+        // Kept: 3 terminals (cap) + 2 non-terminals (never touched).
+        assert!(live_ids.contains(&mid1_id), "8h terminal kept");
+        assert!(live_ids.contains(&mid2_id), "4h terminal kept");
+        assert!(live_ids.contains(&fresh_id), "1h terminal kept");
+        assert!(live_ids.contains(&live_id), "Pending task kept");
+        assert!(
+            live_ids.contains(&old_live_id),
+            "24h-old Pending task kept — non-terminals never evicted even when older than terminals"
+        );
+        assert_eq!(live_ids.len(), 5);
+    }
+
+    #[test]
+    fn prune_terminal_overflow_cap_zero_is_noop_unbounded() {
+        // `cap == 0` is the documented "no cap" semantic. Must be a
+        // true no-op even with hundreds of terminals — the config
+        // knob's 0-means-unbounded contract is user-visible.
+        let app = AppState::new();
+        let base = Utc::now();
+        for i in 0..20 {
+            app.add_task(terminal_task_at(
+                TaskState::Completed,
+                base - chrono::Duration::minutes(i),
+            ));
+        }
+        assert_eq!(app.all_tasks().len(), 20);
+        let evicted = app.prune_terminal_overflow(0);
+        assert_eq!(evicted, 0, "cap=0 must evict nothing");
+        assert_eq!(app.all_tasks().len(), 20);
+    }
+
+    #[test]
+    fn prune_terminal_overflow_idempotent_when_at_or_below_cap() {
+        // At cap: no eviction, return 0. Second call must also
+        // return 0 without mutating state (prune is called on every
+        // save, so idempotence == zero-cost steady state).
+        let app = AppState::new();
+        let base = Utc::now();
+        for i in 0..3 {
+            app.add_task(terminal_task_at(
+                TaskState::Completed,
+                base - chrono::Duration::minutes(i),
+            ));
+        }
+        assert_eq!(app.prune_terminal_overflow(5), 0, "below cap, no evict");
+        assert_eq!(app.prune_terminal_overflow(3), 0, "at cap exactly, no evict");
+        assert_eq!(app.all_tasks().len(), 3, "state unchanged");
+        // A third call on the already-steady state stays a no-op.
+        assert_eq!(app.prune_terminal_overflow(3), 0);
+        assert_eq!(app.all_tasks().len(), 3);
+    }
+
+    #[test]
+    fn prune_terminal_overflow_treats_every_terminal_state_identically() {
+        // `is_terminal()` at HEAD covers Completed, Cancelled, Rejected,
+        // TimedOut, Stale. Prune must not preference one state over
+        // another — only `updated_at` age matters. Feed one of each,
+        // spaced 1 minute apart; with cap=2, evict the 3 oldest and
+        // keep the 2 newest.
+        //
+        // If a future branch adds a new terminal variant (e.g. the
+        // in-flight `AcceptFailed` on the accept-watchdog work),
+        // whoever lands that variant should grow this list too.
+        // Intentionally NOT auto-discovered via a macro — keeping the
+        // list explicit surfaces the grow-this-test step in review.
+        let app = AppState::new();
+        let base = Utc::now();
+        let states = [
+            TaskState::Completed,
+            TaskState::Cancelled,
+            TaskState::Rejected,
+            TaskState::TimedOut,
+            TaskState::Stale,
+        ];
+        let ids: Vec<Uuid> = states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let t = terminal_task_at(
+                    s.clone(),
+                    base - chrono::Duration::minutes((states.len() - i) as i64),
+                );
+                let id = t.id;
+                app.add_task(t);
+                id
+            })
+            .collect();
+        // states[0] is oldest (minus 5min), states[4] newest (minus 1min).
+
+        let evicted = app.prune_terminal_overflow(2);
+        assert_eq!(evicted, 3, "5 terminals, cap=2 → 3 evicted");
+
+        let survivors: std::collections::HashSet<Uuid> =
+            app.all_tasks().into_iter().map(|t| t.id).collect();
+        // Oldest 3 evicted regardless of which terminal variant.
+        for id in &ids[..3] {
+            assert!(!survivors.contains(id), "oldest 3 variants evicted");
+        }
+        // Newest 2 kept regardless of variant.
+        for id in &ids[3..] {
+            assert!(survivors.contains(id), "newest 2 variants kept");
+        }
+    }
+
+    #[test]
+    fn prune_terminal_overflow_tiebreak_on_uuid_is_deterministic() {
+        // Two terminal tasks with identical `updated_at` — test
+        // clock collisions, CI coarse-time containers, etc. UUID
+        // tiebreak gives deterministic eviction so this test can
+        // assert exactly WHICH one survives when cap=1.
+        let app = AppState::new();
+        let ts = Utc::now() - chrono::Duration::hours(1);
+        let mut a = terminal_task_at(TaskState::Completed, ts);
+        let mut b = terminal_task_at(TaskState::Completed, ts);
+        // Force known UUID ordering so the tiebreak is unambiguous.
+        a.id = Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0000);
+        b.id = Uuid::from_u128(0x2000_0000_0000_0000_0000_0000_0000_0000);
+        let a_id = a.id;
+        let b_id = b.id;
+        app.add_task(a);
+        app.add_task(b);
+
+        let evicted = app.prune_terminal_overflow(1);
+        assert_eq!(evicted, 1);
+        let survivors: std::collections::HashSet<Uuid> =
+            app.all_tasks().into_iter().map(|t| t.id).collect();
+        // Smaller UUID sorts first → evicted. Larger UUID survives.
+        assert!(!survivors.contains(&a_id), "lower-UUID evicted on tiebreak");
+        assert!(survivors.contains(&b_id), "higher-UUID retained on tiebreak");
+    }
+
+    #[test]
+    fn prune_terminal_overflow_transition_bumps_updated_at_and_saves_from_eviction() {
+        // Freshly-transitioned-to-terminal task must NOT be evicted
+        // before older terminals. `transition_task` bumps
+        // `updated_at` on the state change, so even if the task was
+        // created earlier, its terminal-entry age is young and
+        // the cap boundary should spare it.
+        let app = AppState::new();
+        let now = Utc::now();
+
+        // Two old pre-existing terminals, 10h and 11h ago.
+        let old_a = terminal_task_at(TaskState::Completed, now - chrono::Duration::hours(11));
+        let old_b = terminal_task_at(TaskState::Completed, now - chrono::Duration::hours(10));
+        let old_a_id = old_a.id;
+        let old_b_id = old_b.id;
+        app.add_task(old_a);
+        app.add_task(old_b);
+
+        // A task created MUCH earlier in Accepted state but
+        // transitioned to Completed just now (bump). Its pre-
+        // transition updated_at was the oldest of all three; post-
+        // transition it's the youngest.
+        let mut accepted = Task::new("long-running", "test");
+        accepted.state = TaskState::Accepted;
+        accepted.updated_at = now - chrono::Duration::hours(48);
+        let accepted_id = accepted.id;
+        app.add_task(accepted);
+        app.transition_task(accepted_id, TaskState::Completed)
+            .expect("Accepted → Completed");
+
+        // Cap=2 over 3 terminals → evict the oldest ONE (old_a).
+        // The fresh transition must keep the just-transitioned task
+        // alive even though its creation is ancient.
+        let evicted = app.prune_terminal_overflow(2);
+        assert_eq!(evicted, 1);
+        let survivors: std::collections::HashSet<Uuid> =
+            app.all_tasks().into_iter().map(|t| t.id).collect();
+        assert!(!survivors.contains(&old_a_id), "oldest terminal evicted");
+        assert!(survivors.contains(&old_b_id), "second-oldest kept");
+        assert!(
+            survivors.contains(&accepted_id),
+            "freshly-transitioned task survives — transition bumped updated_at"
+        );
+    }
+
+    #[test]
+    fn prune_terminal_overflow_leaves_non_terminal_tasks_alone_even_when_all_old() {
+        // Edge case: cap=0 terminals, a bunch of ancient non-terminal
+        // tasks. Must be a no-op — non-terminals participate in
+        // neither the count nor the eviction. The cap is terminal-
+        // specific by design.
+        let app = AppState::new();
+        let long_ago = Utc::now() - chrono::Duration::days(365);
+        for _ in 0..10 {
+            app.add_task(pending_task_at(long_ago));
+        }
+        let evicted = app.prune_terminal_overflow(1);
+        assert_eq!(evicted, 0);
+        assert_eq!(app.all_tasks().len(), 10);
+    }
+
+    #[test]
+    fn save_invokes_prune_with_configured_cap() {
+        // Integration: save() must call prune at its configured cap.
+        // Setting cap=2 then save()-ing an app with 4 terminal tasks
+        // should leave exactly 2 on disk (the two newest). This
+        // locks the save()→prune wiring against a future refactor
+        // that forgets to invoke the sweep.
         let nonce = Uuid::new_v4();
-        let tmp_root = std::env::temp_dir();
-        let archive_path = tmp_root.join(format!("alor-test-archive-{nonce}.json"));
-        let state_path = tmp_root.join(format!("alor-test-state-{nonce}.json"));
-        // Belt-and-braces — make sure nothing left over from a prior run.
-        let _ = std::fs::remove_file(&archive_path);
+        let state_path = std::env::temp_dir().join(format!("alor-test-t14-save-{nonce}.json"));
         let _ = std::fs::remove_file(&state_path);
 
-        let app_state = AppState::with_persistence(state_path.clone());
+        let app = AppState::with_persistence(state_path.clone());
+        app.set_max_terminal_retained(2);
+        assert_eq!(app.max_terminal_retained(), 2);
 
-        // Mix of states: 2 terminal (Completed, Cancelled), 2 non-terminal
-        // (Pending, Accepted). Only the first two should archive.
-        let mk = |state: TaskState| {
-            let mut t = Task::new(format!("{state:?}"), "test");
-            t.state = state;
-            t
-        };
-        let completed = mk(TaskState::Completed);
-        let cancelled = mk(TaskState::Cancelled);
-        let pending = mk(TaskState::Pending);
-        let accepted = mk(TaskState::Accepted);
-        let completed_id = completed.id;
-        let cancelled_id = cancelled.id;
-        let pending_id = pending.id;
-        let accepted_id = accepted.id;
+        let base = Utc::now();
+        for i in 0..4 {
+            app.add_task(terminal_task_at(
+                TaskState::Completed,
+                base - chrono::Duration::hours(i),
+            ));
+        }
+        // add_task already triggers save() internally in the real
+        // daemon; call it explicitly here to match that path.
+        app.save();
 
-        app_state.add_task(completed);
-        app_state.add_task(cancelled);
-        app_state.add_task(pending);
-        app_state.add_task(accepted);
-        assert_eq!(app_state.all_tasks().len(), 4);
+        // Two newest terminals survive in-memory AND on disk.
+        assert_eq!(app.all_tasks().len(), 2);
+        let on_disk = std::fs::read_to_string(&state_path).expect("read state");
+        let parsed: StateInner = serde_json::from_str(&on_disk).expect("parse");
+        assert_eq!(parsed.tasks.len(), 2, "on-disk tasks match in-memory post-prune");
 
-        // First archive sweep: should move the 2 terminal tasks.
-        let moved = app_state.archive_terminal_tasks(&archive_path);
-        assert_eq!(moved, 2, "expected exactly 2 terminal tasks archived");
-
-        let live_ids: HashSet<Uuid> =
-            app_state.all_tasks().into_iter().map(|t| t.id).collect();
-        assert_eq!(live_ids.len(), 2);
-        assert!(live_ids.contains(&pending_id));
-        assert!(live_ids.contains(&accepted_id));
-        assert!(!live_ids.contains(&completed_id));
-        assert!(!live_ids.contains(&cancelled_id));
-
-        // Archive file written with both moved tasks.
-        assert!(archive_path.exists(), "archive file should exist after sweep");
-        let archive_json =
-            std::fs::read_to_string(&archive_path).expect("read archive");
-        let archive: TasksArchive =
-            serde_json::from_str(&archive_json).expect("parse archive");
-        assert_eq!(archive.tasks.len(), 2);
-        assert!(archive.tasks.contains_key(&completed_id));
-        assert!(archive.tasks.contains_key(&cancelled_id));
-        assert!(archive.last_archive_run.is_some());
-        let first_run_ts = archive.last_archive_run;
-
-        // Second sweep: idempotent — nothing left terminal, nothing moves,
-        // archive file untouched (no spurious timestamp bump).
-        let moved_again = app_state.archive_terminal_tasks(&archive_path);
-        assert_eq!(moved_again, 0, "second call must be a no-op");
-        assert_eq!(app_state.all_tasks().len(), 2, "live state unchanged");
-        let archive_json2 =
-            std::fs::read_to_string(&archive_path).expect("read archive");
-        let archive2: TasksArchive =
-            serde_json::from_str(&archive_json2).expect("parse archive");
-        assert_eq!(archive2.tasks.len(), 2);
-        assert_eq!(
-            archive2.last_archive_run, first_run_ts,
-            "timestamp must not bump on a zero-work sweep"
-        );
-
-        // Now flip one of the non-terminal tasks to terminal and sweep again.
-        app_state
-            .transition_task(accepted_id, TaskState::Completed)
-            .expect("Accepted → Completed is legal");
-        let moved_third = app_state.archive_terminal_tasks(&archive_path);
-        assert_eq!(moved_third, 1);
-        let archive3: TasksArchive = serde_json::from_str(
-            &std::fs::read_to_string(&archive_path).expect("read archive"),
-        )
-        .expect("parse archive");
-        assert_eq!(archive3.tasks.len(), 3, "archive grew by one");
-        assert!(archive3.tasks.contains_key(&accepted_id));
-        assert_eq!(app_state.all_tasks().len(), 1);
-        assert_eq!(app_state.all_tasks()[0].id, pending_id);
-
-        // Cleanup.
-        let _ = std::fs::remove_file(&archive_path);
         let _ = std::fs::remove_file(&state_path);
         let _ = std::fs::remove_file(state_path.with_extension("json.tmp"));
-        let _ = std::fs::remove_file(archive_path.with_extension("json.tmp"));
+    }
+
+    #[test]
+    fn default_terminal_retention_cap_matches_documented_default() {
+        // Lock the default against drive-by changes. Operators rely
+        // on "1000 by default" being written in the daemon.yaml
+        // docstring; if we change it, this test fires and forces
+        // the docstring update in the same commit.
+        assert_eq!(DEFAULT_MAX_TERMINAL_RETAINED, 1000);
+        let app = AppState::new();
+        assert_eq!(app.max_terminal_retained(), DEFAULT_MAX_TERMINAL_RETAINED);
+    }
+
+    #[test]
+    fn set_max_terminal_retained_round_trips() {
+        // Setter + getter pair is the public contract lib.rs uses at
+        // startup. Lock that both 0 (disable) and a non-default
+        // positive value (operator override) persist through
+        // subsequent saves without clobber.
+        let app = AppState::new();
+        app.set_max_terminal_retained(42);
+        assert_eq!(app.max_terminal_retained(), 42);
+        app.set_max_terminal_retained(0);
+        assert_eq!(app.max_terminal_retained(), 0);
+        app.set_max_terminal_retained(1000);
+        assert_eq!(app.max_terminal_retained(), 1000);
     }
 }
