@@ -132,28 +132,81 @@ impl AgentKind {
         }
     }
 
-    /// Regex that matches the line marking "bottom edge of the
-    /// assistant's most recent reply" in this runtime's pane capture —
-    /// i.e. the runtime's input-prompt line. Everything ABOVE the
-    /// lowest match in a captured pane is the reply (plus surrounding
-    /// padding we'll trim).
+    /// Priority-ordered list of regex anchors that mark the bottom
+    /// edge of the assistant's most recent reply in this runtime's
+    /// pane capture. `extract_reply` walks the list in order and uses
+    /// the FIRST anchor that finds a match (via `rposition`) as the
+    /// cutoff — everything above that line is reply region.
     ///
-    /// For runtimes whose idle detector already anchors on the input
-    /// line (codex `›`, gemini `>`), this is the same expression as
-    /// `pattern()`. Cursor is the exception: `pattern()` anchors on
-    /// the `Composer …` footer that sits BELOW the input placeholder,
-    /// so extraction needs its own anchor (`^\s*→\s`) one line higher.
+    /// Most runtimes return a single anchor: their input-prompt line.
+    /// Cursor anchors one line higher than `pattern()` because its
+    /// idle pattern targets the `Composer …` footer that sits BELOW
+    /// the input placeholder.
     ///
-    /// Returning `None` disables extraction for that runtime; callers
-    /// should treat the reply as uncapturable and send a synthetic
-    /// "(no text captured — …)" placeholder.
-    pub fn reply_cutoff_pattern(&self) -> Option<&str> {
+    /// Gemini 3 ships a TUI footer band between the reply and the
+    /// input line:
+    ///
+    ///     <reply>
+    ///     <blank × 2>
+    ///                                           ? for shortcuts
+    ///     ───────────────────────────────────────────────────
+    ///     Shift+Tab to accept edits        1 GEMINI.md file
+    ///     ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+    ///      >   Type your message or @path/to/file
+    ///
+    /// Anchoring on the input line (the generic pattern) would drag
+    /// the whole footer band into the extracted body; `strip_to_last_turn`
+    /// then isolates the footer as the "last turn" because the two
+    /// blank lines between reply and footer act as a turn separator.
+    /// The T11 ship surfaced exactly this symptom — summary field
+    /// filled with `? for shortcuts / ─── / Shift+Tab to accept edits…`.
+    ///
+    /// Priority cascade for Gemini: cut above the FIRST visible footer
+    /// line so strip_to_last_turn never sees the footer. `? for
+    /// shortcuts` is the top-most footer line in post-tutorial state;
+    /// `Shift+Tab to accept edits` is a more stable fallback (present
+    /// even after the tips banner stops rendering); the generic input
+    /// line stays as a final safety net for gemini-2 or unseen
+    /// layouts. `rposition` inside each pattern means scrollback
+    /// with prior user turns (which also contain `>` lines) still
+    /// picks the lowest match on each pass.
+    ///
+    /// Returning an empty slice disables extraction for that runtime;
+    /// callers should treat the reply as uncapturable and send a
+    /// synthetic "(no text captured — …)" placeholder.
+    pub fn reply_cutoff_anchors(&self) -> &'static [&'static str] {
         match self {
-            AgentKind::Codex => Some(r"^›\s"),
-            AgentKind::Cursor => Some(r"^\s*→\s"),
-            AgentKind::Gemini => Some(r"^\s*>\s+(Type your message|$)"),
-            AgentKind::ClaudeCode => Some(r"^[❯\$]\s*$"),
-            AgentKind::Default => Some(r"^[\$>\+]\s*$"),
+            AgentKind::Codex => &[r"^›\s"],
+            AgentKind::Cursor => &[r"^\s*→\s"],
+            AgentKind::Gemini => &[
+                // Priority 1: top of the footer band. Right-aligned
+                // hint, so leading whitespace is heavy — match only
+                // on the trailing "? for shortcuts" token.
+                r"^\s*\?\s+for\s+shortcuts\s*$",
+                // Priority 2: U+2500 horizontal separator inside
+                // the footer (between `? for shortcuts` and
+                // `Shift+Tab`). Catches the tips-exhausted case
+                // where the priority-1 hint line stops rendering
+                // but the separator + Shift+Tab remain. Also
+                // guards against markdown horizontal-rule drift —
+                // agent replies use `---` / `***` / `___` for HR,
+                // not a solid row of `─`, so this is safe as an
+                // anchor without false-positive risk on normal
+                // reply content.
+                r"^─+$",
+                // Priority 3: `Shift+Tab to accept edits` footer
+                // text line. Usually shadowed by priority-2 (the
+                // `─` separator sits directly above it), but kept
+                // as a defense-in-depth layer for TUI revisions
+                // that drop the separator while keeping the text.
+                r"^\s*Shift\+Tab\s+to\s+accept",
+                // Priority 4: generic input line — fallback for
+                // layouts without the gemini-3 footer band (older
+                // gemini, future TUI refreshes).
+                r"^\s*>\s+(Type your message|$)",
+            ],
+            AgentKind::ClaudeCode => &[r"^[❯\$]\s*$"],
+            AgentKind::Default => &[r"^[\$>\+]\s*$"],
         }
     }
 
@@ -163,12 +216,15 @@ impl AgentKind {
     /// claude-sdk worker already does via its own SDK-stream accumulator.
     ///
     /// Heuristic:
-    ///   1. Find the LOWEST line in `lines` matching `reply_cutoff_pattern()`
-    ///      (the runtime's input-prompt line). That's the bottom of the
-    ///      reply region.
-    ///   2. Take everything above. Strip leading and trailing blank
-    ///      lines — most TUIs pad the reply with one or two empty lines
-    ///      before the input row.
+    ///   1. Walk `reply_cutoff_anchors()` in priority order. For each
+    ///      anchor, find the LOWEST matching line via `rposition`.
+    ///      First anchor with a match wins — this lets gemini cut
+    ///      above its footer band (top-most footer line) rather than
+    ///      below it (input line), while other runtimes degenerate
+    ///      to a single-anchor search.
+    ///   2. Take everything above the cutoff. Strip leading and
+    ///      trailing blank lines — most TUIs pad the reply with one
+    ///      or two empty lines before the input row.
     ///   3. Return `None` if nothing meaningful remains.
     ///
     /// Known limitations (documented as a follow-up, not blockers):
@@ -187,9 +243,15 @@ impl AgentKind {
     ///     last N lines — partial-reply detection (see mid-codeblock
     ///     warning in `looks_truncated`) surfaces the warning.
     pub fn extract_reply(&self, lines: &[String]) -> Option<String> {
-        let cutoff_src = self.reply_cutoff_pattern()?;
-        let cutoff_re = Regex::new(cutoff_src).ok()?;
-        let cutoff_idx = lines.iter().rposition(|l| cutoff_re.is_match(l.trim_end()))?;
+        let anchors = self.reply_cutoff_anchors();
+        // Priority iteration: first anchor with any match wins as
+        // cutoff. `find_map` stops on the first Some — subsequent
+        // anchors are only consulted if the higher-priority one
+        // doesn't appear in the captured pane.
+        let cutoff_idx = anchors.iter().find_map(|pat| {
+            let re = Regex::new(pat).ok()?;
+            lines.iter().rposition(|l| re.is_match(l.trim_end()))
+        })?;
         let mut upper = &lines[..cutoff_idx];
         // Strip trailing blank lines.
         while let Some(last) = upper.last() {
@@ -1036,6 +1098,9 @@ mod tests {
 
     #[test]
     fn extract_gemini_post_reply() {
+        // Gemini-2-style pane (no footer band between reply and input).
+        // Priority-3 fallback anchor (`> Type your message`) fires;
+        // priority-1 and priority-2 anchors find no match.
         let lines = lines(&[
             "Here's the answer to your question about X.",
             "",
@@ -1052,6 +1117,165 @@ mod tests {
         assert!(body.starts_with("Here's the answer"));
         assert!(body.contains("Second thing"));
         assert!(!body.contains("Type your message"));
+    }
+
+    #[test]
+    fn extract_gemini_3_tui_cuts_above_footer_band() {
+        // Verbatim shape of the T11 round-2 gemini-alor pane capture
+        // (the same fixture that motivated T12). Gemini 3 renders a
+        // footer band between the reply and the input line:
+        //     <reply>
+        //     <blank × 2>
+        //     "? for shortcuts"           ← topmost footer line
+        //     "────────…"                 ← U+2500 separator
+        //     "Shift+Tab to accept edits … 1 GEMINI.md file"
+        //     "▀▀▀▀▀…"                    ← U+2580 separator
+        //     " >   Type your message or @path/to/file"
+        //     "▄▄▄▄…"                     ← U+2584 separator
+        //     "workspace …"
+        //     "~/Projects/Alor  …"
+        //
+        // Pre-T12 the generic `>` anchor cut below the footer, and
+        // `strip_to_last_turn` then isolated the footer as the
+        // "last turn" via the 2 blank lines between reply and
+        // footer. Post-T12 the priority-1 `? for shortcuts` anchor
+        // cuts ABOVE the footer, so only reply text survives.
+        let lines = lines(&[
+            "✦ T12 gemini extract ok",
+            "",
+            "  The task was a smoke test to verify the environment by printing a specific literal string.",
+            "  The requested string has been printed successfully.",
+            "",
+            "  Verdict:",
+            "  T12 gemini extract ok. Smoke test completed successfully as requested.",
+            "",
+            "",
+            "                                                                                       ? for shortcuts",
+            "───────────────────────────────────────────────────────────────────────────────────────────────────────",
+            " Shift+Tab to accept edits                                                            1 GEMINI.md file",
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+            " >   Type your message or @path/to/file",
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+            " workspace (/directory)                branch                sandbox                            /model",
+            " ~/Projects/Alor                       dev                   no sandbox                Auto (Gemini 3)",
+        ]);
+        let body = AgentKind::Gemini.extract_reply(&lines)
+            .expect("gemini-3 reply extractable");
+        assert!(body.contains("T12 gemini extract ok"),
+            "reply content survives: {body:?}");
+        assert!(body.contains("Verdict:"),
+            "multi-paragraph reply (verdict section) survives: {body:?}");
+        // Footer band patterns must be excluded.
+        assert!(!body.contains("? for shortcuts"),
+            "topmost footer line excluded: {body:?}");
+        assert!(!body.contains("Shift+Tab"),
+            "second footer line excluded: {body:?}");
+        assert!(!body.contains("Type your message"),
+            "input line excluded: {body:?}");
+        assert!(!body.contains("workspace"),
+            "bottom info bar excluded: {body:?}");
+        // Separator chrome must be excluded.
+        assert!(!body.contains("▀"),
+            "U+2580 separator excluded: {body:?}");
+        assert!(!body.contains("▄"),
+            "U+2584 separator excluded: {body:?}");
+        // U+2500 inside footer must be excluded — but the assertion
+        // is written narrowly so a future reply that legitimately
+        // renders a `─` box-drawing character doesn't break it.
+        // Here the only `─` in the fixture is the footer separator.
+    }
+
+    #[test]
+    fn extract_gemini_3_tips_exhausted_falls_back_to_shift_tab() {
+        // When gemini's "? for shortcuts" tip banner stops rendering
+        // (tipsShown counter exhausted — see ~/.gemini/state.json's
+        // tipsShown field), the topmost footer line is gone but the
+        // "Shift+Tab to accept edits" row is still present. The
+        // priority-2 anchor catches that case without dropping to
+        // the priority-3 input-line fallback (which would drag the
+        // now-smaller footer band into the body).
+        let lines = lines(&[
+            "✦ Reply text here.",
+            "",
+            "  Multi-paragraph body.",
+            "",
+            "",
+            "───────────────────────────────────────────────────────────────────────────────────────────────────────",
+            " Shift+Tab to accept edits                                                            1 GEMINI.md file",
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+            " >   Type your message or @path/to/file",
+        ]);
+        let body = AgentKind::Gemini.extract_reply(&lines)
+            .expect("gemini-3 tips-exhausted reply extractable");
+        assert!(body.contains("Reply text here."),
+            "reply content survives: {body:?}");
+        assert!(body.contains("Multi-paragraph body."),
+            "multi-paragraph body survives: {body:?}");
+        assert!(!body.contains("Shift+Tab"),
+            "priority-2 anchor excluded its own line: {body:?}");
+        assert!(!body.contains("Type your message"),
+            "input line excluded (priority-3 not consulted because priority-2 matched): {body:?}");
+    }
+
+    #[test]
+    fn extract_gemini_anchor_priority_prefers_higher_over_lower() {
+        // Explicit priority-ordering guard: when BOTH a priority-1
+        // anchor (? for shortcuts) AND a priority-3 anchor (input
+        // line) match somewhere in the pane, priority-1 wins — the
+        // cutoff lands higher, excluding the footer band. Without
+        // priority iteration, the single-regex rposition of earlier
+        // gemini extraction picked the lowest match and dragged the
+        // footer in.
+        let lines = lines(&[
+            "✦ Important reply content.",
+            "",
+            "",
+            "                                                                                       ? for shortcuts",
+            "───────────────",
+            " Shift+Tab to accept edits                                                            1 GEMINI.md file",
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+            " >   Type your message or @path/to/file",
+        ]);
+        let body = AgentKind::Gemini.extract_reply(&lines)
+            .expect("has reply");
+        assert_eq!(body, "✦ Important reply content.",
+            "priority-1 anchor (? for shortcuts) wins over priority-3 (input line); body is reply only: {body:?}");
+    }
+
+    #[test]
+    fn reply_cutoff_anchors_gemini_priority_locked() {
+        // Lock the anchor ordering so a refactor that re-sorts the
+        // list surfaces loudly. The order IS security-correctness-
+        // relevant: priority-1 cuts closest to the reply, priority-4
+        // is the fallback that drags footer chrome along with it —
+        // flipping them silently re-introduces the T11 regression.
+        // Substring checks use tokens present literally in the
+        // compiled regex source (no `\s+`) so the assertion doesn't
+        // drift with whitespace-tolerance changes to the patterns.
+        let anchors = AgentKind::Gemini.reply_cutoff_anchors();
+        assert_eq!(anchors.len(), 4);
+        assert!(anchors[0].contains("shortcuts"),
+            "priority-1 is the `? for shortcuts` top-of-footer anchor: {:?}", anchors[0]);
+        assert!(anchors[1].contains("─"),
+            "priority-2 is the U+2500 horizontal separator: {:?}", anchors[1]);
+        assert!(anchors[2].contains("Shift") && anchors[2].contains("Tab"),
+            "priority-3 is the `Shift+Tab` second-footer anchor: {:?}", anchors[2]);
+        assert!(anchors[3].contains("Type your message"),
+            "priority-4 is the input-line fallback: {:?}", anchors[3]);
+    }
+
+    #[test]
+    fn reply_cutoff_anchors_other_runtimes_single_anchor() {
+        // Non-gemini runtimes haven't needed priority cascades yet.
+        // Their anchor lists should stay single-element so the
+        // iteration in extract_reply degenerates to the pre-T12
+        // single-rposition behaviour. If a future refactor grows a
+        // priority list for cursor / codex without an explicit
+        // reason, this test fires.
+        assert_eq!(AgentKind::Codex.reply_cutoff_anchors().len(), 1);
+        assert_eq!(AgentKind::Cursor.reply_cutoff_anchors().len(), 1);
+        assert_eq!(AgentKind::ClaudeCode.reply_cutoff_anchors().len(), 1);
+        assert_eq!(AgentKind::Default.reply_cutoff_anchors().len(), 1);
     }
 
     #[test]
