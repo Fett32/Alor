@@ -38,12 +38,18 @@ Manual repro checklist (do in a real orch/worker TUI session after deploy):
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from common import sanitize_paste, _build_paste_guard  # noqa: E402
+from common import (  # noqa: E402
+    ORCHESTRATOR_ASSUME_PASTE_TIME_MS,
+    _build_paste_guard,
+    reset_assume_paste_time,
+    sanitize_paste,
+)
 from prompt_toolkit.keys import Keys  # noqa: E402
 
 
@@ -287,6 +293,102 @@ def test_paste_guard_handler_sanitizes_event_data() -> None:
 
 
 # ---------------------------------------------------------------------------
+# tmux assume-paste-time opt-out (orchestrator session)
+# ---------------------------------------------------------------------------
+
+
+def test_reset_assume_paste_time_default_is_non_zero() -> None:
+    """Sanity: the default we reset to must be > 0, otherwise tmux's
+    paste-timing heuristic stays off and the fix is a no-op. The exact
+    value is a documented policy choice (500ms as of this commit)."""
+    assert_eq("default paste-time > 0", ORCHESTRATOR_ASSUME_PASTE_TIME_MS > 0, True)
+    assert_eq(
+        "default paste-time below tmux's max-useful window",
+        ORCHESTRATOR_ASSUME_PASTE_TIME_MS <= 2000,
+        True,
+    )
+
+
+def test_reset_assume_paste_time_skips_outside_tmux(monkeypatched_env) -> None:
+    """Calling outside tmux (no $TMUX) returns False without spawning
+    anything. Guards against a bare `python main.py` dev invocation
+    shelling out to tmux when there's no session to target."""
+    monkeypatched_env.pop("TMUX", None)
+    assert_eq(
+        "no-op when not under tmux",
+        reset_assume_paste_time("alor-orchestrator"),
+        False,
+    )
+
+
+def test_reset_assume_paste_time_shells_out_when_under_tmux(
+    monkeypatched_env, recorder
+) -> None:
+    """Under tmux: executes `tmux set-option -t <session>
+    assume-paste-time <ms>`. We patch subprocess.run to record the
+    args — no real tmux call. Confirms the exact command form the
+    orchestrator emits at startup, which is the surface tmux will
+    see when diagnosing.
+    """
+    import common
+    monkeypatched_env["TMUX"] = "/tmp/tmux-1000/default,1234,5"
+    with recorder.patch(common, "subprocess", run=lambda *a, **kw: recorder.RunOk()):
+        ok = reset_assume_paste_time("alor-orchestrator", ms=500)
+    assert_eq("tmux call succeeded (recorded)", ok, True)
+    assert_eq("exactly one subprocess.run call", len(recorder.calls), 1)
+    argv = recorder.calls[0][0][0]
+    assert_eq(
+        "tmux set-option command shape",
+        argv,
+        ["tmux", "set-option", "-t", "alor-orchestrator",
+         "assume-paste-time", "500"],
+    )
+
+
+class _Recorder:
+    """Tiny stand-in for pytest's monkeypatch + call recorder.
+
+    Keeps this file's zero-runtime-deps promise: no pytest, no mock."""
+
+    class RunOk:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def patch(self, module, attr_name: str, **method_overrides):
+        """Context manager that installs a proxy object in place of
+        `module.<attr_name>` whose methods record calls + return the
+        override result."""
+        recorder = self
+
+        class _Proxy:
+            def __init__(self, overrides):
+                self._overrides = overrides
+                self.RunOk = recorder.RunOk
+            def __getattr__(self, name):
+                if name in self._overrides:
+                    override = self._overrides[name]
+                    def _wrapped(*args, **kwargs):
+                        recorder.calls.append((args, kwargs))
+                        return override(*args, **kwargs)
+                    return _wrapped
+                raise AttributeError(name)
+
+        class _Ctx:
+            def __enter__(self_):
+                self_.original = getattr(module, attr_name)
+                setattr(module, attr_name, _Proxy(method_overrides))
+                return self_
+            def __exit__(self_, *exc):
+                setattr(module, attr_name, self_.original)
+
+        return _Ctx()
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -315,6 +417,20 @@ def main() -> int:
 
     test_paste_guard_registers_bracketed_paste_handler()
     test_paste_guard_handler_sanitizes_event_data()
+
+    # tmux paste-time opt-out suite.
+    test_reset_assume_paste_time_default_is_non_zero()
+    # Create a snapshot of os.environ we can mutate + restore per-test.
+    env_snapshot = dict(os.environ)
+    try:
+        test_reset_assume_paste_time_skips_outside_tmux(os.environ)
+        recorder = _Recorder()
+        test_reset_assume_paste_time_shells_out_when_under_tmux(
+            os.environ, recorder
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(env_snapshot)
 
     print()
     print("PASS — paste sanitization covers ANSI, controls, zero-width, line endings.")

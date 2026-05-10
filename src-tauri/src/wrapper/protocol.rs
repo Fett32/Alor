@@ -48,6 +48,7 @@ pub const MSG_CLI_INTEGRATIONS_GET: &str = "cli.integrations.get";
 pub const MSG_CLI_AGENT_SEND_MESSAGE: &str = "cli.agent.send_message";
 pub const MSG_CLI_AGENT_ENSURE_RUNNING: &str = "cli.agent.ensure_running";
 pub const MSG_CLI_MEMORY_GET: &str = "cli.memory.get";
+pub const MSG_CLI_MEMORY_APPEND: &str = "cli.memory.append";
 pub const MSG_CLI_WORKER_RESPONSE_GET: &str = "cli.worker.response.get";
 pub const MSG_CLI_RESPONSE: &str = "cli.response";
 pub const MSG_CLI_ERROR: &str = "cli.error";
@@ -102,6 +103,28 @@ pub const WORKER_ECHO_SENTINEL_BEGIN: &str = "__ALOR_ORCH_ECHO_BEGIN__";
 pub const WORKER_ECHO_SENTINEL_END: &str = "__ALOR_ORCH_ECHO_END__";
 
 // ---------------------------------------------------------------------------
+// Protocol version gate
+// ---------------------------------------------------------------------------
+//
+// Pinned to `proto/alor_protocol.yaml`'s `protocol_version` key.
+// Every Envelope carries this field; receivers reject envelopes
+// whose `protocol_version` doesn't match. Back-compat via serde's
+// `default = "default_protocol_version"` so envelopes written
+// before the field existed parse as v1 and pass.
+//
+// Bumping this is the forcing function for a coordinated Rust +
+// Python schema change: any wire-format edit MUST bump this,
+// which then fails loudly on any peer running the older number.
+// See the module-level comment at the top of
+// `proto/alor_protocol.yaml` for the full rationale.
+
+pub const PROTOCOL_VERSION: u32 = 1;
+
+fn default_protocol_version() -> u32 {
+    PROTOCOL_VERSION
+}
+
+// ---------------------------------------------------------------------------
 // Envelope — every message on the wire is wrapped in this
 // ---------------------------------------------------------------------------
 
@@ -112,17 +135,67 @@ pub struct Envelope {
     pub kind: String,
     /// Correlation ID so responses can be matched to requests.
     pub correlation_id: Uuid,
+    /// Schema version. Receivers verify against `PROTOCOL_VERSION`
+    /// via `decode_checked` / `expect_current_version`. Absent in
+    /// pre-gate envelopes → defaults to the current version so an
+    /// outbox frame queued before the field existed still passes
+    /// the gate on replay.
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u32,
     /// The actual payload, type-erased as raw JSON.
     pub payload: serde_json::Value,
 }
 
+/// Error returned when `Envelope::expect_current_version` sees a
+/// wire version that doesn't match the local `PROTOCOL_VERSION`.
+/// Separate from generic serde errors so callers can log "peer is
+/// out of sync; rebuild both sides in lockstep" unambiguously.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolVersionMismatch {
+    pub wire: u32,
+    pub local: u32,
+}
+
+impl std::fmt::Display for ProtocolVersionMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "protocol version mismatch: wire={} local={}",
+            self.wire, self.local
+        )
+    }
+}
+
+impl std::error::Error for ProtocolVersionMismatch {}
+
 impl Envelope {
+    /// Build a new Envelope with the local `PROTOCOL_VERSION`
+    /// stamped. All senders route through here (directly or via
+    /// the other `new` callers) so the version is uniform
+    /// daemon-wide without per-callsite plumbing.
     pub fn new(kind: &str, payload: impl Serialize) -> anyhow::Result<Self> {
         Ok(Self {
             kind: kind.to_string(),
             correlation_id: Uuid::new_v4(),
+            protocol_version: PROTOCOL_VERSION,
             payload: serde_json::to_value(payload)?,
         })
+    }
+
+    /// Validate that this envelope's version matches the local
+    /// `PROTOCOL_VERSION`. Callers should run this on every
+    /// inbound decode before trusting the payload — a version
+    /// mismatch means the peer has a different schema and
+    /// individual field reads might be silently wrong.
+    pub fn expect_current_version(&self) -> Result<(), ProtocolVersionMismatch> {
+        if self.protocol_version == PROTOCOL_VERSION {
+            Ok(())
+        } else {
+            Err(ProtocolVersionMismatch {
+                wire: self.protocol_version,
+                local: PROTOCOL_VERSION,
+            })
+        }
     }
 
     pub fn decode_payload<T: for<'de> serde::Deserialize<'de>>(&self) -> anyhow::Result<T> {
@@ -631,6 +704,37 @@ pub const EVENT_TEXT_INJECT_MAX_BYTES: usize = 2048;
 /// recognize the cap and paginate if they really need more.
 pub const TASK_LIST_FULL_MAX_LIMIT: u32 = 50;
 
+/// Grace window the daemon's `cli.assign` handler waits for a
+/// `task.accept` ack from the worker before treating the dispatch
+/// as failed. Tuned for the observed claude-sdk accept latency
+/// (send_accept fires BEFORE acquiring client_lock — see
+/// `orchestrator-py/worker.py::run_task`, so the worker's round-
+/// trip is essentially "read envelope + write frame" for healthy
+/// workers, well under 1s). 5s gives ~5× headroom for a loaded
+/// machine, TLS handshake during a daemon reconnect, or a worker
+/// that's momentarily CPU-bound on an in-flight process_response
+/// from the prior task.
+///
+/// On timeout, `SocketServer::spawn_accept_watchdog` reverts the
+/// task (see `AppState::revert_assignment_on_accept_timeout`) and
+/// emits `task.accept.timeout` + either `task.reassign` (retries
+/// remain) or `task.accept_failed` (retries exhausted).
+pub const ACCEPT_ACK_TIMEOUT_SECS: u64 = 5;
+
+/// Maximum `task.assign` dispatches the daemon's watchdog allows
+/// before moving a task to `TaskState::AcceptFailed` — i.e., after
+/// this many accept-ack timeouts the task is parked as an
+/// infrastructure failure and no longer auto-reverts to `Pending`.
+/// Counted on `Task.accept_attempts`, which persists across daemon
+/// restart so a worker in a restart loop can't get infinite free
+/// retries.
+///
+/// 3 is the reasonable floor: enough to absorb one transient
+/// reconnect window + one operator-observed reassignment + one
+/// final infra failure. Configurable in a follow-up if per-project
+/// tuning proves needed.
+pub const MAX_ACCEPT_ATTEMPTS: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliAssign {
     pub task_id: Uuid,
@@ -722,6 +826,38 @@ pub struct CliMemoryGet {
     pub project: String,
     #[serde(default)]
     pub file_names: Option<Vec<String>>,
+}
+
+/// Payload for `cli.memory.append`.
+///
+/// Appends `text` to the named file inside the project's Memory Hub.
+/// The daemon creates the file if it doesn't exist. `file_name` must
+/// be a leaf basename — names with `.`, `..`, path separators, or NUL
+/// bytes are rejected with a `cli.error`. Payload size is bounded at
+/// `MEMORY_APPEND_MAX_BYTES` (16 KiB, defined in `daemon::memory`) to
+/// keep any single call predictable; callers that need larger notes
+/// should split them across multiple appends or (better) write them
+/// to a dedicated hub file via the `memory::link_agent_memory` path.
+///
+/// Primary intended caller: the orchestrator's `memory_append` MCP
+/// tool, used to promote a noteworthy finding into the project's hub
+/// for future cross-agent reads. The complementary *automatic* write
+/// path is `daemon::memory::auto_distill_task_completion`, invoked
+/// from the `task.complete` handler — no caller action needed for
+/// basic distillation.
+///
+/// Response shape (on success):
+///   {"project": <name>, "file_name": <basename>,
+///    "path": <absolute-path>, "bytes_written": <int>}
+///
+/// The `path` is for diagnosis only; the caller is NOT expected to
+/// `open()` that path themselves — hub files live under the data
+/// directory and are meant to be accessed via `memory.get`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliMemoryAppend {
+    pub project: String,
+    pub file_name: String,
+    pub text: String,
 }
 
 /// Payload for `cli.worker.response.get`. Retrieves the full text of
@@ -862,5 +998,73 @@ mod tests {
         assert_eq!(decoded.summary.as_deref(), Some("just a summary"));
         assert_eq!(decoded.details, None);
         assert_eq!(decoded.output, None);
+    }
+
+    // ---- protocol version gate ----
+    //
+    // Pins the behavior the drift-detector + cross-language tests
+    // rely on. Sibling test on the Python side is in
+    // `orchestrator-py/test_protocol_drift.py`. Sibling test in
+    // the wrapper crate (wrapper/src/protocol.rs) mirrors these.
+
+    #[test]
+    fn envelope_new_stamps_current_protocol_version() {
+        let env = Envelope::new(MSG_TASK_ACCEPT, &serde_json::json!({})).expect("build");
+        assert_eq!(env.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn envelope_expect_current_version_ok_on_match() {
+        let env = Envelope::new(MSG_TASK_ACCEPT, &serde_json::json!({})).expect("build");
+        assert!(env.expect_current_version().is_ok());
+    }
+
+    #[test]
+    fn envelope_expect_current_version_errors_on_mismatch() {
+        // Synthesize an envelope stamped with a future version —
+        // what this side would see from a peer running a newer
+        // schema. Must surface ProtocolVersionMismatch cleanly.
+        let mut env = Envelope::new(MSG_TASK_ACCEPT, &serde_json::json!({})).expect("build");
+        env.protocol_version = PROTOCOL_VERSION + 1;
+        let err = env.expect_current_version().expect_err("mismatch");
+        assert_eq!(err.wire, PROTOCOL_VERSION + 1);
+        assert_eq!(err.local, PROTOCOL_VERSION);
+        // Display format should name both sides so log grepping
+        // can pick out the mismatch.
+        let s = format!("{err}");
+        assert!(s.contains("wire="), "display shows wire: {s}");
+        assert!(s.contains("local="), "display shows local: {s}");
+    }
+
+    #[test]
+    fn envelope_deserialize_pre_gate_envelope_defaults_to_current_version() {
+        // An old peer (or queued outbox frame) that predates the
+        // protocol_version field wrote the envelope without it.
+        // Must parse and default to the current version so
+        // `expect_current_version` passes. This is the back-compat
+        // guarantee the gate rests on.
+        let wire = serde_json::json!({
+            "type": MSG_TASK_ACCEPT,
+            "correlation_id": "00000000-0000-0000-0000-000000000001",
+            "payload": {}
+        });
+        let env: Envelope = serde_json::from_value(wire).expect("parse pre-gate");
+        assert_eq!(env.protocol_version, PROTOCOL_VERSION);
+        assert!(env.expect_current_version().is_ok());
+    }
+
+    #[test]
+    fn envelope_serialize_includes_protocol_version() {
+        // Round-trip: what goes on the wire explicitly carries
+        // `protocol_version` so a NEW peer receiving from us
+        // can verify. If serde ever starts skipping the field
+        // (e.g. somebody adds `skip_serializing_if`), this test
+        // catches it.
+        let env = Envelope::new(MSG_TASK_ACCEPT, &serde_json::json!({})).expect("build");
+        let s = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            s.contains("\"protocol_version\":"),
+            "wire format must include protocol_version field: {s}"
+        );
     }
 }

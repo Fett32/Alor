@@ -32,4 +32,9 @@ jobs:
           pip install -r orchestrator-py/requirements.txt
 
       - name: Run test scripts
+        # PYTHON=python tells run_tests.sh to reuse the setup-python interpreter
+        # (which already has requirements.txt installed above) instead of
+        # provisioning its own .venv.
+        env:
+          PYTHON: python
         run: ./orchestrator-py/run_tests.sh

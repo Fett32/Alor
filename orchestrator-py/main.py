@@ -12,7 +12,10 @@ import os
 import signal
 import sys
 import time
+import traceback
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -21,11 +24,22 @@ import daemon
 import tools
 from common import (
     C_CYAN, C_DIM, C_RED, C_RESET,
-    banner, process_response, read_line,
+    banner, process_response, read_line, reset_assume_paste_time,
 )
 from alor_footer import print_footer
 from tool_gate import make_gate
 
+# `[1m]` is a Claude Code CLI variant-ID suffix (documented in the
+# bundled CLI alongside `-fast`, `-1024k`, `-200k`, dated snapshots).
+# It selects the 1M-context routing of the public model — NOT a stray
+# context-window notation that leaked into the id. The Agent SDK's
+# bundled CLI parses the suffix and forwards the correct beta headers;
+# passed through raw to the Anthropic REST API it would 404, but we
+# never do — every call in this codebase goes through the CLI bundle.
+# Verified live: `claude --model "claude-opus-4-7[1m]" --print "…"`
+# round-trips a response. See also `alor_footer.py` module docstring
+# ("Alor runs [1m]-context models everywhere"). Codex-alor audit #7
+# flagged this as malformed; it is not.
 DEFAULT_MODEL = os.environ.get("ALOR_ORCHESTRATOR_MODEL", "claude-opus-4-7[1m]")
 PROMPT_PATH = Path(os.environ["HOME"]) / ".config" / "alor" / "orchestrator_prompt.md"
 
@@ -232,16 +246,179 @@ def format_event_for_agent(evt: daemon.Event) -> str | None:
     return None
 
 
+# ---- TurnRunner ------------------------------------------------------------
+#
+# Owns the SDK interaction. Serializes query + process_response turns
+# internally so callers never hold an external `client_lock` around the
+# SDK client — they `await runner.submit(text)` and get back a future
+# that resolves when THEIR turn completes.
+#
+# Pre-fix, the orch held a shared `asyncio.Lock` around every
+# `client.query(...) + process_response(...)` pair: Fett's interactive
+# turn, the greet-turn at startup, /reset, and event injection all
+# contended on the same lock. Mid-turn worker events (`task.completed`,
+# `worker.orch_response`, etc.) couldn't be queued into the SDK until
+# the current turn released the lock. For a long Fett turn that meant
+# the SDK didn't see the event in its next turn boundary — observable
+# as "orch doesn't know the worker finished until Fett types something
+# else."
+#
+# After fix, event_watcher just submits each injection to the runner
+# queue and moves on (doesn't even need to await — fire-and-forget is
+# fine for telemetry). Queue is FIFO; Fett's interactive turns and
+# event injections interleave based on arrival order. `/reset` still
+# needs mutual exclusion with turn execution, so the runner exposes
+# `reset_client()` which acquires the turn-executing lock internally.
+
+@dataclass
+class _Turn:
+    """One queued SDK turn awaiting the runner."""
+    text: str
+    # Optional callback invoked with each assistant TextBlock; None
+    # means process_response's default print path. Used by the
+    # capture-last-assistant pattern if callers need it later.
+    on_text: Callable[[str], None] | None
+    # Short label for the footer / diagnostic log.
+    label: str
+    # Resolved by the runner when the turn completes (set_result on
+    # success, set_exception on any raise).
+    future: asyncio.Future
+
+
+class TurnRunner:
+    """Serialize SDK query + process_response turns behind an internal
+    queue. Callers submit without contending; events and Fett input
+    both flow through the same FIFO.
+
+    Contract:
+      * `submit(text)` returns a future that resolves when the turn's
+        ResultMessage arrives (or with an exception if the turn
+        raised). Callers who need to block until completion do
+        `await (await runner.submit(text))`. Callers who don't care
+        (event injection) can just `await runner.submit(text)` and
+        drop the future on the floor.
+      * `reset_client()` waits for the current turn to finish, then
+        runs `disconnect/connect` with no turns in flight. Queued
+        turns resume after reset completes.
+      * `stop()` drains the queue by injecting a sentinel, waits for
+        the worker task to exit. Turns queued after stop() is called
+        will hang on their future — only call on shutdown.
+    """
+
+    def __init__(
+        self,
+        client: ClaudeSDKClient,
+        totals: dict[str, int],
+        cost: list[float],
+    ) -> None:
+        self._client = client
+        self._totals = totals
+        self._cost = cost
+        self._queue: asyncio.Queue[_Turn | None] = asyncio.Queue()
+        # Held by the runner worker only WHILE a turn is executing.
+        # reset_client acquires this externally to pause the worker
+        # between turns — guarantees the SDK client isn't mid-turn
+        # when we disconnect/connect it.
+        self._turn_executing = asyncio.Lock()
+        self._stopped = False
+        self._worker_task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        """Launch the background worker. Idempotent within one
+        lifecycle — calling twice is a bug but won't double-spawn
+        since we guard on the existing task."""
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(
+                self._run(), name="turn_runner"
+            )
+
+    async def submit(
+        self,
+        text: str,
+        *,
+        on_text: Callable[[str], None] | None = None,
+        label: str = "turn",
+    ) -> asyncio.Future:
+        """Enqueue a turn. Returns a future that resolves when the
+        turn completes. Never blocks on the SDK — only on the queue
+        put, which is bounded only by memory.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        await self._queue.put(
+            _Turn(text=text, on_text=on_text, label=label, future=future)
+        )
+        return future
+
+    async def reset_client(self) -> None:
+        """Disconnect + reconnect the SDK client. Acquires the turn-
+        executing lock so it waits for any in-flight turn to finish
+        before tearing down; queued turns stay queued and resume
+        after reconnect.
+        """
+        async with self._turn_executing:
+            await self._client.disconnect()
+            await self._client.connect()
+
+    async def stop(self) -> None:
+        """Signal the worker to exit and wait for it."""
+        self._stopped = True
+        # Sentinel so a worker parked on queue.get() wakes up.
+        await self._queue.put(None)
+        if self._worker_task is not None:
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
+
+    async def _run(self) -> None:
+        while not self._stopped:
+            t = await self._queue.get()
+            if t is None:  # sentinel
+                return
+            async with self._turn_executing:
+                try:
+                    await self._client.query(t.text)
+                    await process_response(
+                        self._client,
+                        self._totals,
+                        self._cost,
+                        on_text=t.on_text,
+                    )
+                    if not t.future.done():
+                        t.future.set_result(None)
+                except asyncio.CancelledError:
+                    if not t.future.done():
+                        t.future.cancel()
+                    raise
+                except Exception as e:
+                    # Log with traceback so SDK-side bugs don't hide
+                    # behind the one-line caller log. Caller's
+                    # `await future` re-raises.
+                    print(
+                        f"{C_RED}[turn_runner {t.label} error] "
+                        f"{e!r}{C_RESET}\n"
+                        f"{C_DIM}{traceback.format_exc()}{C_RESET}"
+                    )
+                    if not t.future.done():
+                        t.future.set_exception(e)
+
+
 async def event_watcher(
     stop: asyncio.Event,
-    client: ClaudeSDKClient,
-    client_lock: asyncio.Lock,
+    runner: TurnRunner,
+    session_start: float,
     totals: dict[str, int],
     cost: list[float],
-    session_start: float,
 ) -> None:
-    """Print daemon events and inject interesting ones into the orch SDK client."""
-    async def consume():
+    """Print daemon events; submit injectable ones to the turn runner.
+
+    Runs the footer after each injected turn completes — kept on the
+    event-watcher side (not the runner's) so footer output stays
+    co-located with the event it followed.
+    """
+    async def consume() -> None:
         async for evt in daemon.event_stream():
             if stop.is_set():
                 break
@@ -249,15 +426,31 @@ async def event_watcher(
             injected = format_event_for_agent(evt)
             if injected is None:
                 continue
+            # Fire into the runner queue. Awaiting submit() is just
+            # the queue-put; this returns essentially instantly even
+            # if the runner is mid-turn, unblocking event_watcher to
+            # pull the next event. The turn runner processes the
+            # injection when it's that turn's slot in the FIFO.
             try:
-                async with client_lock:
-                    await client.query(injected)
-                    await process_response(client, totals, cost)
-                print_footer(session_start, cost[0], totals)
+                fut = await runner.submit(injected, label="event")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                print(f"{C_RED}[event inject error] {e}{C_RESET}")
+                print(f"{C_RED}[event submit failed] {e!r}{C_RESET}")
+                continue
+            # Separately await the turn-complete signal so we can
+            # print the footer in the right order. If the turn
+            # raises, the runner already logged; we just skip the
+            # footer.
+            try:
+                await fut
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+            print_footer(session_start, cost[0], totals)
 
-    task = asyncio.create_task(consume())
+    task = asyncio.create_task(consume(), name="event_watcher_consume")
     await stop.wait()
     task.cancel()
     try:
@@ -277,6 +470,18 @@ async def main() -> int:
         if len(argv) < 2:
             sys.exit("--resume requires a session id")
         resume_session = argv[1]
+
+    # Restore tmux paste-time heuristic on our own session. alor-wrapper
+    # sets `assume-paste-time 0` on every managed session (needed for
+    # worker-side BEGIN/END framing to see line-by-line reads), but that
+    # breaks Fett's interactive multi-line pastes into the orch pane —
+    # each LF submits separately instead of landing as one message. The
+    # orchestrator never receives framed sends over tmux (events arrive
+    # via the daemon socket, not the pane), so it can opt out of the
+    # wrapper default. See common.py::reset_assume_paste_time for the
+    # full rationale. Best-effort: silently skipped when not running
+    # inside tmux (e.g. a dev running `python main.py` bare).
+    reset_assume_paste_time("alor-orchestrator")
 
     system_prompt = load_system_prompt()
     model = DEFAULT_MODEL
@@ -336,7 +541,6 @@ async def main() -> int:
     session_start = time.monotonic()
     totals: dict[str, int] = {}
     cost_accumulator = [0.0]
-    client_lock = asyncio.Lock()
     event_task: asyncio.Task | None = None
 
     # patch_stdout makes every `print` go ABOVE the prompt_toolkit input
@@ -345,26 +549,37 @@ async def main() -> int:
     try:
         with patch_stdout(raw=True):
             async with ClaudeSDKClient(options=options) as client:
+                # All SDK turns (greet, Fett interactive input, event
+                # injection, /reset) go through one serializing runner.
+                # Replaces the prior shared `client_lock` — see the
+                # TurnRunner docstring for the motivation.
+                runner = TurnRunner(client, totals, cost_accumulator)
+                runner.start()
+
                 event_task = asyncio.create_task(
                     event_watcher(
-                        stop_events, client, client_lock, totals, cost_accumulator, session_start
-                    )
+                        stop_events, runner, session_start, totals, cost_accumulator,
+                    ),
+                    name="event_watcher",
                 )
                 try:
-                    async with client_lock:
-                        greet_prompt = (
-                            "Resumed. Acknowledge in one short line that you're back online and "
-                            "ready to continue from where the prior session left off. "
-                            "Do not list your tools."
-                            if resume_session
-                            else "Introduce yourself in one short line so Fett knows you're online and ready. "
-                            "Do not list your tools."
-                        )
-                        await client.query(greet_prompt)
-                        await process_response(client, totals, cost_accumulator)
+                    greet_prompt = (
+                        "Resumed. Acknowledge in one short line that you're back online and "
+                        "ready to continue from where the prior session left off. "
+                        "Do not list your tools."
+                        if resume_session
+                        else "Introduce yourself in one short line so Fett knows you're online and ready. "
+                        "Do not list your tools."
+                    )
+                    greet_fut = await runner.submit(greet_prompt, label="greet")
+                    await greet_fut
                     print_footer(session_start, cost_accumulator[0], totals)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
-                    print(f"{C_RED}[greet error] {e}{C_RESET}")
+                    # Runner already logged with traceback; this is the
+                    # caller-side summary.
+                    print(f"{C_RED}[greet error] {e!r}{C_RESET}")
 
                 while True:
                     line = await read_line(f"{C_CYAN}orch>{C_RESET} ")
@@ -380,24 +595,50 @@ async def main() -> int:
                         print_footer(session_start, cost_accumulator[0], totals)
                         continue
                     if text == "/reset":
-                        async with client_lock:
-                            await client.disconnect()
-                            await client.connect()
-                        print("[conversation reset]")
+                        # Goes through the runner so disconnect /
+                        # connect is mutually exclusive with any in-
+                        # flight turn (event injection mid-reset
+                        # would blow up the SDK client).
+                        try:
+                            await runner.reset_client()
+                            print("[conversation reset]")
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            print(
+                                f"{C_RED}[reset failed] {e!r}{C_RESET}\n"
+                                f"{C_DIM}{traceback.format_exc()}{C_RESET}"
+                            )
                         continue
 
+                    # Interactive turn — submit + await the future.
+                    # submit() just enqueues; the await is what blocks
+                    # until the ResultMessage arrives. During the
+                    # await, event injections can interleave in the
+                    # FIFO, but they run in isolation from each other
+                    # and from Fett's turn — no mid-turn races on
+                    # totals/cost or the receive_response iterator.
                     try:
-                        async with client_lock:
-                            await client.query(text)
-                            await process_response(client, totals, cost_accumulator)
+                        turn_fut = await runner.submit(text, label="fett")
+                        await turn_fut
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as e:
-                        print(f"{C_RED}[error] {e}{C_RESET}")
+                        print(f"{C_RED}[error] {e!r}{C_RESET}")
 
                     print_footer(session_start, cost_accumulator[0], totals)
     finally:
         stop_events.set()
         if event_task is not None:
             await event_task
+        # runner is only defined if the inner `async with` entered — in
+        # the happy path it's always defined. On a setup failure before
+        # the `with`, the NameError would bubble but we're already in
+        # an error state. Guard anyway.
+        try:
+            await runner.stop()  # type: ignore[possibly-undefined]
+        except (NameError, AttributeError):
+            pass
 
     return 0
 

@@ -1,0 +1,247 @@
+# Canonical IPC protocol spec for Alor.
+#
+# Source of truth for every message kind spoken across the
+# Tauri daemon, the Rust `alor-wrapper` binary, and the Python
+# orchestrator / claude-sdk worker. Hand-maintained — the
+# drift-detector tests (`orchestrator-py/test_protocol_drift.py`
+# + `commands.rs::tests::protocol_spec_*`) enforce that every
+# implementation stays consistent with this file.
+#
+# ## Why not protobuf / full codegen?
+#
+# The 2026-04-20 audit called for "one source of truth +
+# generated bindings." Full payload codegen across three
+# languages is a multi-PR effort (wire-format migration + a
+# runtime generator + cross-language serde compatibility). This
+# file delivers the nearer-term half: a single CATALOG of
+# message kinds + protocol version, with tests that fail loud
+# on drift. Payload structs stay hand-written per language but
+# must match on name + wire shape. A follow-up RFC can migrate
+# to prost / schemars / datamodel-code-generator once the
+# version-gate here proves stable.
+
+# ---- protocol_version ----
+#
+# Every Envelope carries this. Senders stamp it unconditionally.
+# Receivers reject envelopes whose `protocol_version` != this
+# value. Back-compat: serde `default = "default_protocol_version"`
+# on Rust (+ Python dict.get with default) means envelopes
+# written before this field existed parse as version=1 and pass.
+#
+# Bumping this number is the forcing function: any schema change
+# (new MSG_* kind, new field on an existing payload, wire format
+# change) MUST bump the version. Mismatched peers then fail-loud
+# on first envelope instead of silently drifting.
+protocol_version: 1
+
+# ---- message kinds ----
+#
+# Every MSG_* constant in any implementation file must appear
+# here. The drift-detector tests enforce this bidirectionally:
+#   - every entry in this file has a matching `pub const
+#     MSG_FOO: &str = "value"` on the participant(s) listed;
+#   - every `pub const MSG_*` in either Rust protocol.rs or
+#     Python agent_client.py has a matching entry here.
+#
+# `participants` lists which binaries define + use the constant.
+# Values: "tauri" (src-tauri/src/wrapper/protocol.rs),
+# "wrapper" (wrapper/src/protocol.rs), "python"
+# (orchestrator-py/agent_client.py). A constant may be in any
+# subset — the Rust-tauri side is typically the superset.
+
+messages:
+
+  # ---- wire protocol base ----
+  - name: MSG_REGISTER
+    value: wrapper.register
+    participants: [tauri, wrapper, python]
+    description: Wrapper/worker announces its agent_id to the daemon.
+
+  - name: MSG_SHUTDOWN
+    value: daemon.shutdown
+    participants: [tauri, wrapper, python]
+    description: Daemon → wrapper/worker shutdown notice.
+
+  - name: MSG_ERROR
+    value: wrapper.error
+    participants: [tauri, wrapper, python]
+    description: Wrapper-side error telemetry broadcast.
+
+  - name: MSG_EVENT
+    value: event
+    participants: [tauri]
+    description: Daemon → CLI-event-stream subscriber broadcast wrapper.
+
+  # ---- task lifecycle ----
+  - name: MSG_TASK_ASSIGN
+    value: task.assign
+    participants: [tauri, wrapper, python]
+    description: Daemon → worker task dispatch.
+
+  - name: MSG_TASK_ACCEPT
+    value: task.accept
+    participants: [tauri, wrapper, python]
+    description: Worker → daemon "I own this task now".
+
+  - name: MSG_TASK_COMPLETE
+    value: task.complete
+    participants: [tauri, wrapper, python]
+    description: Worker → daemon completion + summary/details.
+
+  - name: MSG_TASK_BLOCKED
+    value: task.blocked
+    participants: [tauri, python]
+    description: Worker → daemon "can't proceed"; frees the slot.
+
+  - name: MSG_TASK_PROPOSE
+    value: task.propose
+    participants: [tauri]
+    description: Worker → daemon proposal-for-approval (HITL flow).
+
+  # ---- status / heartbeat ----
+  - name: MSG_STATUS_REQUEST
+    value: status.request
+    participants: [wrapper, python]
+    description: Daemon → worker liveness probe.
+
+  - name: MSG_STATUS_RESPONSE
+    value: status.response
+    participants: [tauri, wrapper, python]
+    description: Worker → daemon heartbeat/liveness reply.
+
+  # ---- user / worker side-channels ----
+  - name: MSG_USER_INTERVENTION
+    value: user.intervention
+    participants: [tauri, wrapper]
+    description: Wrapper → daemon "user typed into pane during task".
+
+  - name: MSG_WORKER_USER_INPUT
+    value: worker.user_input
+    participants: [tauri, python]
+    description: Worker-pane stdin forwarded to orch as event.
+
+  - name: MSG_WORKER_ORCH_RESPONSE
+    value: worker.orch_response
+    participants: [tauri, python]
+    description: Worker's reply to an orch agent_send_message.
+
+  - name: MSG_WORKER_FRAME_WEDGED
+    value: worker.frame_wedged
+    participants: [tauri, python]
+    description: Worker stdin-framing wedge telemetry.
+
+  # ---- CLI RPC (orch → daemon) ----
+  - name: MSG_CLI_RESPONSE
+    value: cli.response
+    participants: [tauri]
+    description: Daemon → orch CLI response envelope.
+
+  - name: MSG_CLI_ERROR
+    value: cli.error
+    participants: [tauri]
+    description: Daemon → orch CLI error envelope (coded).
+
+  - name: MSG_CLI_STATUS
+    value: cli.status
+    participants: [tauri]
+    description: Orch → daemon agent_list / status query.
+
+  - name: MSG_CLI_ASSIGN
+    value: cli.assign
+    participants: [tauri]
+    description: Orch → daemon assign task to agent.
+
+  - name: MSG_CLI_SPAWN
+    value: cli.spawn
+    participants: [tauri]
+    description: Orch → daemon spawn agent.
+
+  - name: MSG_CLI_DELETE
+    value: cli.delete
+    participants: [tauri]
+    description: Orch → daemon delete template instance.
+
+  - name: MSG_CLI_KILL
+    value: cli.kill
+    participants: [tauri]
+    description: Orch → daemon kill a specific agent.
+
+  - name: MSG_CLI_EVENT_STREAM
+    value: cli.event.stream
+    participants: [tauri]
+    description: Orch → daemon subscribe to the broadcast event stream.
+
+  - name: MSG_CLI_AGENT_ENSURE_RUNNING
+    value: cli.agent.ensure_running
+    participants: [tauri]
+    description: Orch → daemon idempotent spawn-if-not-running.
+
+  - name: MSG_CLI_AGENT_SEND_MESSAGE
+    value: cli.agent.send_message
+    participants: [tauri]
+    description: Orch → daemon send a message to an agent's pane.
+
+  - name: MSG_CLI_MEMORY_GET
+    value: cli.memory.get
+    participants: [tauri]
+    description: Orch → daemon fetch memory hub files.
+
+  - name: MSG_CLI_MEMORY_APPEND
+    value: cli.memory.append
+    participants: [tauri]
+    description: Orch → daemon append a curated note to a project hub file. Companion to the automatic `task.complete` → `automation_log.md` distillation; see `src-tauri/src/daemon/memory.rs`.
+
+  - name: MSG_CLI_PROJECT_GET
+    value: cli.project.get
+    participants: [tauri]
+    description: Orch → daemon load project profile.
+
+  - name: MSG_CLI_PROJECT_LIST
+    value: cli.project.list
+    participants: [tauri]
+    description: Orch → daemon list project profiles.
+
+  - name: MSG_CLI_PROJECT_SAVE
+    value: cli.project.save
+    participants: [tauri]
+    description: Orch → daemon save/merge project profile.
+
+  - name: MSG_CLI_TASK_CREATE
+    value: cli.task.create
+    participants: [tauri]
+    description: Orch → daemon create task.
+
+  - name: MSG_CLI_TASK_GET
+    value: cli.task.get
+    participants: [tauri]
+    description: Orch → daemon fetch task by id.
+
+  - name: MSG_CLI_TASK_LIST
+    value: cli.task.list
+    participants: [tauri]
+    description: Orch → daemon list tasks.
+
+  - name: MSG_CLI_TASK_CANCEL
+    value: cli.task.cancel
+    participants: [tauri]
+    description: Orch → daemon cancel task.
+
+  - name: MSG_CLI_TASK_COMPLETE
+    value: cli.task.complete
+    participants: [tauri]
+    description: Orch → daemon retroactive close-out (summary only).
+
+  - name: MSG_CLI_TASK_INTERVENTION_CLEAR
+    value: cli.task.intervention.clear
+    participants: [tauri]
+    description: Orch → daemon clear user_intervened flag.
+
+  - name: MSG_CLI_WORKER_RESPONSE_GET
+    value: cli.worker.response.get
+    participants: [tauri]
+    description: Orch → daemon fetch cached worker_response text.
+
+  - name: MSG_CLI_INTEGRATIONS_GET
+    value: cli.integrations.get
+    participants: [tauri]
+    description: Orch → daemon fetch configured integrations.

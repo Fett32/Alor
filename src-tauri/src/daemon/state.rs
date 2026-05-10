@@ -41,6 +41,16 @@ pub enum TaskState {
     Proposed,
     /// Human has approved the proposal; agent is now applying the changes.
     Staged,
+    /// `task.accept` ack didn't arrive within the daemon's accept-
+    /// handshake window after N dispatch retries (see
+    /// `wrapper::protocol::MAX_ACCEPT_ATTEMPTS`). Terminal-ish —
+    /// distinguishes a daemon-side infrastructure failure (dropped
+    /// accept frame, worker crashed mid-handshake, socket stall
+    /// during reconnect, Rust-side panic in the accept handler) from
+    /// operator cancellation (`Cancelled`) or agent refusal
+    /// (`Rejected`). Operator can rescue via `Cancelled` close-out
+    /// if needed; auto-retry is not attempted past this state.
+    AcceptFailed,
 }
 
 impl TaskState {
@@ -53,6 +63,7 @@ impl TaskState {
                 | TaskState::Rejected
                 | TaskState::TimedOut
                 | TaskState::Stale
+                | TaskState::AcceptFailed
         )
     }
 
@@ -82,7 +93,12 @@ impl TaskState {
             (Stale, Cancelled)
             | (Completed, Cancelled)
             | (Rejected, Cancelled)
-            | (TimedOut, Cancelled) => return true,
+            | (TimedOut, Cancelled)
+            // AcceptFailed is terminal (see `is_terminal`), but we
+            // allow operator finalize-to-Cancelled the same way the
+            // other infra-terminal states do — lets the UI tidy up
+            // a board row without fighting the state machine.
+            | (AcceptFailed, Cancelled) => return true,
             _ => {}
         }
         if self.is_terminal() {
@@ -96,6 +112,18 @@ impl TaskState {
                 | (Assigned, Rejected)
                 | (Assigned, Cancelled)
                 | (Assigned, Stale)
+                // Accept-handshake watchdog paths (task 2026-04-20
+                // follow-up). Assigned → Pending = revert so the
+                // orchestrator can redispatch after an accept
+                // timeout. Assigned → AcceptFailed = retries
+                // exhausted, park as terminal-ish infrastructure
+                // failure (distinct from Rejected/Cancelled).
+                // assigned_to is cleared in `AppState::
+                // revert_assignment_on_accept_timeout` since a
+                // reverted task no longer "belongs to" the prior
+                // agent.
+                | (Assigned, Pending)
+                | (Assigned, AcceptFailed)
                 | (Accepted, Proposed)
                 | (Accepted, Completed)
                 | (Accepted, Blocked)
@@ -190,6 +218,43 @@ pub struct Task {
     /// TASK BRIEF (key files, docs) that is prepended when dispatching.
     #[serde(default)]
     pub project: Option<String>,
+    /// Number of times the daemon has dispatched `task.assign` for
+    /// this task and failed to see a `task.accept` ack within the
+    /// handshake timeout. Incremented by the accept watchdog on each
+    /// timeout; when it reaches `wrapper::protocol::MAX_ACCEPT_ATTEMPTS`
+    /// the task is moved to `TaskState::AcceptFailed` instead of
+    /// bouncing back to `Pending` for another retry.
+    ///
+    /// Persisted on Task so that a daemon restart mid-retry-cycle
+    /// doesn't reset the counter and allow unbounded retries; also
+    /// lets `task_get` expose the attempt count so operators can see
+    /// why a task is stuck.
+    #[serde(default)]
+    pub accept_attempts: u32,
+}
+
+/// Return value for `AppState::revert_assignment_on_accept_timeout`.
+/// Carries enough state for the watchdog caller to emit the right
+/// event shape (`task.reassign` vs `task.accept_failed`) without
+/// re-reading the task under the lock.
+///
+/// Not serialized — this is an in-process RPC between the watchdog
+/// and the event broadcaster.
+#[derive(Debug, Clone)]
+pub struct AcceptRevertOutcome {
+    /// Where the task landed: `Pending` if retries remain,
+    /// `AcceptFailed` on exhaustion.
+    pub new_state: TaskState,
+    /// Post-increment attempt count (equal to `max_attempts` when
+    /// exhausted).
+    pub attempts: u32,
+    /// True iff `attempts >= max_attempts` — caller picks the
+    /// terminal event name off this flag.
+    pub exhausted: bool,
+    /// Agent the task was assigned to before the revert (cleared
+    /// from `task.assigned_to` inside the revert). Needed for the
+    /// event payload.
+    pub prior_agent: Option<String>,
 }
 
 /// Projection of `Task` used by `cli.task.list` when the caller passes
@@ -326,6 +391,7 @@ impl Task {
             summary: None,
             details: None,
             project: None,
+            accept_attempts: 0,
         }
     }
 
@@ -1331,8 +1397,109 @@ impl AppState {
         Ok(result)
     }
 
-    /// Count non-terminal, non-pending tasks assigned to an agent.
-    /// Used to enforce `max_concurrent` before dispatching.
+    /// Revert a task's assignment after the accept-handshake watchdog
+    /// timed out. Called from `SocketServer::spawn_accept_watchdog`
+    /// (see `wrapper/server/routing.rs`). Atomic: increments
+    /// `accept_attempts`, transitions the task, and clears
+    /// `assigned_to` under one lock so a concurrent `cli.assign`
+    /// can't race the revert.
+    ///
+    /// Policy:
+    ///   - If the incremented attempt count is still below
+    ///     `max_attempts`, bounce the task to `Pending` and leave
+    ///     it reassignable. The orchestrator observes the
+    ///     `task.reassign` event (emitted from the caller) and
+    ///     decides whether to re-dispatch.
+    ///   - If the incremented count hits `max_attempts`, park the
+    ///     task in `AcceptFailed` directly — skip the Pending
+    ///     bounce since we're done. Emit `task.accept_failed`
+    ///     from the caller.
+    ///
+    /// Returns an `AcceptRevertOutcome` so the caller can build the
+    /// right event payload without re-reading the task.
+    ///
+    /// Error cases:
+    ///   - Task not found → error (caller should treat as already-
+    ///     removed; skip the event emission).
+    ///   - Task NOT in Assigned state → error. Typical cause: the
+    ///     ack arrived concurrently and MSG_TASK_ACCEPT already
+    ///     transitioned it to Accepted. Caller logs at debug and
+    ///     skips the revert (normal race, not a bug).
+    pub fn revert_assignment_on_accept_timeout(
+        &self,
+        task_id: Uuid,
+        max_attempts: u32,
+    ) -> anyhow::Result<AcceptRevertOutcome> {
+        let mut s = self.inner.lock();
+        let task = s
+            .tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| anyhow::anyhow!("task {} not found", task_id))?;
+
+        if task.state != TaskState::Assigned {
+            anyhow::bail!(
+                "revert_assignment_on_accept_timeout: task {} is in state {:?}, not Assigned (likely a race with the ack)",
+                task_id,
+                task.state
+            );
+        }
+
+        task.accept_attempts = task.accept_attempts.saturating_add(1);
+        let attempts = task.accept_attempts;
+        let prior_agent = task.assigned_to.clone();
+        let exhausted = attempts >= max_attempts;
+
+        let next_state = if exhausted {
+            TaskState::AcceptFailed
+        } else {
+            TaskState::Pending
+        };
+        task.transition(next_state.clone())?;
+        // Reverted tasks no longer "belong to" the prior agent.
+        // Clearing here keeps `agent_active_task_count` honest so
+        // the slot doesn't stay at max_concurrent.
+        task.assigned_to = None;
+        task.updated_at = Utc::now();
+
+        drop(s);
+        self.save();
+        self.emit_event("tasks-changed");
+        self.emit_event("agents-changed");
+
+        Ok(AcceptRevertOutcome {
+            new_state: next_state,
+            attempts,
+            exhausted,
+            prior_agent,
+        })
+    }
+
+    /// Count tasks assigned to an agent that are actively consuming
+    /// the agent's concurrency slot. Used to enforce
+    /// `max_concurrent` before dispatching.
+    ///
+    /// Excluded states:
+    ///   - **Terminal** (Completed, Cancelled, Rejected, TimedOut,
+    ///     Stale, AcceptFailed): the agent is done with these.
+    ///   - **Pending**: not yet assigned to an agent (the filter
+    ///     above matches on `assigned_to == agent_id`, but a
+    ///     Pending task with a stale `assigned_to` shouldn't count
+    ///     either).
+    ///   - **Blocked** (2026-04-20, codex-alor audit fix):
+    ///     `task.blocked` is what the worker sends when its SDK
+    ///     turn raises an exception — the task is no longer being
+    ///     actively worked on. Keeping it counted would mean one
+    ///     bug in a worker permanently pegs a max_concurrent=1
+    ///     agent at capacity until the task is manually resolved
+    ///     (cancelled / reassigned). Excluding Blocked lets the
+    ///     slot accept new work while the blocked task waits for
+    ///     operator / reassignment. A task that later transitions
+    ///     `Blocked → Accepted` (legal per the state machine)
+    ///     would re-enter the active count — at that point
+    ///     max_concurrent is re-enforced. Future use-cases where
+    ///     Blocked SHOULD hold the slot (e.g., a proposal-
+    ///     approval gate) should introduce a distinct state
+    ///     rather than restoring the Blocked-counts semantics.
     pub fn agent_active_task_count(&self, agent_id: &str) -> usize {
         self.inner
             .lock()
@@ -1342,6 +1509,7 @@ impl AppState {
                 t.assigned_to.as_deref() == Some(agent_id)
                     && !t.state.is_terminal()
                     && t.state != TaskState::Pending
+                    && t.state != TaskState::Blocked
             })
             .count()
     }
@@ -2548,6 +2716,148 @@ mod tests {
             .clear_user_intervention(Uuid::new_v4())
             .expect_err("clearing an unknown task must error");
         assert!(err.to_string().contains("not found"));
+    }
+
+    // ------------------------------------------------------------------
+    // Accept-handshake watchdog: state-transition layer tests.
+    //
+    // The in-process side of the 2026-04-20 follow-up. See
+    // `SocketServer::register_and_spawn_accept_watchdog` in
+    // `wrapper/server/routing.rs` for the event-layer path that
+    // consumes these state transitions.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn accept_failed_is_terminal() {
+        assert!(TaskState::AcceptFailed.is_terminal());
+        // Parallel to Cancelled / Stale / TimedOut / Rejected — no
+        // resume-style escape hatch.
+        assert!(!TaskState::AcceptFailed.can_transition_to(&TaskState::Pending));
+        assert!(!TaskState::AcceptFailed.can_transition_to(&TaskState::Assigned));
+        assert!(!TaskState::AcceptFailed.can_transition_to(&TaskState::Accepted));
+        // But operators CAN finalize-to-Cancelled via the UI, same
+        // as other infra-terminal states.
+        assert!(TaskState::AcceptFailed.can_transition_to(&TaskState::Cancelled));
+    }
+
+    #[test]
+    fn assigned_to_pending_and_acceptfailed_are_legal_transitions() {
+        // Both edges were added for the accept-handshake watchdog;
+        // pin them explicitly so an unrelated refactor can't silently
+        // remove them.
+        assert!(TaskState::Assigned.can_transition_to(&TaskState::Pending));
+        assert!(TaskState::Assigned.can_transition_to(&TaskState::AcceptFailed));
+
+        // Sanity: the OTHER pre-existing Assigned edges must still
+        // work — the edit didn't accidentally delete any.
+        assert!(TaskState::Assigned.can_transition_to(&TaskState::Accepted));
+        assert!(TaskState::Assigned.can_transition_to(&TaskState::Rejected));
+        assert!(TaskState::Assigned.can_transition_to(&TaskState::Cancelled));
+        assert!(TaskState::Assigned.can_transition_to(&TaskState::Stale));
+    }
+
+    #[test]
+    fn revert_on_accept_timeout_below_cap_bounces_to_pending() {
+        let app_state = AppState::new();
+        let mut t = Task::new("accept revert", "test");
+        t.state = TaskState::Assigned;
+        t.assigned_to = Some("claude-alor".to_string());
+        let id = t.id;
+        app_state.add_task(t);
+
+        let outcome = app_state
+            .revert_assignment_on_accept_timeout(id, 3)
+            .expect("revert succeeds for Assigned task");
+
+        assert_eq!(outcome.new_state, TaskState::Pending);
+        assert_eq!(outcome.attempts, 1);
+        assert!(!outcome.exhausted);
+        assert_eq!(outcome.prior_agent.as_deref(), Some("claude-alor"));
+
+        let after = app_state.get_task(id).expect("still present");
+        assert_eq!(after.state, TaskState::Pending);
+        assert_eq!(after.assigned_to, None, "assigned_to must be cleared on revert");
+        assert_eq!(after.accept_attempts, 1);
+    }
+
+    #[test]
+    fn revert_on_accept_timeout_at_cap_parks_in_acceptfailed() {
+        // Second call with max=2 should exhaust and park, not bounce.
+        let app_state = AppState::new();
+        let mut t = Task::new("accept exhaust", "test");
+        t.state = TaskState::Assigned;
+        t.assigned_to = Some("claude-alor".to_string());
+        // Simulate a prior timeout having already ticked this once.
+        t.accept_attempts = 1;
+        let id = t.id;
+        app_state.add_task(t);
+
+        let outcome = app_state
+            .revert_assignment_on_accept_timeout(id, 2)
+            .expect("revert at cap succeeds");
+
+        assert_eq!(outcome.new_state, TaskState::AcceptFailed);
+        assert_eq!(outcome.attempts, 2);
+        assert!(outcome.exhausted);
+
+        let after = app_state.get_task(id).expect("still present");
+        assert_eq!(after.state, TaskState::AcceptFailed);
+        assert_eq!(after.assigned_to, None);
+        assert_eq!(after.accept_attempts, 2);
+    }
+
+    #[test]
+    fn revert_on_accept_timeout_rejects_non_assigned_task() {
+        // Common race shape: the ack arrived and MSG_TASK_ACCEPT
+        // transitioned the task to Accepted just before the watchdog
+        // timer fired. The revert call must refuse cleanly so the
+        // watchdog can log at debug and move on — NOT overwrite the
+        // successful accept.
+        let app_state = AppState::new();
+        let mut t = Task::new("accept race", "test");
+        t.state = TaskState::Accepted;
+        t.assigned_to = Some("claude-alor".to_string());
+        let id = t.id;
+        app_state.add_task(t);
+
+        let err = app_state
+            .revert_assignment_on_accept_timeout(id, 3)
+            .expect_err("revert must refuse non-Assigned task");
+        assert!(err.to_string().contains("not Assigned"));
+
+        // State untouched.
+        let after = app_state.get_task(id).expect("still present");
+        assert_eq!(after.state, TaskState::Accepted);
+        assert_eq!(after.accept_attempts, 0, "race must NOT increment attempts");
+    }
+
+    #[test]
+    fn revert_on_accept_timeout_missing_task_errors_cleanly() {
+        let app_state = AppState::new();
+        let err = app_state
+            .revert_assignment_on_accept_timeout(Uuid::new_v4(), 3)
+            .expect_err("revert on missing task must error");
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn accept_attempts_persists_via_serde_default() {
+        // Fresh Task serializes to 0, and an older snapshot lacking
+        // the field round-trips cleanly with default 0.
+        let t = Task::new("serde default", "test");
+        assert_eq!(t.accept_attempts, 0);
+
+        // Deserialize from JSON that OMITS the field (simulating a
+        // snapshot written by a pre-accept-watchdog build).
+        let older = format!(
+            r#"{{"id":"{}","title":"x","description":"y","state":"PENDING","created_at":"{}","updated_at":"{}","subtask_order":0,"user_intervened":false}}"#,
+            t.id,
+            chrono::Utc::now().to_rfc3339(),
+            chrono::Utc::now().to_rfc3339()
+        );
+        let parsed: Task = serde_json::from_str(&older)
+            .expect("older snapshot parses via serde(default)");
+        assert_eq!(parsed.accept_attempts, 0);
     }
 
     #[test]

@@ -12,10 +12,12 @@
 //!     (connect → lose pane / lose session → reconcile → recover
 //!     or get auto-flipped to disconnected).
 //!
-//! Tmux-free CI boxes are fine: every test that shells out to tmux
-//! gracefully skips with an eprintln! when `tmux -V` doesn't
-//! succeed. No-tmux environments simply see "test result: ok. N
-//! passed" with all the skipped ones still reported as passed.
+//! Tmux-hostile CI boxes and sandboxes are fine: every test that
+//! shells out to tmux gracefully skips (eprintln! + early return)
+//! when `common::tmux_runnable()` reports the environment can't
+//! actually create a tmux session. Environments that fail at the
+//! create-session step — not just the binary-present step — get a
+//! clear skip reason instead of an opaque panic.
 //!
 //! Unit tests that exercise `pub(crate)` helpers (`pane_exists`,
 //! `test_insert_pane`, etc.) intentionally remain in-file next to
@@ -25,24 +27,13 @@
 use alor_lib::{AppState, PaneManager, SocketServer};
 use tokio::process::Command;
 
-// ---------------------------------------------------------------------------
-// Test helpers (small + self-contained; duplicated from the in-file
-// test module where appropriate because Rust integration tests can't
-// share code with `#[cfg(test)] mod tests` without a dedicated
-// public module).
-// ---------------------------------------------------------------------------
+mod common;
 
-/// True if `tmux -V` runs successfully on PATH. When false, tests
-/// gracefully skip (eprintln! + early return) rather than failing on
-/// runners without tmux installed.
-async fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+// ---------------------------------------------------------------------------
+// Test helpers. The tmux-runnability probe lives in `tests/common/mod.rs`
+// so future integration tests can share it. The kill-session helper is
+// local because it takes a caller-supplied name (no shared state).
+// ---------------------------------------------------------------------------
 
 /// Kill a tmux session by name, exact-match target. Best-effort — we
 /// don't care about the exit status here, only that the session is
@@ -70,8 +61,11 @@ async fn kill_session(session: &str) {
 /// untouched.
 #[tokio::test]
 async fn reconcile_panes_adds_missing_pane_for_connected_agent_with_live_session() {
-    if !tmux_available().await {
-        eprintln!("tmux not available, skipping");
+    if !common::skip_if_tmux_not_runnable(
+        "reconcile_panes_adds_missing_pane_for_connected_agent_with_live_session",
+    )
+    .await
+    {
         return;
     }
     let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -91,19 +85,31 @@ async fn reconcile_panes_adds_missing_pane_for_connected_agent_with_live_session
     );
 
     // 2. Agent's own tmux session — long-running sleep so it stays
-    //    alive past the test tick.
-    let ok = Command::new("tmux")
+    //    alive past the test tick. The common::tmux_runnable guard
+    //    already proved session creation works in this env, so any
+    //    failure here is a test-specific bug worth surfacing rather
+    //    than silently skipping. Capture stderr in the panic message.
+    let out = Command::new("tmux")
         .args([
             "new-session", "-d", "-s", &agent_session, "sleep", "300",
         ])
         .output()
-        .await
-        .ok()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !ok {
-        kill_session(&main_session).await;
-        panic!("failed to create agent session {agent_session}");
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            kill_session(&main_session).await;
+            panic!(
+                "failed to create agent session {agent_session} \
+                 (tmux new-session exited {}): {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Err(e) => {
+            kill_session(&main_session).await;
+            panic!("failed to spawn tmux new-session for {agent_session}: {e}");
+        }
     }
 
     // 3. Register the agent as connected in AppState.
@@ -158,8 +164,11 @@ async fn reconcile_panes_adds_missing_pane_for_connected_agent_with_live_session
 
 #[tokio::test]
 async fn reconcile_panes_reports_zombie_for_connected_agent_without_session() {
-    if !tmux_available().await {
-        eprintln!("tmux not available, skipping");
+    if !common::skip_if_tmux_not_runnable(
+        "reconcile_panes_reports_zombie_for_connected_agent_without_session",
+    )
+    .await
+    {
         return;
     }
     let state = AppState::new();
@@ -188,23 +197,27 @@ async fn reconcile_panes_reports_zombie_for_connected_agent_without_session() {
 async fn reconcile_panes_omits_zombie_when_session_exists() {
     // Inverse: agent is connected AND its tmux session exists. Must
     // NOT appear in report.zombies.
-    if !tmux_available().await {
-        eprintln!("tmux not available, skipping");
+    if !common::skip_if_tmux_not_runnable("reconcile_panes_omits_zombie_when_session_exists").await
+    {
         return;
     }
     let state = AppState::new();
     let alive_id = format!("pm-alive-test-{}", uuid::Uuid::new_v4().simple());
     let session = format!("alor-{alive_id}");
-    let ok = Command::new("tmux")
+    // Guard already proved new-session works; treat a failure here as
+    // a test-specific bug, not a "skip with no clue" path.
+    let out = Command::new("tmux")
         .args(["new-session", "-d", "-s", &session, "sleep", "300"])
         .output()
-        .await
-        .ok()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !ok {
-        eprintln!("failed to create test session, skipping");
-        return;
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => panic!(
+            "failed to create test session {session} (exit {}): {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => panic!("failed to spawn tmux new-session for {session}: {e}"),
     }
 
     state
@@ -253,8 +266,11 @@ async fn reconcile_panes_skips_disconnected_agents_entirely() {
 /// startup + the `pane_reconcile` Tauri command do in production.
 #[tokio::test]
 async fn reconcile_panes_zombie_auto_clear_flips_state_via_mark_agent_zombie() {
-    if !tmux_available().await {
-        eprintln!("tmux not available, skipping");
+    if !common::skip_if_tmux_not_runnable(
+        "reconcile_panes_zombie_auto_clear_flips_state_via_mark_agent_zombie",
+    )
+    .await
+    {
         return;
     }
 

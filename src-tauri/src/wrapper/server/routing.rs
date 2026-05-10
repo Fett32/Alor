@@ -1,344 +1,87 @@
-/// Socket server for wrapper connections.
-///
-/// Listens on /tmp/alor/daemon.sock and handles:
-/// - wrapper.register — wrapper announces its agent_id
-/// - task.accept/complete/blocked — task state updates
-/// - status.response — heartbeat replies
-/// - cli.* — CLI commands (Phase 9)
-///
-/// Outbound messages (task.assign, status.request) are sent via the
-/// connection registry.
+//! Wrapper-protocol + CLI message routing.
+//!
+//! Split out of `server.rs` during the god-module decomposition.
+//! Owns the two big dispatch fns:
+//!
+//!   * `handle_message` — wrapper-protocol messages (task.accept,
+//!     task.complete, task.blocked, user.intervention, worker.*,
+//!     status.response, wrapper.error). Called from
+//!     `connection.rs`'s per-wrapper read loop.
+//!   * `handle_cli_message` — every `cli.*` command (status,
+//!     assign, kill, task_create/get/list/cancel, memory_get,
+//!     project_*, agent_*, worker_response_get, etc.). Called from
+//!     `connection.rs`'s one-shot CLI branch.
+//!
+//! Also hosts `is_safe_hub_basename` — the file-name guard used by
+//! the `cli.memory.get` handler to reject path traversal / odd
+//! filenames. Kept here because it's only called from
+//! `handle_cli_message`; promoting it to a shared utility module
+//! would overstate its scope.
+//!
+//! No public API — every fn is `pub(super)` or module-private.
+//! Callers reach these methods via `SocketServer`'s inherent impl.
 
-use crate::daemon::config::AgentConfig;
+use serde_json::json;
+use std::collections::HashMap;
+use tokio::io::AsyncWriteExt;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use crate::daemon::memory;
 use crate::daemon::project;
-use crate::daemon::state::{AppState, Task, TaskState, WorkerResponseRecord};
-use crate::terminal::pane_manager::PaneManager;
+use crate::daemon::state::{Task, TaskState, WorkerResponseRecord};
 use crate::wrapper::protocol::{
     truncate_summary, CliAgentEnsureRunning, CliAgentSendMessage, CliAssign, CliDelete, CliKill,
-    CliMemoryGet, CliProjectGet, CliProjectSave, CliSpawn, CliStatus, CliTaskCancel, CliTaskCreate,
+    CliMemoryAppend, CliMemoryGet, CliProjectGet, CliProjectSave, CliSpawn, CliStatus,
+    CliTaskCancel, CliTaskCreate,
     CliTaskComplete as CliTaskCompletePayload, CliTaskGet, CliTaskInterventionClear,
     CliTaskList, CliWorkerResponseGet, Envelope, TaskAccept, TaskAssign,
     TaskBlocked, TaskComplete, TaskPropose, UserIntervention, WorkerFrameWedged,
-    WorkerOrchResponse, WorkerUserInput, WrapperError, WrapperRegister, MSG_CLI_AGENT_ENSURE_RUNNING,
-    MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_DELETE, MSG_CLI_ERROR,
-    MSG_CLI_EVENT_STREAM, MSG_CLI_KILL, MSG_CLI_MEMORY_GET, MSG_CLI_PROJECT_GET,
+    WorkerOrchResponse, WorkerUserInput, WrapperError, MSG_CLI_AGENT_ENSURE_RUNNING,
+    MSG_CLI_AGENT_SEND_MESSAGE, MSG_CLI_ASSIGN, MSG_CLI_DELETE,
+    MSG_CLI_KILL, MSG_CLI_MEMORY_APPEND, MSG_CLI_MEMORY_GET, MSG_CLI_PROJECT_GET,
     MSG_CLI_PROJECT_LIST, MSG_CLI_PROJECT_SAVE, MSG_CLI_RESPONSE, MSG_CLI_SPAWN,
     MSG_CLI_STATUS, MSG_CLI_TASK_CANCEL, MSG_CLI_TASK_COMPLETE, MSG_CLI_TASK_CREATE,
     MSG_CLI_TASK_INTERVENTION_CLEAR,
-    MSG_CLI_TASK_GET, MSG_CLI_TASK_LIST, MSG_CLI_WORKER_RESPONSE_GET, MSG_ERROR, MSG_EVENT,
-    MSG_REGISTER,
+    MSG_CLI_TASK_GET, MSG_CLI_TASK_LIST, MSG_CLI_WORKER_RESPONSE_GET, MSG_ERROR,
     MSG_CLI_INTEGRATIONS_GET, MSG_STATUS_RESPONSE, MSG_TASK_ACCEPT, MSG_TASK_ASSIGN,
     MSG_TASK_BLOCKED, MSG_TASK_COMPLETE, MSG_TASK_PROPOSE, MSG_USER_INTERVENTION,
     MSG_WORKER_FRAME_WEDGED, MSG_WORKER_ORCH_RESPONSE, MSG_WORKER_USER_INPUT,
     DEFAULT_TASK_GET_VIEW, EVENT_TEXT_INJECT_MAX_BYTES, MEMORY_GET_WARN_BYTES,
     TASK_LIST_FULL_MAX_LIMIT, TASK_SUMMARY_MAX_BYTES, WORKER_ECHO_SENTINEL_BEGIN,
     WORKER_ECHO_SENTINEL_END, ERR_CODE_FRAMED_SEND_NOT_SUPPORTED,
+    ACCEPT_ACK_TIMEOUT_SECS, MAX_ACCEPT_ATTEMPTS,
 };
-use anyhow::{Context, Result};
-use serde_json::json;
-use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
-pub const DAEMON_SOCKET: &str = "/tmp/alor/daemon.sock";
-
-/// A connected wrapper's write half, keyed by agent_id.
-type WriterMap = Arc<Mutex<HashMap<String, tokio::net::unix::OwnedWriteHalf>>>;
-type ChildMap = Arc<Mutex<HashMap<String, std::process::Child>>>;
-/// Each subscriber's writer lives behind its own mutex so broadcast_event
-/// can snapshot handles under the outer lock, drop it, then write per-sub
-/// without stalling every subscriber on one slow client.
-type EventSubscribers =
-    Arc<Mutex<HashMap<u64, Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>>>>;
-
-/// Shared state for the socket server.
-#[derive(Clone)]
-pub struct SocketServer {
-    writers: WriterMap,
-    app_state: AppState,
-    pane_manager: PaneManager,
-    agent_configs: Arc<Vec<(String, AgentConfig)>>,
-    spawned: ChildMap,
-    event_subscribers: EventSubscribers,
-    next_sub_id: Arc<AtomicU64>,
-}
+use super::{cli_error, cli_error_coded, SocketServer};
+use super::agent_lifecycle::is_framed_send_allowed;
 
 impl SocketServer {
-    pub fn with_configs(
-        app_state: AppState,
-        pane_manager: PaneManager,
-        configs: Vec<(String, AgentConfig)>,
-    ) -> Self {
-        Self {
-            writers: Arc::new(Mutex::new(HashMap::new())),
-            app_state,
-            pane_manager,
-            agent_configs: Arc::new(configs),
-            spawned: Arc::new(Mutex::new(HashMap::new())),
-            event_subscribers: Arc::new(Mutex::new(HashMap::new())),
-            next_sub_id: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    /// Start listening. Call this in a spawned task.
-    pub async fn run(&self) -> Result<()> {
-        // Ensure parent directory exists
-        let sock_path = Path::new(DAEMON_SOCKET);
-        if let Some(parent) = sock_path.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
-        }
-
-        // Remove stale socket file
-        if sock_path.exists() {
-            tokio::fs::remove_file(sock_path).await.ok();
-        }
-
-        let listener = UnixListener::bind(sock_path)
-            .context("bind daemon socket")?;
-
-        // Restrict socket to owner only (0600) so unprivileged users can't
-        // connect and issue CLI commands.
-        std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600))
-            .context("set daemon socket permissions")?;
-
-        info!(path = DAEMON_SOCKET, "socket server listening");
-
-        // Periodically reap exited children so `spawned` doesn't grow
-        // forever.  Wrappers/workers that exit on their own (crash, /quit,
-        // normal shutdown) aren't removed through the kill/delete path, and
-        // without try_wait the kernel keeps zombie entries and we keep a
-        // stale Child handle indefinitely.
-        {
-            let reaper = self.clone();
-            tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(30));
-                interval.tick().await; // skip the immediate first tick
-                loop {
-                    interval.tick().await;
-                    let mut spawned = reaper.spawned.lock().await;
-                    spawned.retain(|id, child| match child.try_wait() {
-                        Ok(Some(status)) => {
-                            info!(instance = %id, exit = ?status, "reaped exited child");
-                            false
-                        }
-                        Ok(None) => true,
-                        Err(e) => {
-                            warn!(instance = %id, error = %e, "try_wait failed");
-                            true
-                        }
-                    });
-                }
-            });
-        }
-
-        loop {
-            match listener.accept().await {
-                Ok((stream, _addr)) => {
-                    let server = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = server.handle_connection(stream).await {
-                            warn!("connection handler error: {e:#}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("accept error: {e}");
-                }
-            }
-        }
-    }
-
-    /// Handle one wrapper connection.
-    async fn handle_connection(&self, stream: UnixStream) -> Result<()> {
-        let (read_half, write_half) = stream.into_split();
-        let mut reader = BufReader::new(read_half);
-        let mut line = String::new();
-
-        // First message determines connection type
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Ok(()); // EOF before any message
-        }
-
-        let env: Envelope = serde_json::from_str(line.trim())
-            .context("parse first envelope")?;
-
-        // CLI messages: handle and return
-        if env.kind.starts_with("cli.") {
-            if env.kind == MSG_CLI_EVENT_STREAM {
-                // Event stream subscriber: hold connection open
-                let sub_id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
-                {
-                    let mut subs = self.event_subscribers.lock().await;
-                    subs.insert(sub_id, Arc::new(Mutex::new(write_half)));
-                }
-                info!(sub_id, "cli event stream subscriber connected");
-
-                // Keep reading until disconnect. We swallow read errors
-                // locally so the subscriber is always removed from the map —
-                // previously `?` would propagate out and skip the cleanup.
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!(sub_id, "event stream read error: {e}");
-                            break;
-                        }
-                    }
-                }
-
-                {
-                    let mut subs = self.event_subscribers.lock().await;
-                    subs.remove(&sub_id);
-                }
-                info!(sub_id, "cli event stream subscriber disconnected");
-                return Ok(());
-            }
-
-            // One-shot CLI command
-            let response = self.handle_cli_message(env).await;
-            let mut resp_line = serde_json::to_string(&response)?;
-            resp_line.push('\n');
-
-            // write_half is not yet consumed — we still own it
-            let mut writer = write_half;
-            writer.write_all(resp_line.as_bytes()).await?;
-            writer.flush().await?;
-            return Ok(());
-        }
-
-        // Wrapper registration flow
-        if env.kind != MSG_REGISTER {
-            anyhow::bail!("first message must be wrapper.register, got {}", env.kind);
-        }
-
-        let reg: WrapperRegister = env.decode_payload()
-            .context("decode WrapperRegister")?;
-        let agent_id = reg.agent_id.clone();
-
-        // Validate agent ID: alphanumeric, dashes, underscores only (max 64 chars).
-        if agent_id.is_empty()
-            || agent_id.len() > 64
-            || !agent_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        {
-            anyhow::bail!("invalid agent_id: {agent_id:?}");
-        }
-
-        info!(agent_id = %agent_id, "wrapper registered");
-
-        // Update agent status in app state FIRST to check for collisions.
-        // This is the source of truth for "connected".
-        if let Err(e) = self.app_state.set_agent_connected(&agent_id, true) {
-            warn!(agent_id = %agent_id, "registration rejected: {e:#}");
-            let err_env = Envelope::new(
-                MSG_ERROR,
-                WrapperError { 
-                    agent_id: agent_id.clone(),
-                    message: format!("Collision: {e:#}") 
-                }
-            )?;
-            let mut line = serde_json::to_string(&err_env)?;
-            line.push('\n');
-            let mut writer = write_half;
-            writer.write_all(line.as_bytes()).await?;
-            writer.flush().await?;
-            return Ok(());
-        }
-
-        // Store the write half
-        {
-            let mut writers = self.writers.lock().await;
-            writers.insert(agent_id.clone(), write_half);
-        }
-
-        // Add agent pane to alor-main. Failure here used to be invisible
-        // — a silent `warn!` — which masked the root cause of task
-        // 1ed52762 (agents connected without a pane in alor-main). The
-        // stale-entry bug that caused that is now fixed inside
-        // `add_agent_pane`; escalating the log level to error! and
-        // naming the agent + tmux session makes any remaining failure
-        // class loud enough to catch on the next occurrence.
-        // PaneManager::reconcile_panes still runs on boot + via the UI
-        // as defense-in-depth if a novel failure shape slips through.
-        if let Err(e) = self.pane_manager.add_agent_pane(&agent_id).await {
-            let agent_session = format!("alor-{agent_id}");
-            error!(
-                agent_id = %agent_id,
-                tmux_session = %agent_session,
-                "add_agent_pane failed during wrapper.register: {e:#}"
-            );
-            // Emit a UI-visible event so the frontend can surface the
-            // problem (currently logged; future: a toast/banner).
-            let pane_fail = json!({
-                "agent_id": &agent_id,
-                "tmux_session": &agent_session,
-                "error": format!("{e:#}"),
-            });
-            self.broadcast_event("agent.pane_add_failed", pane_fail.clone())
-                .await;
-            self.app_state
-                .emit_event_with("agent.pane_add_failed", pane_fail);
-        }
-
-        // Broadcast connection event
-        self.broadcast_event(
-            "agent.connected",
-            json!({"agent_id": &agent_id}),
-        )
-        .await;
-
-        // Read loop
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                info!(agent_id = %agent_id, "wrapper disconnected");
-                break;
-            }
-
-            let env: Envelope = match serde_json::from_str(line.trim()) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(agent_id = %agent_id, "malformed message: {e}");
-                    continue;
-                }
-            };
-
-            self.handle_message(&agent_id, env).await;
-        }
-
-        // Cleanup on disconnect
-        {
-            let mut writers = self.writers.lock().await;
-            writers.remove(&agent_id);
-        }
-        let _ = self.app_state.set_agent_connected(&agent_id, false);
-
-        // Broadcast disconnection event
-        self.broadcast_event(
-            "agent.disconnected",
-            json!({"agent_id": &agent_id}),
-        )
-        .await;
-
-        Ok(())
-    }
 
     /// Handle one envelope from a wrapper.
-    async fn handle_message(&self, agent_id: &str, env: Envelope) {
+    pub(super) async fn handle_message(&self, agent_id: &str, env: Envelope) {
         match env.kind.as_str() {
             MSG_TASK_ACCEPT => {
                 if let Ok(payload) = env.decode_payload::<TaskAccept>() {
+                    // Cancel the accept-handshake watchdog FIRST (before
+                    // the idempotent-replay guard). Dropping the
+                    // oneshot sender closes the receiver in the
+                    // watchdog's select arm, so the watchdog exits
+                    // quietly without firing a spurious revert.
+                    // Doing this unconditionally — even for replays —
+                    // is safe because the map only contains entries
+                    // for IN-FLIGHT handshakes: on first successful
+                    // ack the entry is already gone, and the
+                    // `remove()` is a no-op.
+                    {
+                        let mut pending = self.pending_accepts.lock().await;
+                        if let Some(tx) = pending.remove(&payload.task_id) {
+                            // Explicit drop for clarity — closing the
+                            // channel is what signals the watchdog.
+                            drop(tx);
+                        }
+                    }
+
                     // Idempotent-replay guard. Worker outboxes can re-deliver
                     // an accept the daemon already processed before its
                     // previous crash (Accepted → Accepted is otherwise an
@@ -465,6 +208,39 @@ impl SocketServer {
                     // the broadcast — that's the whole point of the split.
                     match self.app_state.transition_task(payload.task_id, TaskState::Completed) {
                         Ok(_) => {
+                            // Automatic Memory Hub distillation (audit
+                            // item #7). Fire-and-forget: any error
+                            // logs a warn but doesn't fail the task
+                            // completion. Only runs when BOTH a
+                            // project AND a non-empty summary are
+                            // present — a summary-less completion
+                            // has nothing meaningful to distill, and
+                            // a projectless task has no hub to write
+                            // to. See `memory::auto_distill_task_completion`
+                            // for the entry shape + retention policy.
+                            if let Some(task) = self.app_state.get_task(payload.task_id) {
+                                if let (Some(project), Some(summary)) =
+                                    (task.project.as_deref(), summary_terse.as_deref())
+                                {
+                                    let trimmed = summary.trim();
+                                    if !project.is_empty() && !trimmed.is_empty() {
+                                        if let Err(e) = memory::auto_distill_task_completion(
+                                            project,
+                                            agent_id,
+                                            &payload.task_id,
+                                            &task_title,
+                                            trimmed,
+                                        ) {
+                                            warn!(
+                                                agent_id,
+                                                task_id = %payload.task_id,
+                                                project,
+                                                "memory auto-distill failed: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             self.broadcast_event(
                                 "task.completed",
                                 json!({
@@ -649,7 +425,7 @@ impl SocketServer {
     }
 
     /// Handle a CLI message and return a response envelope.
-    async fn handle_cli_message(&self, env: Envelope) -> Envelope {
+    pub(super) async fn handle_cli_message(&self, env: Envelope) -> Envelope {
         let correlation_id = env.correlation_id;
 
         match env.kind.as_str() {
@@ -1196,6 +972,25 @@ impl SocketServer {
                             let _ = writer.flush().await;
                         }
 
+                        // Register the accept-handshake watchdog BEFORE
+                        // releasing any external attention. If the worker
+                        // replies faster than this handler finishes the
+                        // broadcast + response (unlikely but possible on
+                        // a loopback socket), MSG_TASK_ACCEPT's remove()
+                        // on an absent entry is a harmless no-op and
+                        // `transition_task(Accepted)` still runs. So
+                        // late-registration is correctness-neutral; the
+                        // worst case is a watchdog that fires a revert
+                        // on an already-accepted task, which
+                        // `revert_assignment_on_accept_timeout` detects
+                        // and rejects (state no longer Assigned) as a
+                        // debug-level race.
+                        self.register_and_spawn_accept_watchdog(
+                            payload.task_id,
+                            payload.agent_id.clone(),
+                        )
+                        .await;
+
                         self.broadcast_event(
                             "task.assigned",
                             json!({
@@ -1409,25 +1204,36 @@ impl SocketServer {
             MSG_CLI_PROJECT_SAVE => {
                 match env.decode_payload::<CliProjectSave>() {
                     Ok(payload) => {
-                        let mut profile = project::ProjectProfile::new(&payload.name);
-                        if let Some(desc) = payload.description {
-                            profile.description = desc;
-                        }
-                        if let Some(root) = payload.root_dir {
-                            profile.root_dir = Some(root);
-                        }
-                        if let Some(stack) = payload.stack {
-                            profile.stack = stack;
-                        }
-                        if let Some(kf) = payload.key_files {
-                            profile.key_files = kf;
-                        }
-                        if let Some(dp) = payload.doc_paths {
-                            profile.doc_paths = dp;
-                        }
-                        if let Some(ref mi) = payload.memory_index {
-                            profile.memory_index = Some(mi.clone());
-                        }
+                        // MERGE semantics — preserve fields the
+                        // payload doesn't mention. Pre-fix
+                        // (2026-04-20) the handler built a FRESH
+                        // ProjectProfile::new(), which defaulted
+                        // `memory_hub` and `notes` to None/empty;
+                        // any round-trip through the UI silently
+                        // erased those fields. See
+                        // `project::merge_profile` for the full
+                        // merge-rule contract.
+                        let existing = match project::load_profile(&payload.name) {
+                            Ok(opt) => opt,
+                            Err(e) => {
+                                return cli_error(
+                                    correlation_id,
+                                    &format!(
+                                        "failed to load existing project for merge: {e}"
+                                    ),
+                                );
+                            }
+                        };
+                        let profile = project::merge_profile(
+                            existing,
+                            &payload.name,
+                            payload.description.clone(),
+                            payload.root_dir.clone(),
+                            payload.stack.clone(),
+                            payload.key_files.clone(),
+                            payload.doc_paths.clone(),
+                            payload.memory_index.clone(),
+                        );
 
                         if let Err(e) = project::save_profile(&profile) {
                             return cli_error(
@@ -1990,6 +1796,94 @@ impl SocketServer {
                 }
             }
 
+            MSG_CLI_MEMORY_APPEND => {
+                // Curated-write counterpart to the task.complete auto-
+                // distillation. The orchestrator (or any caller via
+                // alor-cli) nominates a text block for the project's
+                // Memory Hub; we append it to the named file after the
+                // same basename guard `memory.get` uses (no path
+                // traversal, no hierarchical names), a payload-size
+                // cap, and the same head-trim retention policy the
+                // auto-distiller applies to `automation_log.md`. See
+                // `memory::append_to_hub_file` for the write semantics
+                // and `memory::MEMORY_APPEND_MAX_BYTES` /
+                // `AUTOMATION_LOG_MAX_BYTES` for the caps.
+                match env.decode_payload::<CliMemoryAppend>() {
+                    Ok(payload) => {
+                        if !is_safe_hub_basename(&payload.file_name) {
+                            return cli_error(
+                                correlation_id,
+                                &format!(
+                                    "unsafe file_name {:?} (must be a plain basename; names with `..`, `/`, `\\`, or NUL are rejected)",
+                                    payload.file_name
+                                ),
+                            );
+                        }
+                        if payload.text.len() > memory::MEMORY_APPEND_MAX_BYTES {
+                            return cli_error(
+                                correlation_id,
+                                &format!(
+                                    "text exceeds MEMORY_APPEND_MAX_BYTES cap ({} B; got {} B) — split into multiple appends or use a dedicated hub file",
+                                    memory::MEMORY_APPEND_MAX_BYTES,
+                                    payload.text.len()
+                                ),
+                            );
+                        }
+                        // Same retention cap as the auto-distiller so a
+                        // caller can't grow `automation_log.md` past the
+                        // bound by hand; other hub files trim to a
+                        // generous 1 MiB so curated notes (usually
+                        // static reference material) aren't clobbered
+                        // by a handful of appends.
+                        let retention_cap = if payload.file_name == memory::AUTOMATION_LOG_BASENAME
+                        {
+                            Some(memory::AUTOMATION_LOG_MAX_BYTES)
+                        } else {
+                            Some(1024 * 1024)
+                        };
+                        match memory::append_to_hub_file(
+                            &payload.project,
+                            &payload.file_name,
+                            &payload.text,
+                            retention_cap,
+                        ) {
+                            Ok(path) => {
+                                let path_display = path.display().to_string();
+                                info!(
+                                    project = %payload.project,
+                                    file = %payload.file_name,
+                                    bytes = payload.text.len(),
+                                    "memory.append: wrote to hub file"
+                                );
+                                match Envelope::new(
+                                    MSG_CLI_RESPONSE,
+                                    json!({
+                                        "project": payload.project,
+                                        "file_name": payload.file_name,
+                                        "path": path_display,
+                                        "bytes_written": payload.text.len(),
+                                    }),
+                                ) {
+                                    Ok(mut e) => {
+                                        e.correlation_id = correlation_id;
+                                        e
+                                    }
+                                    Err(_) => cli_error(
+                                        correlation_id,
+                                        "failed to serialize memory.append response",
+                                    ),
+                                }
+                            }
+                            Err(e) => cli_error(
+                                correlation_id,
+                                &format!("memory.append failed: {e:#}"),
+                            ),
+                        }
+                    }
+                    Err(e) => cli_error(correlation_id, &format!("invalid payload: {e}")),
+                }
+            }
+
             MSG_CLI_WORKER_RESPONSE_GET => {
                 // Audit 8b03cae6 bloat fix #4: fetch-on-demand
                 // counterpart to the orchestrator's injected-text cap.
@@ -2063,442 +1957,159 @@ impl SocketServer {
         }
     }
 
-    /// Generate a unique instance ID for an agent kind.
-    /// If `base` is not already taken, returns it as-is.
-    /// Otherwise appends `-2`, `-3`, etc. until a free ID is found.
-    fn unique_instance_id(&self, base: &str) -> String {
-        let agents = self.app_state.all_agents();
-        let taken: std::collections::HashSet<&str> =
-            agents.iter().map(|a| a.id.as_str()).collect();
-
-        if !taken.contains(base) {
-            return base.to_string();
-        }
-
-        for n in 2u32.. {
-            let candidate = format!("{base}-{n}");
-            if !taken.contains(candidate.as_str()) {
-                return candidate;
-            }
-        }
-        unreachable!()
-    }
-
-    /// Handle a cli.spawn request.
-    async fn handle_spawn(&self, correlation_id: Uuid, payload: CliSpawn) -> Envelope {
-        // Find config for this agent
-        let config = self
-            .agent_configs
-            .iter()
-            .find(|(id, _)| id == &payload.agent)
-            .map(|(_, cfg)| cfg.clone());
-
-        let config = match config {
-            Some(c) => c,
-            None => {
-                return cli_error(
-                    correlation_id,
-                    &format!("no config found for agent '{}'", payload.agent),
-                )
-            }
-        };
-
-        // Effective project + working_dir: payload override beats yaml config.
-        let effective_project = payload.project.clone().or_else(|| config.project.clone());
-        let effective_working_dir = payload
-            .working_dir
-            .clone()
-            .or_else(|| config.working_dir.clone());
-
-        // Templates must be parameterized at spawn time — refuse bare template
-        // spawns that didn't pass either a project or a working_dir override.
-        if config.template
-            && payload.project.is_none()
-            && payload.working_dir.is_none()
+    /// Register a pending-accept entry for `task_id` and spawn a
+    /// background watchdog that fires `ACCEPT_ACK_TIMEOUT_SECS`
+    /// later. The watchdog:
+    ///
+    ///   - Exits silently if the MSG_TASK_ACCEPT handler removes
+    ///     the entry from `pending_accepts` (dropping the oneshot
+    ///     sender, which wakes the receiver's select arm).
+    ///   - Otherwise calls
+    ///     `AppState::revert_assignment_on_accept_timeout` and
+    ///     emits the corresponding `task.accept.timeout` +
+    ///     (`task.reassign` | `task.accept_failed`) events.
+    ///
+    /// Broken out of the `cli.assign` arm body so the logic is
+    /// testable via `SocketServer` inherent impl without going
+    /// through the envelope-routing path.
+    /// Promoted from `pub(super)` to `pub` so the Tauri-facing
+    /// assign path in `commands.rs::assign_task` can wire up the
+    /// same accept-handshake watchdog the `cli.assign` arm uses.
+    /// Previously only the CLI path got timeout-revert coverage;
+    /// frontend-originated assigns went unprotected.
+    pub async fn register_and_spawn_accept_watchdog(
+        &self,
+        task_id: Uuid,
+        agent_id: String,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         {
-            return cli_error(
-                correlation_id,
-                &format!(
-                    "'{}' is a template; agent_spawn needs a project and/or working_dir override",
-                    payload.agent
-                ),
-            );
-        }
-
-        // If spawning from a template, record the template id so the instance
-        // can be respawned after daemon restart using the template's command.
-        let template_ref = if config.template {
-            Some(payload.agent.clone())
-        } else {
-            None
-        };
-
-        // Determine instance ID: explicit --name, auto-derived from project for
-        // template spawns, or a unique numbered id as a last resort.
-        let instance_id = match payload.name.clone() {
-            Some(name) => name,
-            None => {
-                if config.template {
-                    match effective_project.as_deref() {
-                        Some(proj) if !proj.is_empty() => format!("{}-{}", payload.agent, proj),
-                        _ => self.unique_instance_id(&payload.agent),
-                    }
-                } else {
-                    self.unique_instance_id(&payload.agent)
-                }
-            }
-        };
-
-        // Collision guard: a template-derived id could accidentally collide
-        // with an existing yaml slot (e.g. template 'claude' + project 'alor'
-        // derives 'claude-alor', which is also a fixed yaml slot). Refuse so
-        // we don't overwrite state metadata or spawn an orphan session.
-        if config.template
-            && instance_id != payload.agent
-            && self
-                .agent_configs
-                .iter()
-                .any(|(id, _)| id == &instance_id)
-        {
-            return cli_error(
-                correlation_id,
-                &format!(
-                    "instance id '{}' conflicts with an existing yaml slot; \
-                     use agent_ensure_running('{}') instead, or spawn with an explicit --name",
-                    instance_id, instance_id
-                ),
-            );
-        }
-
-        // Register the instance in state with the base config's metadata plus
-        // any runtime overrides.
-        {
-            let existing = self.app_state.get_agent(&instance_id);
-            if existing.is_none() {
-                let display_name = config
-                    .identity
-                    .as_ref()
-                    .map(|id| format!("{} {}", id, instance_id))
-                    .unwrap_or_else(|| instance_id.clone());
-                let mut agent = crate::daemon::state::Agent::new(&instance_id, &display_name);
-                agent.tmux_session = Some(format!("alor-{instance_id}"));
-                agent.project = effective_project.clone();
-                agent.tier = config.tier.clone();
-                agent.max_concurrent = config.max_concurrent;
-                agent.working_dir = effective_working_dir.clone();
-                agent.template = template_ref.clone();
-                self.app_state.register_agent(agent);
-            } else {
-                self.app_state.set_agent_metadata(
-                    &instance_id,
-                    effective_project.clone(),
-                    Some(config.tier.clone()),
-                    Some(config.max_concurrent),
-                    effective_working_dir.clone(),
-                    template_ref.clone(),
+            let mut pending = self.pending_accepts.lock().await;
+            // Overwrite any prior entry for this task_id. A duplicate
+            // assign (shouldn't happen, but cli.assign could race
+            // itself if two orchs hit the same task) replaces the
+            // older sender — dropping it signals the older watchdog
+            // to exit silently, which is what we want: there's only
+            // ever one valid in-flight handshake per task.
+            if let Some(old_tx) = pending.insert(task_id, tx) {
+                drop(old_tx);
+                tracing::debug!(
+                    task_id = %task_id,
+                    "replaced prior accept-watchdog registration"
                 );
             }
         }
 
-        // Resolve workdir once; both runtime branches use it.
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let expanded_workdir: Option<std::path::PathBuf> =
-            effective_working_dir.as_ref().map(|wd| {
-                if wd.starts_with('~') {
-                    std::path::PathBuf::from(&home)
-                        .join(wd.strip_prefix("~/").unwrap_or(&wd[1..]))
-                } else {
-                    std::path::PathBuf::from(wd)
+        let server = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    ACCEPT_ACK_TIMEOUT_SECS,
+                )) => {
+                    // Timeout: MSG_TASK_ACCEPT didn't arrive in time.
+                    server.handle_accept_timeout(task_id, &agent_id).await;
                 }
-            });
-
-        let mut cmd = if config.runtime == "claude-sdk" {
-            // SDK worker path: run-worker.sh inside a tmux session.
-            // The worker talks wrapper protocol directly to the daemon and
-            // hosts its own ClaudeSDKClient. No alor-wrapper in the loop.
-            if config.command.is_empty() {
-                return cli_error(
-                    correlation_id,
-                    "claude-sdk runtime requires `command:` in yaml to point at run-worker.sh",
-                );
-            }
-            let session_name = format!("alor-{instance_id}");
-
-            let mut c = std::process::Command::new("tmux");
-            c.args(["new-session", "-d", "-s", &session_name]);
-            if let Some(ref wd) = expanded_workdir {
-                c.arg("-c").arg(wd);
-            }
-            // Everything after `--` is the command line tmux runs inside.
-            c.arg("--");
-            c.arg(&config.command[0]);
-            c.arg(&instance_id);
-            if let Some(ref wd) = expanded_workdir {
-                c.arg("--workdir").arg(wd);
-            }
-            if let Some(ref proj) = effective_project {
-                c.arg("--project").arg(proj);
-            }
-            c
-        } else {
-            // Classic wrapper path.
-            let wrapper_bin = match crate::daemon::config::find_wrapper_binary() {
-                Ok(bin) => bin,
-                Err(e) => {
-                    return cli_error(
-                        correlation_id,
-                        &format!("wrapper binary not found: {e}"),
-                    )
+                _ = rx => {
+                    // Either the sender sent Ok (not currently used —
+                    // we signal by drop) or the sender was dropped
+                    // (by MSG_TASK_ACCEPT's `remove()`). Either way
+                    // the handshake is resolved; exit silently.
+                    tracing::trace!(
+                        task_id = %task_id,
+                        "accept-watchdog cancelled by ack"
+                    );
                 }
-            };
-            let mut c = std::process::Command::new(&wrapper_bin);
-            c.arg(&instance_id);
-            if !config.command.is_empty() {
-                c.arg("--command").arg(config.command.join(" "));
             }
-            if let Some(ref wd) = expanded_workdir {
-                c.arg("--workdir").arg(wd);
-            }
-            if let Some(ref sf) = config.startup_file {
-                let expanded = if sf.starts_with('~') {
-                    std::path::PathBuf::from(&home)
-                        .join(sf.strip_prefix("~/").unwrap_or(&sf[1..]))
-                } else {
-                    std::path::PathBuf::from(sf)
-                };
-                c.arg("--startup-file").arg(expanded);
-            }
-            c
-        };
+        });
+    }
 
-        match cmd
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
+    /// Handle the accept-watchdog timeout path: revert the task's
+    /// assignment and emit the appropriate event cascade. Called
+    /// from the watchdog body in
+    /// `register_and_spawn_accept_watchdog`; factored out so tests
+    /// can drive the timeout path synchronously without waiting on
+    /// the 5s sleep.
+    pub(super) async fn handle_accept_timeout(
+        &self,
+        task_id: Uuid,
+        agent_id: &str,
+    ) {
+        // Clean up our own pending-accept entry whether or not the
+        // revert succeeds — we're the authority on this handshake
+        // ending, one way or another.
         {
-            Ok(child) => {
-                let pid = child.id();
-                info!(agent = %payload.agent, instance_id = %instance_id, pid, "agent spawned via CLI");
-
-                // For claude-sdk runtime, apply session-level mouse + history
-                // AFTER new-session creates the session. Without mouse on, the
-                // nested-tmux setup (alor-main pane running `tmux attach -t
-                // this session`) can't forward wheel events to this session's
-                // own copy-mode, so scrolling shows the outer pane's empty
-                // scrollback instead of the worker's real history. Wrapper-
-                // runtime agents already get this via ensure_session_defaults.
-                if config.runtime == "claude-sdk" {
-                    // set-option uses the BARE name — tmux 3.4 rejects
-                    // the `=name` exact-match sigil on set-option
-                    // specifically ("no such session"), even though it
-                    // works for has-session and kill-session. We rely on
-                    // the handle_spawn collision guard above and the
-                    // validated alphanumeric agent_id so the bare name
-                    // lands on the right session.
-                    let session_name = format!("alor-{instance_id}");
-                    let _ = std::process::Command::new("tmux")
-                        .args(["set-option", "-t", &session_name, "mouse", "on"])
-                        .output();
-                    let _ = std::process::Command::new("tmux")
-                        .args(["set-option", "-t", &session_name, "history-limit", "50000"])
-                        .output();
-                }
-
-                {
-                    let mut spawned = self.spawned.lock().await;
-                    spawned.insert(instance_id.clone(), child);
-                }
-                // If the caller tagged this spawn with a task_id
-                // (worker calling agent_spawn mid-task — see
-                // orchestrator-py/tools.py::agent_spawn), record the
-                // pairing so transition_task can warn if the worker
-                // forgets to kill the instance before completing.
-                if let Some(task_id) = payload.spawned_by_task {
-                    self.app_state.record_task_spawn(task_id, &instance_id);
-                }
-                self.broadcast_event(
-                    "agent.spawned",
-                    json!({"agent": &payload.agent, "instance_id": &instance_id, "pid": pid}),
-                )
-                .await;
-                match Envelope::new(
-                    MSG_CLI_RESPONSE,
-                    json!({"spawned": &instance_id, "pid": pid}),
-                ) {
-                    Ok(mut e) => {
-                        e.correlation_id = correlation_id;
-                        e
-                    }
-                    Err(_) => cli_error(correlation_id, "failed to build response"),
-                }
-            }
-            Err(e) => cli_error(
-                correlation_id,
-                &format!("failed to spawn {}: {e}", payload.agent),
-            ),
+            let mut pending = self.pending_accepts.lock().await;
+            pending.remove(&task_id);
         }
-    }
 
-    /// Broadcast an event to all event stream subscribers.
-    async fn broadcast_event(&self, event_type: &str, data: serde_json::Value) {
-        let event = match Envelope::new(
-            MSG_EVENT,
-            serde_json::json!({
-                "event": event_type,
-                "data": data,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
-        ) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut line = match serde_json::to_string(&event) {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        line.push('\n');
-        let bytes: Arc<[u8]> = Arc::from(line.into_bytes());
-
-        // Snapshot subscriber handles under the outer lock, then release it
-        // so a single stuck subscriber can't stall other broadcasts.
-        let handles: Vec<(u64, Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>)> = {
-            let subs = self.event_subscribers.lock().await;
-            subs.iter().map(|(id, w)| (*id, w.clone())).collect()
+        let outcome = match self
+            .app_state
+            .revert_assignment_on_accept_timeout(task_id, MAX_ACCEPT_ATTEMPTS)
+        {
+            Ok(o) => o,
+            Err(e) => {
+                // Most common cause: race with the ack that arrived
+                // between timeout-fire and revert-acquire. Log at
+                // debug, skip events, don't escalate.
+                tracing::debug!(
+                    task_id = %task_id,
+                    agent_id,
+                    "accept-watchdog timeout superseded: {e}"
+                );
+                return;
+            }
         };
 
-        let mut dead = Vec::new();
-        for (id, writer) in handles {
-            let mut w = writer.lock().await;
-            if w.write_all(&bytes).await.is_err() || w.flush().await.is_err() {
-                dead.push(id);
-            }
-        }
-        if !dead.is_empty() {
-            let mut subs = self.event_subscribers.lock().await;
-            for id in dead {
-                subs.remove(&id);
-            }
-        }
-    }
-
-    /// Send an envelope to a specific wrapper.
-    pub async fn send_to(&self, agent_id: &str, envelope: &Envelope) -> Result<()> {
-        let mut writers = self.writers.lock().await;
-        let writer = writers.get_mut(agent_id)
-            .ok_or_else(|| anyhow::anyhow!("no connection for agent {agent_id}"))?;
-
-        let mut line = serde_json::to_string(envelope)?;
-        line.push('\n');
-        writer.write_all(line.as_bytes()).await?;
-        writer.flush().await?;
-
-        Ok(())
-    }
-
-    /// Check if a wrapper is connected.
-    pub async fn is_connected(&self, agent_id: &str) -> bool {
-        self.writers.lock().await.contains_key(agent_id)
-    }
-
-    /// Mark an agent as a zombie: flip `connected` to false in state
-    /// and broadcast the disconnect event. Called by
-    /// `PaneManager::reconcile_panes` callers after it detects that
-    /// an agent's tmux session has disappeared while state still
-    /// thinks it's connected.
-    ///
-    /// Deliberately does NOT remove the agent from the `writers` map.
-    /// The zombie wrapper process may still have a live daemon socket
-    /// — we want to reach it (e.g. to send SHUTDOWN via kill_agent)
-    /// even after flagging the UI state as disconnected. Writers get
-    /// cleaned up by the normal socket-drop path (see the read-loop
-    /// cleanup at line 317) when the wrapper actually dies.
-    ///
-    /// The `reason` field on the broadcast distinguishes this from a
-    /// normal socket-drop disconnect so CLI event subscribers can
-    /// branch if they care.
-    pub async fn mark_agent_zombie(&self, agent_id: &str) {
-        self.mark_agent_disconnected(agent_id, "zombie_auto_cleared").await;
-    }
-
-    /// Mark an agent as disconnected because it was just killed. Called
-    /// from the `MSG_CLI_KILL` handler after the child process + tmux
-    /// session have been taken down. Analogous to `mark_agent_zombie`
-    /// but with a distinct `reason` so event subscribers can tell
-    /// "orch explicitly killed this" apart from "reconcile detected a
-    /// zombie and auto-cleaned up."
-    ///
-    /// Historical bug this addresses (task 2026-04-19 repro): the
-    /// `cli.kill` handler used to take the tmux session down but
-    /// never flip `state.connected` to false. For agents without a
-    /// tracked daemon-spawned child the wrapper's socket wasn't
-    /// closed by the kill path — so the natural "socket drop →
-    /// normal disconnect cleanup" never fired and `agent_list`
-    /// still showed `connected: true` with no tmux session. Classic
-    /// zombie shape, except caused by the kill itself. Calling this
-    /// method unconditionally from the kill path makes the state
-    /// transition loudly authoritative.
-    pub async fn mark_agent_killed(&self, agent_id: &str) {
-        self.mark_agent_disconnected(agent_id, "killed").await;
-    }
-
-    /// Shared implementation for the disconnect-with-reason paths.
-    /// Flips `state.connected` to false and broadcasts
-    /// `agent.disconnected` with the supplied reason. Deliberately
-    /// does NOT touch the `writers` map — kept wrapper sockets, if
-    /// any, drop through the normal read-loop cleanup path when they
-    /// actually close (see the handler in `handle_message`). That
-    /// preserves the ability to reach a still-live wrapper socket
-    /// for a follow-up SHUTDOWN if needed.
-    ///
-    /// Idempotent on repeated calls: `set_agent_connected(id, false)`
-    /// on an already-disconnected agent is a no-op for the flag
-    /// value; broadcast goes out each time but subscribers are
-    /// expected to tolerate duplicate disconnect events.
-    async fn mark_agent_disconnected(&self, agent_id: &str, reason: &str) {
-        if let Err(e) = self.app_state.set_agent_connected(agent_id, false) {
-            warn!(
-                agent_id,
-                reason,
-                "mark_agent_disconnected: set_agent_connected(false) failed: {e:#}"
-            );
-            return;
-        }
-        info!(
+        warn!(
+            task_id = %task_id,
             agent_id,
-            reason,
-            "agent marked disconnected (connected -> false)"
+            attempts = outcome.attempts,
+            exhausted = outcome.exhausted,
+            new_state = ?outcome.new_state,
+            "task.accept ack timeout; task reverted"
         );
+
+        // Always emit the telemetry event — lets operators + the
+        // orch observe the timeout even when the task goes straight
+        // to AcceptFailed.
         self.broadcast_event(
-            "agent.disconnected",
+            "task.accept.timeout",
             json!({
+                "task_id": task_id.to_string(),
                 "agent_id": agent_id,
-                "reason": reason,
+                "attempts": outcome.attempts,
+                "max_attempts": MAX_ACCEPT_ATTEMPTS,
+                "prior_agent": outcome.prior_agent,
             }),
         )
         .await;
-    }
 
-}
-
-fn cli_error(correlation_id: Uuid, message: &str) -> Envelope {
-    Envelope {
-        kind: MSG_CLI_ERROR.to_string(),
-        correlation_id,
-        payload: serde_json::json!({"error": message}),
-    }
-}
-
-/// Variant of `cli_error` that stamps a stable `code` alongside the
-/// human-readable `error`. Callers (orchestrator-py) pattern-match on
-/// `code` to raise typed exceptions; the `error` prose stays the surface
-/// that makes it into logs and LLM contexts. Use when the rejection is
-/// something a caller might plausibly want to handle specifically — not
-/// for every unexpected failure.
-fn cli_error_coded(correlation_id: Uuid, code: &str, message: &str) -> Envelope {
-    Envelope {
-        kind: MSG_CLI_ERROR.to_string(),
-        correlation_id,
-        payload: serde_json::json!({"code": code, "error": message}),
+        // Terminal-event fan-out: either "please try again" or
+        // "give up".
+        if outcome.exhausted {
+            self.broadcast_event(
+                "task.accept_failed",
+                json!({
+                    "task_id": task_id.to_string(),
+                    "agent_id": agent_id,
+                    "attempts": outcome.attempts,
+                    "reason": "accept_timeout",
+                }),
+            )
+            .await;
+        } else {
+            self.broadcast_event(
+                "task.reassign",
+                json!({
+                    "task_id": task_id.to_string(),
+                    "prior_agent": outcome.prior_agent,
+                    "attempts": outcome.attempts,
+                    "max_attempts": MAX_ACCEPT_ATTEMPTS,
+                    "reason": "accept_timeout",
+                }),
+            )
+            .await;
+        }
     }
 }
 
@@ -2517,7 +2128,7 @@ fn cli_error_coded(correlation_id: Uuid, code: &str, message: &str) -> Envelope 
 /// filesystem: better to treat "odd but legal" names as missing
 /// than to open up subtle traversal paths. Callers that need exotic
 /// filenames can rename their hub entries.
-fn is_safe_hub_basename(name: &str) -> bool {
+pub(super) fn is_safe_hub_basename(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." {
         return false;
     }
@@ -2536,1173 +2147,5 @@ fn is_safe_hub_basename(name: &str) -> bool {
     match (comps.next(), comps.next()) {
         (Some(std::path::Component::Normal(_)), None) => true,
         _ => false,
-    }
-}
-
-/// Runtime layer that hosts `claude-sdk` workers and speaks the
-/// BEGIN/END framing state machine in its stdin loop (orchestrator-py's
-/// worker.py). Any other runtime (wrapper, future codex/gemini) has a
-/// raw pty with no framing awareness — injecting sentinel-wrapped
-/// payloads would splat literal `__ALOR_ORCH_ECHO_BEGIN__<uuid>` lines
-/// into the CLI's prompt.
-const SDK_FRAMED_RUNTIME: &str = "claude-sdk";
-
-/// Resolve an agent_id to the runtime string declared in its yaml
-/// config.
-///
-/// Resolution order:
-///   1. Direct match against a loaded yaml slot (`agent_configs`).
-///   2. For template-spawned instances: follow `Agent.template` from
-///      runtime state back to the template's yaml config.
-///
-/// Returns `None` only when the agent is neither a known yaml slot nor
-/// a state-persisted instance of a known template. In that unresolved
-/// case the caller MUST treat the agent as non-SDK (fail-closed) —
-/// allowing a framed send to an unidentifiable agent would defeat the
-/// whole point of the gate.
-fn resolve_agent_runtime(
-    agent_configs: &[(String, AgentConfig)],
-    app_state: &AppState,
-    agent_id: &str,
-) -> Option<String> {
-    if let Some((_, cfg)) = agent_configs.iter().find(|(id, _)| id == agent_id) {
-        return Some(cfg.runtime.clone());
-    }
-    let agent = app_state.get_agent(agent_id)?;
-    let template_id = agent.template.as_deref()?;
-    agent_configs
-        .iter()
-        .find(|(id, _)| id == template_id)
-        .map(|(_, cfg)| cfg.runtime.clone())
-}
-
-/// Gate for `cli.agent.send_message` with `suppress_echo=true`. Only
-/// agents whose resolved runtime is `claude-sdk` may receive framed
-/// sends; everything else (wrapper, unknown) is rejected so sentinel
-/// bytes never land in a non-framing pty.
-fn is_framed_send_allowed(
-    agent_configs: &[(String, AgentConfig)],
-    app_state: &AppState,
-    agent_id: &str,
-) -> bool {
-    matches!(
-        resolve_agent_runtime(agent_configs, app_state, agent_id).as_deref(),
-        Some(SDK_FRAMED_RUNTIME)
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::daemon::state::Agent;
-    use crate::wrapper::protocol::TASK_SUMMARY_TRUNCATION_MARKER;
-
-    /// Build a minimal AgentConfig with just `runtime` set; every other
-    /// field defaults. Kept here rather than in config.rs because these
-    /// tests are the only thing that need a programmatically-built
-    /// config (production code deserializes from yaml).
-    fn cfg(runtime: &str) -> AgentConfig {
-        // Round-trip through yaml — simpler than manually filling every
-        // field, and exercises the same defaults the loader uses in
-        // production.
-        let yaml = format!("runtime: {runtime}\n");
-        serde_yaml::from_str::<AgentConfig>(&yaml).expect("valid test yaml")
-    }
-
-    #[test]
-    fn framed_send_allowed_for_claude_sdk_slot() {
-        let configs = vec![("alor".to_string(), cfg("claude-sdk"))];
-        let state = AppState::new();
-        assert!(is_framed_send_allowed(&configs, &state, "alor"));
-    }
-
-    #[test]
-    fn framed_send_rejected_for_wrapper_slot() {
-        // The latent hazard: default runtime is "wrapper", and a
-        // framed send to one would splat literal BEGIN/END markers
-        // into the CLI's pty.
-        let configs = vec![("codex".to_string(), cfg("wrapper"))];
-        let state = AppState::new();
-        assert!(!is_framed_send_allowed(&configs, &state, "codex"));
-    }
-
-    #[test]
-    fn framed_send_rejected_for_unknown_agent() {
-        // Fail-closed: no config + no state entry means we can't prove
-        // it's SDK-framed-safe, so reject.
-        let configs = vec![("alor".to_string(), cfg("claude-sdk"))];
-        let state = AppState::new();
-        assert!(!is_framed_send_allowed(&configs, &state, "ghost"));
-    }
-
-    #[test]
-    fn framed_send_allowed_for_claude_sdk_template_instance() {
-        // Template-spawned instance: no direct config entry, but its
-        // `template` field points at a yaml slot whose runtime is
-        // claude-sdk. Must resolve transitively.
-        let configs = vec![("claude".to_string(), cfg("claude-sdk"))];
-        let state = AppState::new();
-        let mut instance = Agent::new("claude-mandaspace", "claude-mandaspace");
-        instance.template = Some("claude".to_string());
-        state.register_agent(instance);
-        assert!(is_framed_send_allowed(
-            &configs,
-            &state,
-            "claude-mandaspace"
-        ));
-    }
-
-    #[test]
-    fn framed_send_rejected_for_wrapper_template_instance() {
-        // Same transitive lookup, but the template is a wrapper
-        // runtime — the gate must still refuse.
-        let configs = vec![("codex".to_string(), cfg("wrapper"))];
-        let state = AppState::new();
-        let mut instance = Agent::new("codex-scratch", "codex-scratch");
-        instance.template = Some("codex".to_string());
-        state.register_agent(instance);
-        assert!(!is_framed_send_allowed(&configs, &state, "codex-scratch"));
-    }
-
-    #[test]
-    fn framed_send_rejected_when_template_points_at_missing_config() {
-        // Defensive: if an instance's template id no longer resolves
-        // (e.g. yaml was deleted between spawn and now), we can't
-        // prove runtime, so fail-closed.
-        let configs: Vec<(String, AgentConfig)> = vec![];
-        let state = AppState::new();
-        let mut instance = Agent::new("orphan", "orphan");
-        instance.template = Some("gone".to_string());
-        state.register_agent(instance);
-        assert!(!is_framed_send_allowed(&configs, &state, "orphan"));
-    }
-
-    #[test]
-    fn resolve_runtime_direct_slot_wins_over_template() {
-        // If an agent_id exists as both a direct yaml slot AND a
-        // state-persisted instance (shouldn't happen in practice, but
-        // belts-and-suspenders), the direct config is authoritative.
-        let configs = vec![("alor".to_string(), cfg("claude-sdk"))];
-        let state = AppState::new();
-        let mut instance = Agent::new("alor", "alor");
-        instance.template = Some("some-wrapper-template".to_string());
-        state.register_agent(instance);
-        assert_eq!(
-            resolve_agent_runtime(&configs, &state, "alor").as_deref(),
-            Some("claude-sdk")
-        );
-    }
-
-    /// Build a SocketServer wired to real AppState + PaneManager but with
-    /// no connected wrappers and no event subscribers — good enough to
-    /// exercise `handle_message` without a live socket.
-    fn server_for_test() -> SocketServer {
-        SocketServer::with_configs(
-            AppState::new(),
-            crate::terminal::pane_manager::PaneManager::new(),
-            vec![],
-        )
-    }
-
-    /// Drive a task all the way to Completed with a baseline summary so
-    /// the idempotency tests have something to protect.
-    fn completed_task_with_summary(state: &AppState, summary: &str) -> Uuid {
-        let task = Task::new("test-title", "test-description");
-        let id = task.id;
-        state.add_task(task);
-        state
-            .transition_task(id, TaskState::Assigned)
-            .expect("Pending → Assigned");
-        state
-            .transition_task(id, TaskState::Accepted)
-            .expect("Assigned → Accepted");
-        state.set_task_summary(id, summary.to_string());
-        state
-            .transition_task(id, TaskState::Completed)
-            .expect("Accepted → Completed");
-        id
-    }
-
-    #[tokio::test]
-    async fn task_complete_is_idempotent_on_replay() {
-        // Outbox replays can re-deliver a MSG_TASK_COMPLETE the daemon
-        // already processed before its previous crash. The guard must
-        // treat it as a no-op: summary untouched, state untouched, no
-        // second tmux orchestrator ping.
-        let server = server_for_test();
-        let task_id = completed_task_with_summary(&server.app_state, "first-summary");
-
-        let replay = Envelope::new(
-            MSG_TASK_COMPLETE,
-            TaskComplete {
-                task_id,
-                summary: Some("second-summary".to_string()),
-                details: None,
-                output: None,
-            },
-        )
-        .expect("build envelope");
-
-        // Must not panic, must not re-transition, must not overwrite.
-        server.handle_message("test-agent", replay).await;
-
-        let task = server
-            .app_state
-            .get_task(task_id)
-            .expect("task still present");
-        assert_eq!(task.state, TaskState::Completed);
-        assert_eq!(
-            task.summary.as_deref(),
-            Some("first-summary"),
-            "replayed completion must not overwrite existing summary"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_complete_splits_summary_and_details_on_the_wire() {
-        // Hot-path bloat fix #1 (audit 8b03cae6). When a worker sends
-        // `task.complete` with both `summary` and `details`, the daemon
-        // must:
-        //   (a) store the summary verbatim (we're under the 512 B cap
-        //       here — no truncation marker).
-        //   (b) store the details on the Task for `task_get` to return.
-        //   (c) transition the task to Completed.
-        //
-        // The associated broadcast shape (has_details flag, summary
-        // injected, details body NOT injected) is exercised separately
-        // via format_event_for_agent regression tests on the Python
-        // side; here we pin the state mutations.
-        let server = server_for_test();
-        let task = Task::new("t", "d");
-        let id = task.id;
-        server.app_state.add_task(task);
-        server
-            .app_state
-            .transition_task(id, TaskState::Assigned)
-            .expect("assign");
-        server
-            .app_state
-            .transition_task(id, TaskState::Accepted)
-            .expect("accept");
-
-        let env = Envelope::new(
-            MSG_TASK_COMPLETE,
-            TaskComplete {
-                task_id: id,
-                summary: Some("done; scope-check passed".to_string()),
-                details: Some(
-                    "Full report:\n- 3 tests added\n- 1 refactor\n- diff attached".to_string(),
-                ),
-                output: None,
-            },
-        )
-        .expect("build envelope");
-        server.handle_message("test-agent", env).await;
-
-        let t = server.app_state.get_task(id).expect("task present");
-        assert_eq!(t.state, TaskState::Completed);
-        assert_eq!(t.summary.as_deref(), Some("done; scope-check passed"));
-        assert_eq!(
-            t.details.as_deref(),
-            Some("Full report:\n- 3 tests added\n- 1 refactor\n- diff attached")
-        );
-        // Summary under cap must NOT carry the truncation marker.
-        assert!(
-            !t.summary
-                .as_deref()
-                .unwrap()
-                .ends_with(TASK_SUMMARY_TRUNCATION_MARKER),
-            "summary under cap must not be marked truncated"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_complete_truncates_oversize_summary_with_marker() {
-        // Back-compat path: a worker (old or misbehaving) sends a multi-
-        // KB summary with no `details` split. The daemon must truncate
-        // at the protocol cap and stash the clipped form — it may NOT
-        // let a 10 KB summary reach the orch-event broadcast verbatim
-        // (that's the whole point of the fix). No details field gets
-        // synthesized from the oversize summary; the daemon is a
-        // dumb cap, not a splitter. Workers are responsible for the
-        // summary/details split on their side.
-        let server = server_for_test();
-        let task = Task::new("t", "d");
-        let id = task.id;
-        server.app_state.add_task(task);
-        server
-            .app_state
-            .transition_task(id, TaskState::Assigned)
-            .expect("assign");
-        server
-            .app_state
-            .transition_task(id, TaskState::Accepted)
-            .expect("accept");
-
-        // 5 KB of ASCII — comfortably over the 512 B cap.
-        let big = "a".repeat(5_000);
-        let env = Envelope::new(
-            MSG_TASK_COMPLETE,
-            TaskComplete {
-                task_id: id,
-                summary: Some(big.clone()),
-                details: None,
-                output: None,
-            },
-        )
-        .expect("build envelope");
-        server.handle_message("test-agent", env).await;
-
-        let t = server.app_state.get_task(id).expect("task present");
-        assert_eq!(t.state, TaskState::Completed);
-        let stored = t.summary.as_deref().expect("summary stored");
-        assert!(
-            stored.len() <= TASK_SUMMARY_MAX_BYTES,
-            "oversize summary must be truncated to cap; got {} bytes",
-            stored.len()
-        );
-        assert!(
-            stored.ends_with(TASK_SUMMARY_TRUNCATION_MARKER),
-            "truncated summary must carry the marker; got tail {:?}",
-            &stored[stored.len().saturating_sub(32)..]
-        );
-        // And the handler does NOT invent a details field from the clip.
-        // Details synthesis is the worker's job; daemon is cap-only.
-        assert!(
-            t.details.is_none(),
-            "server must not synthesize details from a truncated summary"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_get_default_view_returns_summary_shape_with_has_flags() {
-        // Default (no `view` field on the payload) must resolve to
-        // the "summary" projection: lean scalars + has_* booleans,
-        // heavy bodies dropped. This is the fix's default contract.
-        let server = server_for_test();
-        let mut t = Task::new("title", "non-empty description");
-        t.summary = Some("ok".to_string());
-        t.details = Some("long report".to_string());
-        let id = t.id;
-        server.app_state.add_task(t);
-
-        let env = Envelope::new(
-            MSG_CLI_TASK_GET,
-            serde_json::json!({"task_id": id}),
-        )
-        .expect("build envelope");
-        let resp = server.handle_cli_message(env).await;
-
-        let payload = resp.payload;
-        assert_eq!(payload.get("view").and_then(|v| v.as_str()), Some("summary"));
-        let task = payload.get("task").expect("task present").as_object().expect("object");
-        // Summary-shape affordances.
-        assert_eq!(task.get("has_description"), Some(&serde_json::Value::Bool(true)));
-        assert_eq!(task.get("has_summary"), Some(&serde_json::Value::Bool(true)));
-        assert_eq!(task.get("has_details"), Some(&serde_json::Value::Bool(true)));
-        assert_eq!(task.get("has_proposal_brief"), Some(&serde_json::Value::Bool(false)));
-        assert_eq!(task.get("has_proposal_diff"), Some(&serde_json::Value::Bool(false)));
-        // Heavy bodies must not be present.
-        assert!(task.get("description").is_none(), "summary must not carry description");
-        assert!(task.get("summary").is_none(), "summary view must not carry the summary body");
-        assert!(task.get("details").is_none(), "summary view must not carry details");
-        assert!(task.get("proposal_diff").is_none());
-    }
-
-    #[tokio::test]
-    async fn task_get_full_view_returns_entire_task() {
-        // Explicit opt-in to `view="full"` must return the full Task
-        // including heavy bodies. Back-compat for alor-cli (which
-        // now passes view="full" explicitly) + the orch's follow-up
-        // fetch path after a has_* flag told it there's something
-        // to pull.
-        let server = server_for_test();
-        let mut t = Task::new("title", "the description body");
-        t.summary = Some("ok".to_string());
-        t.details = Some("the long report".to_string());
-        t.proposal_diff = Some("--- a/x\n+++ b/x".to_string());
-        let id = t.id;
-        server.app_state.add_task(t);
-
-        let env = Envelope::new(
-            MSG_CLI_TASK_GET,
-            serde_json::json!({"task_id": id, "view": "full"}),
-        )
-        .expect("build envelope");
-        let resp = server.handle_cli_message(env).await;
-
-        let payload = resp.payload;
-        assert_eq!(payload.get("view").and_then(|v| v.as_str()), Some("full"));
-        let task = payload.get("task").expect("task present").as_object().expect("object");
-        // Heavy bodies round-trip.
-        assert_eq!(
-            task.get("description").and_then(|v| v.as_str()),
-            Some("the description body")
-        );
-        assert_eq!(task.get("summary").and_then(|v| v.as_str()), Some("ok"));
-        assert_eq!(
-            task.get("details").and_then(|v| v.as_str()),
-            Some("the long report")
-        );
-        assert_eq!(
-            task.get("proposal_diff").and_then(|v| v.as_str()),
-            Some("--- a/x\n+++ b/x")
-        );
-        // has_* flags are NOT on the full view — they're a summary-
-        // shape affordance, redundant once the bodies are inline.
-        assert!(
-            task.get("has_description").is_none(),
-            "full view must not carry the has_* affordance flags"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_get_unknown_view_falls_through_to_summary() {
-        // LLM typo forgiveness: `view="Summary"`, `view="FULL"`,
-        // `view="whatever"` all resolve to the safe default
-        // (summary) rather than error. Mirrors the agent_list /
-        // task_list silent fallback.
-        let server = server_for_test();
-        let t = Task::new("title", "desc");
-        let id = t.id;
-        server.app_state.add_task(t);
-
-        let env = Envelope::new(
-            MSG_CLI_TASK_GET,
-            serde_json::json!({"task_id": id, "view": "whatever-typo"}),
-        )
-        .expect("build envelope");
-        let resp = server.handle_cli_message(env).await;
-
-        let payload = resp.payload;
-        assert_eq!(
-            payload.get("view").and_then(|v| v.as_str()),
-            Some("summary"),
-            "unknown view string must fall through to summary"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_get_missing_task_returns_cli_error() {
-        // Regression guard: not-found path must still return a
-        // cli.error (not a summary of a default Task). Shape this
-        // test to the error envelope kind rather than content so a
-        // future error-prose change doesn't flap.
-        let server = server_for_test();
-        let missing = Uuid::new_v4();
-
-        let env = Envelope::new(
-            MSG_CLI_TASK_GET,
-            serde_json::json!({"task_id": missing}),
-        )
-        .expect("build envelope");
-        let resp = server.handle_cli_message(env).await;
-
-        // cli_error produces an MSG_CLI_ERROR envelope with the
-        // prose in payload.error. Confirm shape.
-        assert_eq!(resp.kind, MSG_CLI_ERROR);
-        assert!(
-            resp.payload
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .contains("not found"),
-            "missing-task error payload must say 'not found'; got {:?}",
-            resp.payload
-        );
-    }
-
-    // ---------------------------------------------------------------------
-    // task_list full-view limit clamp (audit 8b03cae6 fix #3)
-    // ---------------------------------------------------------------------
-    //
-    // The list view=full escape hatch used to let a caller land 100+
-    // full-serialized Task objects (1.1 KB each → 110 KB+) in a single
-    // orchestrator tool response by passing `limit=0` or a large limit.
-    // These tests pin the server-side clamp at TASK_LIST_FULL_MAX_LIMIT
-    // (50), the limit_clamped_from / limit_applied response fields, and
-    // the summary-view leave-alone.
-
-    /// Helper: seed `n` tasks into state. Returns nothing — state is
-    /// consulted via the MSG_CLI_TASK_LIST handler directly.
-    fn seed_tasks(state: &AppState, n: usize) {
-        for i in 0..n {
-            state.add_task(Task::new(format!("task-{i}"), "d"));
-        }
-    }
-
-    /// Helper: fire a MSG_CLI_TASK_LIST with the given view/limit and
-    /// return the response payload for inspection.
-    async fn task_list_payload(
-        server: &SocketServer,
-        view: Option<&str>,
-        limit: Option<u32>,
-    ) -> serde_json::Value {
-        let mut body = serde_json::json!({});
-        if let Some(v) = view {
-            body["view"] = serde_json::json!(v);
-        }
-        if let Some(l) = limit {
-            body["limit"] = serde_json::json!(l);
-        }
-        // Force state_filter="all" so non-terminal filter doesn't
-        // silently drop our fixture tasks (new Task defaults to
-        // Pending, which IS non-terminal, but be explicit).
-        body["state_filter"] = serde_json::json!("all");
-        let env = Envelope::new(MSG_CLI_TASK_LIST, body).expect("build envelope");
-        let resp = server.handle_cli_message(env).await;
-        resp.payload
-    }
-
-    #[tokio::test]
-    async fn task_list_full_view_limit_zero_is_clamped_to_max() {
-        // limit=0 historically meant "no limit". On view=full that
-        // was the canonical escape hatch. Must now clamp to
-        // TASK_LIST_FULL_MAX_LIMIT and surface the clamp metadata.
-        let server = server_for_test();
-        seed_tasks(&server.app_state, 100);
-
-        let payload = task_list_payload(&server, Some("full"), Some(0)).await;
-
-        assert_eq!(payload.get("view").and_then(|v| v.as_str()), Some("full"));
-        assert_eq!(
-            payload
-                .get("returned")
-                .and_then(|v| v.as_u64())
-                .expect("returned"),
-            TASK_LIST_FULL_MAX_LIMIT as u64,
-            "limit=0 on view=full must clamp to TASK_LIST_FULL_MAX_LIMIT"
-        );
-        assert_eq!(
-            payload
-                .get("limit_clamped_from")
-                .and_then(|v| v.as_u64())
-                .expect("limit_clamped_from present"),
-            0,
-        );
-        assert_eq!(
-            payload
-                .get("limit_applied")
-                .and_then(|v| v.as_u64())
-                .expect("limit_applied present"),
-            TASK_LIST_FULL_MAX_LIMIT as u64,
-        );
-        // has_more correctly reflects the clamp — 100 tasks, 50
-        // returned, more remain.
-        assert_eq!(
-            payload.get("has_more").and_then(|v| v.as_bool()),
-            Some(true),
-            "clamp must not zero out has_more"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_list_full_view_large_limit_is_clamped_to_max() {
-        // limit=100 (or any limit > MAX) must clamp, with the clamp
-        // metadata reflecting the original value.
-        let server = server_for_test();
-        seed_tasks(&server.app_state, 100);
-
-        let payload = task_list_payload(&server, Some("full"), Some(100)).await;
-
-        assert_eq!(
-            payload
-                .get("returned")
-                .and_then(|v| v.as_u64())
-                .expect("returned"),
-            TASK_LIST_FULL_MAX_LIMIT as u64,
-        );
-        assert_eq!(
-            payload
-                .get("limit_clamped_from")
-                .and_then(|v| v.as_u64())
-                .expect("limit_clamped_from present"),
-            100,
-        );
-        assert_eq!(
-            payload
-                .get("limit_applied")
-                .and_then(|v| v.as_u64())
-                .expect("limit_applied present"),
-            TASK_LIST_FULL_MAX_LIMIT as u64,
-        );
-    }
-
-    #[tokio::test]
-    async fn task_list_full_view_small_limit_is_not_clamped() {
-        // A limit inside the cap must pass through untouched — no
-        // clamp metadata in the response so the normal-path shape
-        // is unchanged.
-        let server = server_for_test();
-        seed_tasks(&server.app_state, 100);
-
-        let payload = task_list_payload(&server, Some("full"), Some(10)).await;
-
-        assert_eq!(
-            payload
-                .get("returned")
-                .and_then(|v| v.as_u64())
-                .expect("returned"),
-            10,
-        );
-        assert!(
-            payload.get("limit_clamped_from").is_none(),
-            "unclamped response must NOT carry limit_clamped_from; \
-             got payload = {}",
-            payload
-        );
-        assert!(
-            payload.get("limit_applied").is_none(),
-            "unclamped response must NOT carry limit_applied"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_list_full_view_at_exact_cap_is_not_clamped() {
-        // Boundary: limit == MAX must NOT trigger the clamp (it's
-        // the exact allowed value). Guards against off-by-one in
-        // the `would_exceed` predicate.
-        let server = server_for_test();
-        seed_tasks(&server.app_state, 100);
-
-        let payload = task_list_payload(
-            &server,
-            Some("full"),
-            Some(TASK_LIST_FULL_MAX_LIMIT),
-        )
-        .await;
-
-        assert_eq!(
-            payload
-                .get("returned")
-                .and_then(|v| v.as_u64())
-                .expect("returned"),
-            TASK_LIST_FULL_MAX_LIMIT as u64,
-        );
-        assert!(
-            payload.get("limit_clamped_from").is_none(),
-            "limit == cap must not trigger clamp metadata"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_list_summary_view_limit_zero_is_not_clamped() {
-        // Summary view remains unclamped — the per-task projection
-        // is lean (~70 tokens) and unlimited scans are context-safe
-        // at realistic task counts. This is the behavior callers
-        // doing a "give me everything for the dashboard" scan rely
-        // on; changing it here would be a regression for every
-        // summary consumer.
-        let server = server_for_test();
-        seed_tasks(&server.app_state, 100);
-
-        let payload = task_list_payload(&server, Some("summary"), Some(0)).await;
-
-        assert_eq!(payload.get("view").and_then(|v| v.as_str()), Some("summary"));
-        assert_eq!(
-            payload
-                .get("returned")
-                .and_then(|v| v.as_u64())
-                .expect("returned"),
-            100,
-            "summary view with limit=0 must return the whole filtered set"
-        );
-        assert!(
-            payload.get("limit_clamped_from").is_none(),
-            "summary-view response must not carry clamp metadata"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_list_default_view_with_limit_zero_is_not_clamped() {
-        // Default view (no `view` field on the payload) resolves to
-        // summary per DEFAULT_TASK_LIST_VIEW. Same leave-alone
-        // contract as explicit summary.
-        let server = server_for_test();
-        seed_tasks(&server.app_state, 100);
-
-        let payload = task_list_payload(&server, None, Some(0)).await;
-
-        assert_eq!(payload.get("view").and_then(|v| v.as_str()), Some("summary"));
-        assert_eq!(
-            payload
-                .get("returned")
-                .and_then(|v| v.as_u64())
-                .expect("returned"),
-            100,
-        );
-        assert!(payload.get("limit_clamped_from").is_none());
-    }
-
-    // ---------------------------------------------------------------------
-    // worker_response_get fetch-on-demand (audit 8b03cae6 fix #4)
-    // ---------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn worker_response_get_returns_cached_text_by_correlation_id() {
-        // End-to-end: seed a response in the cache, fire
-        // MSG_CLI_WORKER_RESPONSE_GET, confirm the response envelope
-        // carries the full text + metadata. This is the path the
-        // orchestrator hits after seeing a truncated worker.orch_response
-        // event carrying a worker_response_get(correlation_id=X) pointer.
-        let server = server_for_test();
-        let cid = Uuid::new_v4();
-        let tid = Uuid::new_v4();
-        let full_text = "x".repeat(5_000);
-        server.app_state.record_worker_response(WorkerResponseRecord {
-            correlation_id: cid,
-            agent_id: "claude-mandaforge".to_string(),
-            text: full_text.clone(),
-            task_id: Some(tid),
-            during_task: true,
-            timestamp: chrono::Utc::now(),
-        });
-
-        let env = Envelope::new(
-            MSG_CLI_WORKER_RESPONSE_GET,
-            serde_json::json!({"correlation_id": cid}),
-        )
-        .expect("build envelope");
-        let resp = server.handle_cli_message(env).await;
-
-        assert_eq!(resp.kind, MSG_CLI_RESPONSE);
-        let payload = resp.payload;
-        assert_eq!(
-            payload.get("correlation_id").and_then(|v| v.as_str()),
-            Some(cid.to_string().as_str())
-        );
-        assert_eq!(
-            payload.get("agent_id").and_then(|v| v.as_str()),
-            Some("claude-mandaforge")
-        );
-        // The whole 5 KB round-trips — that's the entire point of
-        // the cache (orch already has a 2 KB truncated copy; it's
-        // here to recover the full body).
-        assert_eq!(
-            payload.get("text").and_then(|v| v.as_str()).map(str::len),
-            Some(5_000)
-        );
-        assert_eq!(
-            payload.get("task_id").and_then(|v| v.as_str()),
-            Some(tid.to_string().as_str())
-        );
-        assert_eq!(
-            payload.get("during_task").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        // Timestamp is an RFC3339 string; just confirm it's non-empty.
-        assert!(
-            payload
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .map(|s| !s.is_empty())
-                .unwrap_or(false),
-            "timestamp must be present + non-empty"
-        );
-    }
-
-    #[tokio::test]
-    async fn worker_response_get_unknown_correlation_id_returns_cli_error() {
-        // Not-found path. Must be a typed cli_error envelope (so
-        // Python-side DaemonError fires) rather than a silent empty
-        // text — otherwise the LLM would think the response genuinely
-        // came back empty and not retry / ask Fett directly.
-        let server = server_for_test();
-        let unknown = Uuid::new_v4();
-
-        let env = Envelope::new(
-            MSG_CLI_WORKER_RESPONSE_GET,
-            serde_json::json!({"correlation_id": unknown}),
-        )
-        .expect("build envelope");
-        let resp = server.handle_cli_message(env).await;
-
-        assert_eq!(resp.kind, MSG_CLI_ERROR);
-        let err_msg = resp
-            .payload
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        assert!(
-            err_msg.contains("not found"),
-            "error prose must say 'not found'; got {:?}",
-            err_msg
-        );
-        // Include the id in the prose so logs / LLM context can
-        // distinguish which id failed when multiple fetches race.
-        assert!(
-            err_msg.contains(&unknown.to_string()),
-            "error prose must echo the unknown correlation_id"
-        );
-    }
-
-    #[tokio::test]
-    async fn msg_worker_orch_response_handler_stashes_before_broadcast() {
-        // Integration: the full handler path records to the cache so
-        // a subsequent fetch resolves. Separate from the
-        // cache-unit-tests above (which exercise AppState directly) —
-        // this one pins the MSG_WORKER_ORCH_RESPONSE → cache write
-        // wire-up.
-        let server = server_for_test();
-        let cid = Uuid::new_v4();
-        let env = Envelope::new(
-            MSG_WORKER_ORCH_RESPONSE,
-            WorkerOrchResponse {
-                agent_id: "ignored-per-connection-bound-rule".to_string(),
-                correlation_id: cid,
-                text: "y".repeat(4_000),
-                during_task: false,
-                task_id: None,
-            },
-        )
-        .expect("build envelope");
-        server.handle_message("claude-alor", env).await;
-
-        // Cache populated with the full body — this is what the fetch
-        // RPC would return. The agent_id on the record reflects the
-        // connection-bound agent (security: workers can't forge a
-        // reply on behalf of another agent).
-        let rec = server
-            .app_state
-            .get_worker_response(cid)
-            .expect("handler must have recorded the response before broadcast");
-        assert_eq!(rec.text.len(), 4_000);
-        assert_eq!(rec.agent_id, "claude-alor");
-    }
-
-    // ---------------------------------------------------------------------
-    // memory_get file_names filter (audit 8b03cae6 fix #5)
-    // ---------------------------------------------------------------------
-
-    #[test]
-    fn is_safe_hub_basename_accepts_plain_filenames() {
-        // Positive cases — things callers legitimately pass.
-        assert!(super::is_safe_hub_basename("index.md"));
-        assert!(super::is_safe_hub_basename("notes.txt"));
-        assert!(super::is_safe_hub_basename("README"));
-        assert!(super::is_safe_hub_basename("file-with-dashes.md"));
-        assert!(super::is_safe_hub_basename("file.with.dots.md"));
-        assert!(super::is_safe_hub_basename(".hidden"));
-    }
-
-    #[test]
-    fn is_safe_hub_basename_rejects_traversal_and_hierarchical() {
-        // Negative cases — traversal attempts + non-basename inputs.
-        assert!(!super::is_safe_hub_basename(""), "empty name");
-        assert!(!super::is_safe_hub_basename("."), "bare dot");
-        assert!(!super::is_safe_hub_basename(".."), "bare dot-dot");
-        assert!(!super::is_safe_hub_basename("../etc/passwd"));
-        assert!(!super::is_safe_hub_basename("/etc/passwd"));
-        assert!(!super::is_safe_hub_basename("/absolute"));
-        assert!(!super::is_safe_hub_basename("sub/nested.md"));
-        assert!(!super::is_safe_hub_basename("..\\windows-style"));
-        assert!(!super::is_safe_hub_basename("back\\slash.md"));
-        // NUL bytes: belt-and-braces rejection.
-        assert!(!super::is_safe_hub_basename("file\0null.md"));
-    }
-
-    // ---------------------------------------------------------------------
-    // End-to-end handler tests. These mutate XDG_DATA_HOME (the hub
-    // dir anchor) so they MUST be serialized — the Rust test runner
-    // runs tests concurrently by default, and env-var mutation is
-    // process-global. A module-level mutex around the env+fs section
-    // keeps them from racing each other.
-    // ---------------------------------------------------------------------
-
-    static MEMORY_GET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII helper: sets `XDG_DATA_HOME` for the duration of the test,
-    /// creates the hub dir for `project`, writes the supplied files
-    /// into it, and restores the prior env on drop.
-    struct HubFixture {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        _tempdir: tempfile::TempDir,
-        prior_xdg: Option<std::ffi::OsString>,
-    }
-
-    impl HubFixture {
-        fn new(project: &str, files: &[(&str, &str)]) -> Self {
-            let guard = MEMORY_GET_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            let tempdir = tempfile::tempdir().expect("tempdir");
-            let prior_xdg = std::env::var_os("XDG_DATA_HOME");
-            std::env::set_var("XDG_DATA_HOME", tempdir.path());
-
-            // ProjectDirs resolves to {XDG_DATA_HOME}/alor on Linux,
-            // so the hub lives at {tempdir}/alor/hubs/{project}.
-            let hub = tempdir
-                .path()
-                .join("alor")
-                .join("hubs")
-                .join(project);
-            std::fs::create_dir_all(&hub).expect("mkdir hub");
-            for (name, content) in files {
-                std::fs::write(hub.join(name), content).expect("write fixture");
-            }
-
-            Self {
-                _guard: guard,
-                _tempdir: tempdir,
-                prior_xdg,
-            }
-        }
-    }
-
-    impl Drop for HubFixture {
-        fn drop(&mut self) {
-            match &self.prior_xdg {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
-    }
-
-    /// Invoke the MSG_CLI_MEMORY_GET handler with the given payload
-    /// and return the response payload as serde_json::Value.
-    async fn memory_get_payload(
-        server: &SocketServer,
-        body: serde_json::Value,
-    ) -> serde_json::Value {
-        let env = Envelope::new(MSG_CLI_MEMORY_GET, body).expect("build envelope");
-        server.handle_cli_message(env).await.payload
-    }
-
-    #[tokio::test]
-    async fn memory_get_no_filter_returns_all_hub_files() {
-        // Back-compat: no file_names → return everything in the hub,
-        // same shape as pre-fix. No `missing` field on the response.
-        let _fx = HubFixture::new(
-            "alor",
-            &[
-                ("index.md", "# Index\nsee README"),
-                ("notes.md", "# Notes\none two three"),
-            ],
-        );
-        let server = server_for_test();
-
-        let payload = memory_get_payload(
-            &server,
-            serde_json::json!({"project": "alor"}),
-        )
-        .await;
-
-        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
-        assert_eq!(files.len(), 2, "all hub files returned");
-        assert!(files.get("index.md").is_some());
-        assert!(files.get("notes.md").is_some());
-        assert!(
-            payload.get("missing").is_none(),
-            "no-filter response must not carry `missing`"
-        );
-    }
-
-    #[tokio::test]
-    async fn memory_get_with_filter_returns_only_named_files() {
-        // The main fix: caller pulls one file from a hub that has
-        // several.
-        let _fx = HubFixture::new(
-            "alor",
-            &[
-                ("index.md", "# Index content"),
-                ("notes.md", "# Notes content"),
-                ("reference.md", "# Reference content"),
-            ],
-        );
-        let server = server_for_test();
-
-        let payload = memory_get_payload(
-            &server,
-            serde_json::json!({
-                "project": "alor",
-                "file_names": ["index.md"],
-            }),
-        )
-        .await;
-
-        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
-        assert_eq!(files.len(), 1, "only the named file returned");
-        assert_eq!(
-            files.get("index.md").and_then(|v| v.as_str()),
-            Some("# Index content")
-        );
-        // Filter-active path emits `missing`, empty here because the
-        // one requested file was found on disk.
-        let missing = payload
-            .get("missing")
-            .and_then(|v| v.as_array())
-            .expect("missing present (filter active)");
-        assert!(missing.is_empty());
-    }
-
-    #[tokio::test]
-    async fn memory_get_filter_treats_traversal_as_missing() {
-        // Path-traversal rejection: `../etc/passwd`, `/etc/passwd`,
-        // `sub/nested.md` must all surface in `missing` rather than
-        // escape the hub dir.
-        let _fx = HubFixture::new(
-            "alor",
-            &[("index.md", "# legitimate")],
-        );
-        let server = server_for_test();
-
-        let payload = memory_get_payload(
-            &server,
-            serde_json::json!({
-                "project": "alor",
-                "file_names": [
-                    "../etc/passwd",
-                    "/etc/passwd",
-                    "sub/nested.md",
-                    "..",
-                    "",
-                ],
-            }),
-        )
-        .await;
-
-        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
-        assert!(
-            files.is_empty(),
-            "no traversal-variant name must be served"
-        );
-        let missing: Vec<String> = payload
-            .get("missing")
-            .and_then(|v| v.as_array())
-            .expect("missing present")
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        // All rejected names surface as missing so the caller sees a
-        // consistent "I asked for X, didn't get X" shape.
-        for bad in ["../etc/passwd", "/etc/passwd", "sub/nested.md", "..", ""] {
-            assert!(
-                missing.contains(&bad.to_string()),
-                "traversal/invalid name {bad:?} must appear in missing; got {missing:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn memory_get_filter_reports_unknown_files_as_missing_without_panic() {
-        // Unknown but well-formed basenames → empty files, name in
-        // missing. No panic, no error envelope.
-        let _fx = HubFixture::new(
-            "alor",
-            &[("index.md", "# present")],
-        );
-        let server = server_for_test();
-
-        let payload = memory_get_payload(
-            &server,
-            serde_json::json!({
-                "project": "alor",
-                "file_names": ["nonexistent.md", "also-missing.md"],
-            }),
-        )
-        .await;
-
-        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
-        assert!(files.is_empty());
-        let missing: Vec<String> = payload
-            .get("missing")
-            .and_then(|v| v.as_array())
-            .unwrap()
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        assert!(missing.contains(&"nonexistent.md".to_string()));
-        assert!(missing.contains(&"also-missing.md".to_string()));
-    }
-
-    #[tokio::test]
-    async fn memory_get_over_warn_threshold_still_serves_full_response() {
-        // The MEMORY_GET_WARN_BYTES threshold (10 KiB) is operational
-        // telemetry — a warn-log that fires when the orch keeps
-        // tripping the size ceiling without using the file_names
-        // filter — NOT a cap. Pin this contract: the response is
-        // still served in full even when it goes well over the
-        // threshold. (Capturing the warn-log itself would require
-        // another dev-dep — tracing-test — for modest value; the
-        // threshold constant lives next to the handler call-site
-        // so a visual mismatch there is the more likely regression
-        // shape anyway.)
-        //
-        // 12 KiB total across two files is comfortably over the
-        // 10 KiB threshold.
-        let body_a = "a".repeat(6_000);
-        let body_b = "b".repeat(6_000);
-        let _fx = HubFixture::new(
-            "alor",
-            &[
-                ("big-a.md", body_a.as_str()),
-                ("big-b.md", body_b.as_str()),
-            ],
-        );
-        let server = server_for_test();
-
-        let payload = memory_get_payload(
-            &server,
-            serde_json::json!({"project": "alor"}),
-        )
-        .await;
-
-        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
-        assert_eq!(files.len(), 2);
-        let got_a = files.get("big-a.md").and_then(|v| v.as_str()).expect("big-a");
-        let got_b = files.get("big-b.md").and_then(|v| v.as_str()).expect("big-b");
-        assert_eq!(got_a.len(), 6_000, "full content of big-a served");
-        assert_eq!(got_b.len(), 6_000, "full content of big-b served");
-        // Total served bytes > threshold — confirms warn is advisory
-        // rather than capping.
-        assert!(got_a.len() + got_b.len() > MEMORY_GET_WARN_BYTES);
-    }
-
-    #[tokio::test]
-    async fn memory_get_empty_filter_is_equivalent_to_no_filter() {
-        // Empty list `[]` must fall through to the whole-hub read,
-        // matching None. Different wire shape (filter_active=false)
-        // → no `missing` field emitted.
-        let _fx = HubFixture::new(
-            "alor",
-            &[("index.md", "content"), ("notes.md", "more content")],
-        );
-        let server = server_for_test();
-
-        let payload = memory_get_payload(
-            &server,
-            serde_json::json!({"project": "alor", "file_names": []}),
-        )
-        .await;
-
-        let files = payload.get("files").and_then(|v| v.as_object()).expect("files");
-        assert_eq!(files.len(), 2);
-        assert!(
-            payload.get("missing").is_none(),
-            "empty filter must be treated as no filter — no `missing` in wire shape"
-        );
-    }
-
-    #[tokio::test]
-    async fn task_accept_is_idempotent_on_replay() {
-        // Same shape for task.accept: Accepted → Accepted is otherwise an
-        // illegal transition, which used to log a warn on every replay.
-        let server = server_for_test();
-        let task = Task::new("t", "d");
-        let id = task.id;
-        server.app_state.add_task(task);
-        server
-            .app_state
-            .transition_task(id, TaskState::Assigned)
-            .expect("assign");
-        server
-            .app_state
-            .transition_task(id, TaskState::Accepted)
-            .expect("accept");
-
-        let replay = Envelope::new(MSG_TASK_ACCEPT, TaskAccept { task_id: id })
-            .expect("build envelope");
-        server.handle_message("test-agent", replay).await;
-
-        let t = server.app_state.get_task(id).expect("present");
-        assert_eq!(t.state, TaskState::Accepted);
     }
 }

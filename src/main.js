@@ -12,7 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { initAgentPanel } from "./components/AgentPanel.js";
 import { initTaskList }   from "./components/TaskList.js";
 import { initTerminal }   from "./components/Terminal.js";
-import { toastIpcError } from "./toast.js";
+import { showToast, toastIpcError } from "./toast.js";
 
 // ---------------------------------------------------------------------------
 // Session header
@@ -93,18 +93,40 @@ async function init() {
   initTaskList();
   await initTerminal();
 
-  // Kill all sessions button
+  // Kill all sessions button.
+  //
+  // Typed-confirm gate (2026-04-20 hardening): the backend requires
+  // the literal token "KILL" — a generic OK/Cancel click-through
+  // isn't enough. If the user hits Cancel on the prompt, OR types
+  // anything other than "KILL", we abort client-side without
+  // invoking. Backend also re-validates as defense-in-depth so
+  // programmatic callers (future CLI wrappers, Tauri-internal
+  // shortcuts) can't bypass.
   const $btnKillAll = document.getElementById("btn-kill-all");
   if ($btnKillAll) {
     $btnKillAll.addEventListener("click", async () => {
-      if (confirm("Kill all background agent sessions and wrappers?")) {
-        try {
-          await invoke("kill_all_agents");
-          console.log("[main] kill_all_agents successful");
-        } catch (err) {
-          console.error("[main] kill_all_agents failed:", err);
-          toastIpcError("Failed to kill sessions", err);
-        }
+      const typed = prompt(
+        "Kill ALL background agent sessions and wrappers.\n" +
+        "This is irreversible.\n\n" +
+        "Type KILL to confirm:"
+      );
+      if (typed === null) {
+        // Cancel — silent no-op.
+        return;
+      }
+      if (typed !== "KILL") {
+        showToast(
+          `Kill all aborted: type exactly KILL (got ${JSON.stringify(typed)}).`,
+          { variant: "error", duration: 10_000 },
+        );
+        return;
+      }
+      try {
+        await invoke("kill_all_agents", { confirm: typed });
+        console.log("[main] kill_all_agents successful");
+      } catch (err) {
+        console.error("[main] kill_all_agents failed:", err);
+        toastIpcError("Failed to kill sessions", err);
       }
     });
   }

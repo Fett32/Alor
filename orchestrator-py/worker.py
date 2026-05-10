@@ -16,6 +16,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
@@ -39,6 +40,9 @@ from alor_footer import print_footer
 import tools
 from tool_gate import make_gate
 
+# `[1m]` suffix → see main.py's matching constant for the full note.
+# Short version: valid Claude Code CLI variant-ID suffix for the 1M-
+# context route, NOT a leaked context-window label. Verified live.
 DEFAULT_MODEL = os.environ.get("ALOR_WORKER_MODEL", "claude-opus-4-7[1m]")
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "worker_prompt.md"
 
@@ -130,10 +134,40 @@ async def run_task(
     print(f"\n{C_BLUE}━━ TASK {task_id[:8]} ━━{C_RESET}  {C_DIM}{title}{C_RESET}")
 
     # Accept immediately — SDK readiness is structural, no injection race.
+    #
+    # `sock.send_accept` routes through the strict-send path, NOT the
+    # queueing one: silent enqueue of task.accept was a real bug
+    # (2026-04-20, task 73378a0d). If send_accept raises, the daemon
+    # does NOT know we own this task — proceeding into the SDK turn
+    # would stream a response that could never be credited. Refuse
+    # loudly; let the daemon-side timeout / reassign path handle it.
     try:
         await sock.send_accept(task_id)
+    except asyncio.CancelledError:
+        # Shutting down before we even started the task. Propagate.
+        raise
     except Exception as e:
-        print(f"{C_RED}[accept send failed] {e}{C_RESET}")
+        # send_accept raised (either AgentClientError from the strict
+        # path, or an unexpected programming bug). Either way: DO NOT
+        # enter the SDK phase. The task stays in ASSIGNED on the
+        # daemon side; operator/timeout reassigns.
+        print(
+            f"{C_RED}[accept not delivered — refusing to proceed; "
+            f"task stays ASSIGNED until daemon-side reassignment] "
+            f"{e!r}{C_RESET}\n{C_DIM}{traceback.format_exc()}{C_RESET}"
+        )
+        # Best-effort error broadcast so the orch's event stream sees
+        # the worker-side refusal. This uses the queueing `send()`
+        # path (not strict), so if the socket is still down this just
+        # queues for reconnect — acceptable for telemetry.
+        try:
+            await sock.send_error(
+                f"send_accept failed for task {task_id}: {e!r}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
         return
 
     prompt = f"{title}\n\n{description}" if title else description
@@ -163,13 +197,78 @@ async def run_task(
             async with client_lock:
                 await client.query(prompt)
                 await process_response(client, totals, cost, on_text=capture)
+        except asyncio.CancelledError:
+            # Cancellation is a control-flow signal, not a bug. The
+            # outer cleanup (`finally` below) still clears the
+            # per-turn state before the cancellation propagates.
+            # Previously swallowed by `except Exception` (pre-3.8
+            # habit where CancelledError was a subclass), which
+            # made /quit-driven shutdown look like a "worker
+            # exception during task" in logs + fired a stray
+            # wrapper.error at the daemon.
+            raise
         except Exception as e:
+            # Real bug — not cancellation, not a transport failure
+            # (SDK client errors land here). Log the full traceback
+            # so bugs become diagnosable rather than showing up as
+            # a one-line "worker exception during task: X" with no
+            # stack.
+            tb = traceback.format_exc()
             err = f"worker exception during task: {e}"
-            print(f"{C_RED}[task error] {err}{C_RESET}")
+            print(f"{C_RED}[task error] {err}{C_RESET}\n{C_DIM}{tb}{C_RESET}")
+
+            # Two envelopes to the daemon, in order:
+            #
+            # 1. `wrapper.error` — telemetry broadcast. Surfaces the
+            #    error + traceback in the orch's event stream +
+            #    daemon logs. Same as pre-fix behavior.
+            #
+            # 2. `task.blocked` — STATE TRANSITION. Without this,
+            #    the daemon's view stays at ACCEPTED forever and
+            #    the agent slot is stuck at capacity (especially
+            #    bad for max_concurrent=1 agents). The daemon's
+            #    MSG_TASK_BLOCKED handler transitions
+            #    Accepted → Blocked, which clears the slot for
+            #    reassignment. This is the codex-alor audit fix
+            #    (2026-04-20).
+            #
+            # Both use the queueing `send()` path — if one fails,
+            # the other still attempts. send_error is strictly
+            # informational; send_blocked is the one that matters
+            # for slot availability.
             try:
-                await sock.send_error(err)
+                await sock.send_error(f"{err}\n{tb}")
+            except asyncio.CancelledError:
+                raise
             except Exception:
+                # Nested send failure — best-effort. Primary error
+                # already printed; orch may just miss this specific
+                # error broadcast.
                 pass
+
+            try:
+                # Terse reason for the daemon event. The full
+                # traceback already went to the orch via
+                # wrapper.error above; keeping this short keeps the
+                # task.blocked event compact for the event stream.
+                await sock.send_blocked(
+                    task_id=task_id,
+                    reason=f"worker exception: {e!r}",
+                    waiting_for=None,  # unclear what would unblock
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as nested:
+                # If the blocked-transition send fails too, log
+                # loudly — this is the state-transition path, and
+                # a miss means the task stays ACCEPTED (the exact
+                # bug we're fixing). The outbox will replay on
+                # reconnect, but if the failure is non-transport
+                # the slot stays stuck.
+                print(
+                    f"{C_RED}[task.blocked send failed after worker exception] "
+                    f"{nested!r}{C_RESET}"
+                )
             return
 
         print_footer(session_start, cost[0], totals)
@@ -264,22 +363,92 @@ async def daemon_loop(
     Without the outer reconnect loop, a daemon restart would EOF the socket,
     return from recv_forever, exit this coroutine, and take the worker with
     it — which is why workers used to die every time Alor restarted.
+
+    Task-assign handling is DETACHED: each `task.assign` spawns a
+    background `run_task` via `asyncio.create_task` so the
+    `async for env in sock.recv_forever()` loop stays drainable for
+    other envelopes while the SDK turn streams. Actual SDK-turn
+    serialization is still enforced by `client_lock` inside
+    `run_task` itself — detachment only lifts concurrency at the
+    envelope-processing layer.
+
+    Pre-fix the loop awaited `run_task` inline, which held the loop
+    blocked for the entire SDK stream. That caused the 2026-04-20
+    head-of-line stall: a second `task.assign` arriving while the
+    first task was mid-stream sat in ASSIGNED state until the first
+    task finished. `status.request` / `shutdown` were starved the
+    same way.
     """
-    while not stop.is_set():
+    # Background run_task set. add_done_callback(_on_run_task_done)
+    # removes entries on completion; the `finally` block below drains
+    # what's left on shutdown.
+    active_run_tasks: set[asyncio.Task[None]] = set()
+
+    def _on_run_task_done(t: asyncio.Task[None]) -> None:
+        active_run_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is None or isinstance(exc, asyncio.CancelledError):
+            return
+        # run_task has its own except-Exception arm that logs task-
+        # internal failures and returns; reaching this callback means
+        # an exception escaped that arm (intentional re-raise, or a
+        # bug outside the inner try). Surface it — otherwise detached
+        # tasks silently drop their exceptions, which was one of the
+        # classic pitfalls of asyncio.create_task without a done-
+        # callback.
+        tb = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        print(
+            f"{C_RED}[detached {t.get_name()} raised] {exc!r}{C_RESET}\n"
+            f"{C_DIM}{tb}{C_RESET}"
+        )
+
+    try:
+      while not stop.is_set():
         try:
             async for env in sock.recv_forever():
                 if stop.is_set():
                     return
                 if env.kind == MSG_TASK_ASSIGN:
-                    await run_task(
-                        client, client_lock, sock, env, totals, cost, session_start, current
+                    # Detach run_task so daemon_loop stays drainable.
+                    # See module docstring on the HOL-block fix.
+                    task_id_for_name = str(
+                        (env.payload or {}).get("task_id", "?")
+                    )[:8]
+                    bg = asyncio.create_task(
+                        run_task(
+                            client,
+                            client_lock,
+                            sock,
+                            env,
+                            totals,
+                            cost,
+                            session_start,
+                            current,
+                        ),
+                        name=f"run_task:{task_id_for_name}",
                     )
+                    active_run_tasks.add(bg)
+                    bg.add_done_callback(_on_run_task_done)
                 elif env.kind == MSG_STATUS_REQUEST:
                     task_id = (env.payload or {}).get("task_id")
                     try:
                         await sock.send_status(task_id=task_id, alive=True, details="worker online")
-                    except Exception:
-                        pass
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        # Best-effort: the status.request isn't
+                        # critical — daemon will infer liveness from
+                        # other signals. But log unexpected errors
+                        # with traceback instead of a bare `pass`
+                        # that hides bugs in the status-build path.
+                        print(
+                            f"{C_YELLOW}[status send failed] {e!r}{C_RESET}\n"
+                            f"{C_DIM}{traceback.format_exc()}{C_RESET}"
+                        )
                 elif env.kind == MSG_SHUTDOWN:
                     print(f"{C_YELLOW}[daemon shutdown received]{C_RESET}")
                     stop.set()
@@ -288,8 +457,46 @@ async def daemon_loop(
                     # Ignore unknown envelopes — may be cli.* responses or
                     # events that the daemon mistakenly echoed.
                     pass
+        except asyncio.CancelledError:
+            # Cooperative shutdown (worker /quit, SIGTERM, outer
+            # cleanup after stdin_loop exited first). Propagate so
+            # the task actually cancels — DO NOT treat as a
+            # "daemon connection lost" event and enter the
+            # reconnect loop. That's exactly the bug the old
+            # `except Exception` caused: CancelledError is NOT an
+            # Exception subclass in Python 3.8+, so this arm only
+            # exists to make intent explicit — but we want to be
+            # loud about the split since the tuple `except
+            # (CancelledError, Exception)` pre-fix pattern was
+            # written by someone who thought they caught the same
+            # thing.
+            raise
+        except OSError as e:
+            # Real transport-layer error: broken socket, connection
+            # reset, EPIPE mid-read, daemon restart closed our end.
+            # Expected during daemon cycling; the reconnect block
+            # below handles recovery. Log the errno shape so
+            # post-mortem can attribute to a specific failure mode.
+            print(f"{C_YELLOW}[daemon_loop transport error] {e!r}{C_RESET}")
         except Exception as e:
-            print(f"{C_RED}[daemon_loop error] {e}{C_RESET}")
+            # Real bug — KeyError in envelope decode, TypeError in
+            # a handler, JSONDecodeError re-raised past the
+            # `recv_forever` skip path, a programming mistake in
+            # one of the MSG_* branches, etc. Pre-fix, these
+            # landed in `[daemon_loop error]` with no traceback
+            # and triggered a reconnect — disguising the bug as a
+            # "network error" + silently continuing.
+            #
+            # Fix: dump the full traceback so the bug is
+            # diagnosable, flag explicitly as a bug (not a
+            # transport error), and still continue into the
+            # recovery path — we don't want a single rogue
+            # envelope to permanently kill the worker, but the
+            # log evidence now makes drift visible.
+            print(
+                f"{C_RED}[daemon_loop BUG — not a transport error] "
+                f"{e!r}{C_RESET}\n{C_DIM}{traceback.format_exc()}{C_RESET}"
+            )
 
         if stop.is_set():
             return
@@ -303,12 +510,25 @@ async def daemon_loop(
         try:
             await sock.connect_and_register()
             print(f"{C_GREEN}[reconnected to daemon]{C_RESET}")
-        except Exception as e:
-            print(f"{C_RED}[reconnect failed] {e}; retrying in 3s{C_RESET}")
+        except asyncio.CancelledError:
+            raise
+        except OSError as e:
+            # Expected shape during daemon-down windows.
+            print(f"{C_RED}[reconnect failed] {e!r}; retrying in 3s{C_RESET}")
             await asyncio.sleep(3.0)
-            # Skip the flush attempt this iteration — not connected. The
-            # outer `while not stop.is_set()` loop takes us back through
-            # the reconnect dance on the next pass.
+            continue
+        except Exception as e:
+            # Non-transport failure during reconnect (e.g. auth /
+            # registration logic bug). Don't treat as a "retry in
+            # 3s" — surface the traceback so the bug is visible,
+            # but still continue the reconnect loop so the worker
+            # can recover if the bug turns out to be environmental.
+            print(
+                f"{C_RED}[reconnect BUG — not a transport error] "
+                f"{e!r}; retrying in 3s{C_RESET}\n"
+                f"{C_DIM}{traceback.format_exc()}{C_RESET}"
+            )
+            await asyncio.sleep(3.0)
             continue
 
         # Drain any envelopes that were stashed while the socket was down
@@ -321,8 +541,17 @@ async def daemon_loop(
         if pending:
             try:
                 flushed = await sock.flush_outbox()
+            except asyncio.CancelledError:
+                raise
+            except OSError as e:
+                print(f"{C_YELLOW}[flush transport error] {e!r}{C_RESET}")
+                flushed = 0
             except Exception as e:
-                print(f"{C_RED}[flush error] {e}{C_RESET}")
+                print(
+                    f"{C_RED}[flush BUG — not a transport error] "
+                    f"{e!r}{C_RESET}\n"
+                    f"{C_DIM}{traceback.format_exc()}{C_RESET}"
+                )
                 flushed = 0
             remaining = sock.pending_count()
             if remaining:
@@ -333,6 +562,37 @@ async def daemon_loop(
                 await sock.close()
                 continue
             print(f"{C_GREEN}[flushed {flushed} queued envelope(s)]{C_RESET}")
+    finally:
+        # Drain outstanding detached run_task(s) on shutdown. On
+        # normal /quit or SIGTERM the worker should finish cleanly
+        # rather than leaving orphan background tasks — which would
+        # otherwise print "Task was destroyed but it is pending!"
+        # warnings and potentially lose a partial task.complete mid-
+        # send. Bounded wait so a wedged SDK turn can't block
+        # shutdown indefinitely.
+        if active_run_tasks:
+            pending_tasks = [t for t in active_run_tasks if not t.done()]
+            if pending_tasks:
+                print(
+                    f"{C_YELLOW}[daemon_loop shutdown: cancelling "
+                    f"{len(pending_tasks)} active run_task(s)]{C_RESET}"
+                )
+                for t in pending_tasks:
+                    t.cancel()
+                # Shield from CancelledError propagating into us
+                # before we've finished draining — we want each
+                # run_task's own finally (which clears per-turn
+                # state) to get a fair chance to run.
+                try:
+                    await asyncio.wait(pending_tasks, timeout=2.0)
+                except asyncio.CancelledError:
+                    # We're being cancelled on top of already
+                    # cancelling children. Let it propagate after
+                    # one more best-effort nudge.
+                    for t in pending_tasks:
+                        if not t.done():
+                            t.cancel()
+                    raise
 
 
 async def stdin_loop(
@@ -425,10 +685,27 @@ async def stdin_loop(
                                 client, totals, cost, on_text=capture_orch_reply
                             )
                         dispatched = True
+                    except asyncio.CancelledError:
+                        # Cooperative cancel (worker shutting down
+                        # or outer task cancelled). Propagate — the
+                        # orch_response emit path below is skipped,
+                        # but the awaiting orch will time out
+                        # naturally. Getting stuck with an
+                        # un-propagated CancelledError would leak
+                        # the stdin_loop task instead.
+                        raise
                     except Exception as e:
-                        print(f"{C_RED}[error] {e}{C_RESET}")
-                        # Fall through — still emit orch_response (possibly
-                        # empty) so the orch's await doesn't hang forever.
+                        # Real bug path. Dump traceback so we can
+                        # actually see what went wrong — the old
+                        # bare `[error] <e>` hid KeyError /
+                        # TypeError / SDK-side bugs in a single-
+                        # line log. Still fall through to emit an
+                        # orch_response (possibly empty) so the
+                        # orch's await doesn't hang forever.
+                        print(
+                            f"{C_RED}[frame dispatch error] {e!r}{C_RESET}\n"
+                            f"{C_DIM}{traceback.format_exc()}{C_RESET}"
+                        )
                 # else: empty-body frame. Still report back so the awaiting
                 # caller gets a prompt timeout-or-empty answer instead of
                 # waiting 60s.
@@ -449,11 +726,18 @@ async def stdin_loop(
                         during_task=closed_task_id is not None,
                         task_id=closed_task_id,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     # Non-fatal — orch will just time out waiting. Worth a
                     # visible warning though, since this means a tool call
                     # on the orch side will return a timeout marker.
-                    print(f"{C_RED}[orch_response send failed] {e}{C_RESET}")
+                    # Traceback for non-OSError shapes so a send_*
+                    # bug isn't masked as "orch will retry".
+                    print(
+                        f"{C_RED}[orch_response send failed] {e!r}{C_RESET}\n"
+                        f"{C_DIM}{traceback.format_exc()}{C_RESET}"
+                    )
 
                 if dispatched:
                     print_footer(session_start, cost[0], totals)
@@ -506,10 +790,15 @@ async def stdin_loop(
                             lines_dropped=lines_dropped,
                             task_id=frame_task_id,
                         )
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as e:
                         # Recovery must continue even if the send blows up.
+                        # Traceback so wedged-telemetry-path bugs are
+                        # visible rather than one-line warnings.
                         print(
-                            f"{C_RED}[frame_wedged send failed] {e}{C_RESET}"
+                            f"{C_RED}[frame_wedged send failed] {e!r}{C_RESET}\n"
+                            f"{C_DIM}{traceback.format_exc()}{C_RESET}"
                         )
                 # Stay in_frame; swap uuid + buffer + task_id for the fresh
                 # frame. The orch that issued the stale BEGIN will time out
@@ -567,8 +856,17 @@ async def stdin_loop(
                     await client.disconnect()
                     await client.connect()
                     print("[conversation reset]")
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
-                    print(f"{C_RED}[reset failed] {e}{C_RESET}")
+                    # Disconnect / reconnect failing is a real
+                    # problem — either the SDK shim is wedged or a
+                    # credential refresh failed. Give enough
+                    # context to diagnose instead of a one-liner.
+                    print(
+                        f"{C_RED}[reset failed] {e!r}{C_RESET}\n"
+                        f"{C_DIM}{traceback.format_exc()}{C_RESET}"
+                    )
             continue
 
         # Forward Fett-typed lines to the orch as an event so it stays
@@ -581,17 +879,33 @@ async def stdin_loop(
                 during_task=task_id is not None,
                 task_id=task_id,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             # Non-fatal: keep the local conversation going even if the
             # daemon is unreachable. The orch just won't see this line.
-            print(f"{C_RED}[forward to daemon failed] {e}{C_RESET}")
+            # Traceback keeps a silent bug in user_input encoding from
+            # turning into "orch missed a message" with no clue why.
+            print(
+                f"{C_RED}[forward to daemon failed] {e!r}{C_RESET}\n"
+                f"{C_DIM}{traceback.format_exc()}{C_RESET}"
+            )
 
         try:
             async with client_lock:
                 await client.query(text)
                 await process_response(client, totals, cost, on_text=None)
+        except asyncio.CancelledError:
+            # Worker is shutting down mid-turn. Propagate.
+            raise
         except Exception as e:
-            print(f"{C_RED}[error] {e}{C_RESET}")
+            # Real bug — SDK internal, tool-dispatch failure, etc.
+            # Traceback so we can actually debug the interactive
+            # path's rare failures.
+            print(
+                f"{C_RED}[interactive turn error] {e!r}{C_RESET}\n"
+                f"{C_DIM}{traceback.format_exc()}{C_RESET}"
+            )
 
         print_footer(session_start, cost[0], totals)
 
@@ -690,13 +1004,15 @@ async def main() -> int:
             daemon_task = asyncio.create_task(
                 daemon_loop(
                     sock, client, client_lock, totals, cost, session_start, stop, current
-                )
+                ),
+                name="daemon_loop",
             )
             stdin_task = asyncio.create_task(
                 stdin_loop(
                     client, client_lock, totals, cost, session_start,
                     args.agent_id, stop, sock, current,
-                )
+                ),
+                name="stdin_loop",
             )
 
             done, pending = await asyncio.wait(
@@ -707,8 +1023,27 @@ async def main() -> int:
                 t.cancel()
                 try:
                     await t
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
+                    # Expected: we just called `t.cancel()` above.
+                    # CancelledError is a BaseException (not Exception)
+                    # since Python 3.8, so it WON'T be caught by the
+                    # `except Exception` branch below — the two are
+                    # split deliberately. See main.py's matching
+                    # cleanup block for the same pattern on the orch
+                    # side.
                     pass
+                except Exception as e:
+                    # The loser task raised a real exception during
+                    # teardown (bug in daemon_loop/stdin_loop, socket
+                    # error while winding down, SDK oddity, etc.).
+                    # Don't re-raise — the winning task already
+                    # produced the exit result, and the outer cleanup
+                    # (sock.close) still needs to run. But surface it
+                    # so bugs aren't swallowed by a too-broad except.
+                    print(
+                        f"{C_RED}[{t.get_name()} teardown error] "
+                        f"{e!r}{C_RESET}"
+                    )
 
     await sock.close()
     return 0

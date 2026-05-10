@@ -834,6 +834,7 @@ impl PaneManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::OnceCell;
 
     /// Create a disposable tmux session and return (session_name, first_pane_id).
     /// Caller is responsible for kill-session on cleanup.
@@ -868,29 +869,112 @@ mod tests {
             .await;
     }
 
-    /// Skip the test gracefully if tmux isn't on PATH or isn't usable
-    /// (CI runners without tmux, sandbox environments).
-    async fn tmux_available() -> bool {
-        Command::new("tmux")
-            .arg("-V")
-            .output()
+    /// Outcome of the tmux-runnability probe used by the unit tests
+    /// below. Mirrors `src-tauri/tests/common::TmuxProbe` — duplicated
+    /// here because Rust unit tests in `#[cfg(test)] mod tests` live in
+    /// a different compilation unit from the integration test crate and
+    /// cannot share code. Keep the two in sync.
+    #[derive(Clone, Debug)]
+    enum TmuxProbe {
+        Runnable,
+        Unavailable(String),
+    }
+
+    // Cached probe — the "does tmux actually work here?" answer is
+    // binary-global and the create+kill cycle is non-trivial.
+    static TMUX_PROBE: OnceCell<TmuxProbe> = OnceCell::const_new();
+
+    /// Whether `tmux` can drive a session in the current environment,
+    /// not just whether the binary resolves. `tmux -V` succeeds in
+    /// sandboxed CI but `tmux new-session` can still fail with
+    /// "Operation not permitted" when access to `/tmp/tmux-<uid>/` is
+    /// denied. Only the full probe catches that.
+    async fn tmux_runnable() -> &'static TmuxProbe {
+        TMUX_PROBE
+            .get_or_init(|| async {
+                let vout = match Command::new("tmux").arg("-V").output().await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return TmuxProbe::Unavailable(format!(
+                            "tmux -V failed to spawn: {e}"
+                        ));
+                    }
+                };
+                if !vout.status.success() {
+                    return TmuxProbe::Unavailable(format!(
+                        "tmux -V exited {}: {}",
+                        vout.status,
+                        String::from_utf8_lossy(&vout.stderr).trim()
+                    ));
+                }
+
+                let probe_name = format!(
+                    "alor-pm-tmux-probe-{}",
+                    uuid::Uuid::new_v4().simple()
+                );
+                let sout = match Command::new("tmux")
+                    .args(["new-session", "-d", "-s", &probe_name, "true"])
+                    .output()
+                    .await
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return TmuxProbe::Unavailable(format!(
+                            "tmux new-session failed to spawn: {e}"
+                        ));
+                    }
+                };
+                if !sout.status.success() {
+                    return TmuxProbe::Unavailable(format!(
+                        "tmux new-session failed: {}",
+                        String::from_utf8_lossy(&sout.stderr).trim()
+                    ));
+                }
+
+                // Best-effort cleanup; `true` has already exited so the
+                // session may already be gone.
+                let exact = format!("={probe_name}");
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", &exact])
+                    .output()
+                    .await;
+
+                TmuxProbe::Runnable
+            })
             .await
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+    }
+
+    /// Return true if tmux is runnable; else emit a labelled skip
+    /// message and return false. Caller should `return;` on false.
+    async fn skip_if_tmux_not_runnable(test_label: &str) -> bool {
+        match tmux_runnable().await {
+            TmuxProbe::Runnable => true,
+            TmuxProbe::Unavailable(reason) => {
+                eprintln!(
+                    "[{test_label}] skipping: tmux not runnable in this \
+                     environment ({reason})"
+                );
+                false
+            }
+        }
     }
 
     #[tokio::test]
     async fn pane_exists_returns_true_for_live_pane_and_false_after_kill() {
-        if !tmux_available().await {
-            eprintln!("tmux not available, skipping");
+        if !skip_if_tmux_not_runnable("pane_exists_returns_true_for_live_pane_and_false_after_kill")
+            .await
+        {
             return;
         }
+        // Guard passed → session creation works in this env. A failure
+        // here is a test-specific bug, not an env skip. Panic with the
+        // nonce so repros are actionable.
         let (session, pane_id) = match make_test_session().await {
             Some(v) => v,
-            None => {
-                eprintln!("failed to create test session, skipping");
-                return;
-            }
+            None => panic!(
+                "make_test_session failed after tmux-runnable guard passed — \
+                 unexpected in-test regression"
+            ),
         };
 
         let pm = PaneManager::new();
@@ -913,8 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn pane_exists_rejects_bogus_id() {
-        if !tmux_available().await {
-            eprintln!("tmux not available, skipping");
+        if !skip_if_tmux_not_runnable("pane_exists_rejects_bogus_id").await {
             return;
         }
         let pm = PaneManager::new();
@@ -937,8 +1020,11 @@ mod tests {
         // letting pane_exists confirm it's dead, the stale entry is
         // gone. The actual re-add path is exercised live (see the
         // failure-mode discussion in add_agent_pane's docstring).
-        if !tmux_available().await {
-            eprintln!("tmux not available, skipping");
+        if !skip_if_tmux_not_runnable(
+            "add_agent_pane_evicts_stale_entry_when_tracked_pane_is_dead",
+        )
+        .await
+        {
             return;
         }
 

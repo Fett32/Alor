@@ -507,6 +507,41 @@ async def memory_get(
     return await _one_shot("cli.memory.get", payload)
 
 
+async def memory_append(
+    project: str,
+    file_name: str,
+    text: str,
+) -> dict[str, Any]:
+    """Append `text` to a named file in the project's Memory Hub.
+
+    Companion to `memory_get`. Creates the file if missing. `file_name`
+    must be a leaf basename — names with `..`, `/`, `\\`, or NUL are
+    rejected at the daemon with a `cli.error` (surfaces in Python as
+    `DaemonError`). Text is capped at MEMORY_APPEND_MAX_BYTES (16 KiB)
+    on the daemon side; larger payloads are rejected rather than
+    truncated so a caller can notice + split explicitly.
+
+    Retention: `automation_log.md` gets head-trimmed past
+    AUTOMATION_LOG_MAX_BYTES (256 KiB). Other hub files trim past
+    1 MiB. See `src-tauri/src/daemon/memory.rs` for the exact policy.
+
+    Response shape:
+      {project, file_name, path, bytes_written}
+
+    Automatic distillation path: on every `task.complete` the daemon
+    already appends a one-line entry to `automation_log.md` for tasks
+    that have a project + non-empty summary. `memory_append` is the
+    CURATED-WRITE surface — the orchestrator uses it to promote a
+    particular finding into the hub (into `automation_log.md` or
+    anywhere else) rather than trusting the auto-distiller to pick it
+    up.
+    """
+    return await _one_shot(
+        "cli.memory.append",
+        {"project": project, "file_name": file_name, "text": text},
+    )
+
+
 async def worker_response_get(correlation_id: str) -> dict[str, Any]:
     """Retrieve the full text of a prior `worker.orch_response` from
     the daemon's bounded in-memory cache.

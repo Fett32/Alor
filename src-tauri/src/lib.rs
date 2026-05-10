@@ -176,6 +176,13 @@ pub fn run() {
                 }
             });
 
+            // Clone agent_configs before the recovery thread moves
+            // it — the orphaned-session sweeper (spawned below,
+            // after the reconcile task) needs its own copy to
+            // cross-reference yaml slot ids against live tmux
+            // sessions.
+            let agent_configs_for_sweep = agent_configs.clone();
+
             // Auto-launch wrappers for agents with autolaunch: true OR existing sessions.
             let configs_for_launch = agent_configs;
             let pm_recovery = pane_manager.clone();
@@ -361,6 +368,24 @@ pub fn run() {
                 run_once().await;
                 tokio::time::sleep(std::time::Duration::from_millis(12_000)).await;
                 run_once().await;
+            });
+
+            // Orphaned-session sweeper. Kills `alor-<id>` tmux
+            // sessions that don't correspond to any registered
+            // agent OR any yaml slot — leftovers from crashed
+            // agents, deleted templates, removed yaml configs, or
+            // state corruption. Runs once on a boot delay (matches
+            // reconcile's t+3s cushion so reclaimed wrappers have
+            // had time to register + autolaunch sessions have been
+            // created). See `daemon::session::sweep_orphaned_agent_sessions`
+            // for the full policy including protected `alor-main`.
+            let app_state_sweep = app_state.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                daemon::session::sweep_orphaned_agent_sessions(
+                    &app_state_sweep,
+                    &agent_configs_for_sweep,
+                );
             });
 
             // Start PTY relay for alor-main.

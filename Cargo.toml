@@ -5,3 +5,23 @@ members = [
     "cli",
 ]
 resolver = "2"
+
+# Release-build tuning. Must live at the workspace root — cargo
+# silently ignores `[profile.*]` blocks defined in non-root workspace
+# members (see `src-tauri/Cargo.toml` for a placeholder comment).
+#
+#   panic = "abort"     — drop unwinding metadata; wrappers never
+#                          recover from panics, the daemon will.
+#   codegen-units = 1   — one unit lets LTO see the whole crate graph.
+#   lto = true          — full link-time optimization across crates.
+#   opt-level = "s"     — optimize for size over speed; wrappers are
+#                          latency-insensitive (tmux polls at 500 ms
+#                          anyway) and smaller binaries mean faster
+#                          spawn + less memory resident per agent.
+#   strip = true        — drop debug symbols from the shipped binary.
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

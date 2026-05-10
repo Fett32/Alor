@@ -57,12 +57,29 @@ SOCKET_READ_LIMIT = 16 * 1024 * 1024
 OUTBOX_MAX_ENTRIES = 100
 OUTBOX_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
 
-# Wire-protocol constants — must match wrapper/src/protocol.rs
+# ---- IPC protocol schema (pinned to proto/alor_protocol.yaml) ----
+#
+# Source of truth: `proto/alor_protocol.yaml` in the repo root.
+# The drift-detector test (`test_protocol_drift.py`) enforces that
+# every constant below matches the YAML, and that every Rust
+# `pub const MSG_*` matches it too. Adding a new message kind is
+# a three-step operation: update the YAML, update Rust
+# (`src-tauri/src/wrapper/protocol.rs` + optionally
+# `wrapper/src/protocol.rs`), and update this file's subset.
+# Missing any of them fails the drift test.
+
+# Protocol version gate — see `proto/alor_protocol.yaml` for the
+# rationale. Every Envelope carries this; receivers reject
+# envelopes whose version doesn't match. Bumping here is the
+# forcing function for a coordinated Rust + Python schema change.
+PROTOCOL_VERSION = 1
+
 MSG_REGISTER = "wrapper.register"
 MSG_TASK_ASSIGN = "task.assign"
 MSG_TASK_ACCEPT = "task.accept"
 MSG_TASK_COMPLETE = "task.complete"
-MSG_WRAPPER_ERROR = "wrapper.error"
+MSG_TASK_BLOCKED = "task.blocked"
+MSG_ERROR = "wrapper.error"
 MSG_STATUS_REQUEST = "status.request"
 MSG_STATUS_RESPONSE = "status.response"
 MSG_SHUTDOWN = "daemon.shutdown"
@@ -76,11 +93,26 @@ class AgentClientError(RuntimeError):
     pass
 
 
+class ProtocolVersionError(AgentClientError):
+    """Raised when an incoming envelope's `protocol_version` doesn't
+    match the local `PROTOCOL_VERSION`. Distinct subclass so callers
+    can catch it separately from generic socket / parse errors and
+    surface "schema mismatch — peer needs rebuild" loudly.
+    """
+    pass
+
+
 @dataclass
 class Envelope:
     kind: str
     correlation_id: str
     payload: dict[str, Any]
+    # Defaults to the local PROTOCOL_VERSION for senders; overridden
+    # from the wire on receive. Back-compat: envelopes written
+    # before this field existed decode to PROTOCOL_VERSION via
+    # `from_line`'s `dict.get(..., PROTOCOL_VERSION)` default, so
+    # an older pre-field peer still passes.
+    protocol_version: int = PROTOCOL_VERSION
 
     def to_json(self) -> bytes:
         return (
@@ -88,6 +120,7 @@ class Envelope:
                 {
                     "type": self.kind,
                     "correlation_id": self.correlation_id,
+                    "protocol_version": self.protocol_version,
                     "payload": self.payload,
                 }
             )
@@ -96,16 +129,34 @@ class Envelope:
 
     @classmethod
     def from_line(cls, line: str) -> "Envelope":
+        """Parse a wire envelope. Raises `ProtocolVersionError` if
+        the envelope's `protocol_version` doesn't match the local
+        `PROTOCOL_VERSION`. Absent field → treated as
+        `PROTOCOL_VERSION` for back-compat with pre-version peers.
+        """
         obj = json.loads(line)
+        wire_version = obj.get("protocol_version", PROTOCOL_VERSION)
+        if wire_version != PROTOCOL_VERSION:
+            raise ProtocolVersionError(
+                f"protocol version mismatch: wire={wire_version!r} "
+                f"local={PROTOCOL_VERSION!r}; peer is running a "
+                f"different schema — rebuild both sides in lockstep"
+            )
         return cls(
             kind=obj["type"],
             correlation_id=obj.get("correlation_id", ""),
             payload=obj.get("payload") or {},
+            protocol_version=wire_version,
         )
 
     @staticmethod
     def new(kind: str, payload: dict[str, Any] | None = None) -> "Envelope":
-        return Envelope(kind=kind, correlation_id=str(uuid.uuid4()), payload=payload or {})
+        return Envelope(
+            kind=kind,
+            correlation_id=str(uuid.uuid4()),
+            payload=payload or {},
+            protocol_version=PROTOCOL_VERSION,
+        )
 
 
 class AgentClient:
@@ -409,8 +460,52 @@ class AgentClient:
             self._persist_outbox()
         return sent
 
+    async def _send_strict(self, kind: str, payload: dict[str, Any]) -> None:
+        """Transport-strict variant of `send`: raises on socket failure
+        instead of queueing silently.
+
+        Use for envelopes where silent queue is materially worse than
+        a visible failure. Currently only `task.accept` — see
+        `send_accept` below for the rationale.
+        """
+        env = Envelope.new(kind, payload)
+        frame = env.to_json()
+        if self._writer is None:
+            raise AgentClientError(
+                f"cannot send {kind}: socket not connected"
+            )
+        try:
+            self._writer.write(frame)
+            await self._writer.drain()
+        except OSError as e:
+            # Deliberately re-raise (don't enqueue). Caller needs to
+            # see the failure so it can decline the caller-visible
+            # action that required the send.
+            raise AgentClientError(
+                f"send {kind} failed: {e!r}"
+            ) from e
+
     async def send_accept(self, task_id: str) -> None:
-        await self.send(MSG_TASK_ACCEPT, {"task_id": task_id})
+        """Send `task.accept` for a just-assigned task.
+
+        Routes through `_send_strict`, NOT the queueing `send()` path
+        every other envelope uses. Silent queue on a dead socket was a
+        real, observed bug (2026-04-20, task 73378a0d): if the socket
+        was in a pending-reconnect state at the precise moment
+        `run_task` called `send_accept`, the accept frame would
+        enqueue silently, the daemon would never see it, and the task
+        would sit in ASSIGNED state forever while the worker burned
+        tokens streaming an SDK response into the void.
+
+        Strict semantics here let `run_task` refuse to enter the SDK
+        phase when the daemon hasn't confirmed the assignment —
+        better to fail loudly and leave the task reassignable than to
+        silently credit the wrong agent's work.
+
+        Callers must handle `AgentClientError`. See `worker.run_task`
+        for the caller-side handling pattern.
+        """
+        await self._send_strict(MSG_TASK_ACCEPT, {"task_id": task_id})
 
     async def send_complete(
         self,
@@ -448,9 +543,46 @@ class AgentClient:
 
     async def send_error(self, message: str) -> None:
         await self.send(
-            MSG_WRAPPER_ERROR,
+            MSG_ERROR,
             {"agent_id": self.agent_id, "message": message},
         )
+
+    async def send_blocked(
+        self,
+        task_id: str,
+        reason: str,
+        waiting_for: str | None = None,
+    ) -> None:
+        """Signal the daemon that the worker cannot proceed with a task.
+
+        Sends `task.blocked` which the daemon's MSG_TASK_BLOCKED
+        handler turns into an `Accepted → Blocked` state transition.
+        Unlike `wrapper.error` (which only broadcasts a telemetry
+        event), this actually moves the task off the agent's active
+        count — freeing `max_concurrent=1` slots for reassignment.
+
+        Pre-fix (2026-04-20), `run_task`'s exception path only
+        called `send_error`; the task sat in ACCEPTED forever and
+        the slot stayed at capacity. See codex-alor-report.md for
+        the audit finding.
+
+        `reason` is a short human-readable description (goes into
+        the broadcast event's `reason` field + daemon logs).
+        `waiting_for` is an optional hint for the orchestrator when
+        the wrapper knows what unblocks it — e.g. "user input",
+        "dependency X". None means "don't know / generic failure".
+        """
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "reason": reason,
+        }
+        if waiting_for is not None:
+            payload["waiting_for"] = waiting_for
+        else:
+            # TaskBlocked's `waiting_for` is `Option<String>` on the
+            # Rust side; an explicit null on the wire maps to None.
+            payload["waiting_for"] = None
+        await self.send(MSG_TASK_BLOCKED, payload)
 
     async def send_worker_user_input(
         self,

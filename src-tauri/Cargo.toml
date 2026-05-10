@@ -38,9 +38,9 @@ serde_yaml = "0.9"
 # module-level Mutex so concurrent tests don't race on the env var.
 tempfile = "3"
 
-[profile.release]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "s"
-strip = true
+# [profile.release] lives at the workspace root (/Cargo.toml) — cargo
+# ignores profile blocks on non-root workspace members and emits
+# "profiles for the non root package will be ignored" if one is
+# defined here. Keeping this comment so the next contributor who
+# wants to tweak LTO / strip / opt-level knows where to actually
+# make the change, and doesn't silently re-introduce a no-op block.

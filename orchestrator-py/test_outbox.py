@@ -229,11 +229,17 @@ async def test_all_exception_types_caught() -> None:
 
 
 async def test_count_cap_evicts_oldest() -> None:
+    # Uses send_complete rather than send_accept as the outbox-push
+    # vehicle — send_accept was promoted to strict-send in the
+    # 73378a0d follow-up fix, so it no longer queues. send_complete
+    # still routes through the queueing `send()` path and keeps the
+    # same shape (task_id in payload) so the FIFO assertions below
+    # still read naturally.
     w = DeadWriterOnDrain()
     sock = make_client(w)
     # Send OUTBOX_MAX_ENTRIES + 5 frames with distinguishable payloads.
     for i in range(OUTBOX_MAX_ENTRIES + 5):
-        await sock.send_accept(f"task-{i}")
+        await sock.send_complete(f"task-{i}", summary="ok")
     check("count-cap: length capped", sock.pending_count(), OUTBOX_MAX_ENTRIES)
     check("count-cap: 5 dropped", sock.dropped_count(), 5)
     # FIFO: the first 5 frames (task-0…task-4) were evicted; the head
@@ -284,9 +290,12 @@ async def test_oversized_frame_kept_when_empty() -> None:
 
 async def test_flush_fifo_order() -> None:
     # Queue on a dead writer, then swap to a capturing writer and flush.
+    # send_accept was swapped out (now strict — doesn't queue); using
+    # send_error as the first queueing kind instead so this test still
+    # exercises heterogeneous-kind FIFO ordering through the outbox.
     dead = DeadWriterOnDrain()
     sock = make_client(dead)
-    await sock.send_accept("task-1")
+    await sock.send_error("boom")
     await sock.send_complete("task-1", summary="ok")
     await sock.send_status(task_id="task-1", alive=True)
     check("flush-fifo: 3 pending", sock.pending_count(), 3)
@@ -301,17 +310,19 @@ async def test_flush_fifo_order() -> None:
     check(
         "flush-fifo: order preserved",
         kinds,
-        ["task.accept", "task.complete", "status.response"],
+        ["wrapper.error", "task.complete", "status.response"],
     )
 
 
 async def test_partial_flush_keeps_remainder() -> None:
-    # Queue 3 frames on a dead writer.
+    # Queue 3 frames on a dead writer. Swapped from send_accept to
+    # send_complete after send_accept became strict — same FIFO
+    # invariant under test, different envelope kind.
     dead = DeadWriterOnDrain()
     sock = make_client(dead)
-    await sock.send_accept("task-1")
-    await sock.send_accept("task-2")
-    await sock.send_accept("task-3")
+    await sock.send_complete("task-1", summary="a")
+    await sock.send_complete("task-2", summary="b")
+    await sock.send_complete("task-3", summary="c")
     check("partial: 3 pending before flush", sock.pending_count(), 3)
 
     # Writer that succeeds once then fails.
@@ -327,16 +338,21 @@ async def test_partial_flush_keeps_remainder() -> None:
     check("partial: tail is task-3", tail["payload"]["task_id"], "task-3")
 
 
-async def test_all_six_send_paths_route_through_outbox() -> None:
-    """Every public send_* wrapper must end up in the outbox when the
-    writer is dead — that's the whole point of routing through `send()`.
+async def test_queueing_send_paths_route_through_outbox() -> None:
+    """Every public send_* wrapper that uses the QUEUEING send path
+    must end up in the outbox when the writer is dead — that's the
+    whole point of routing through `send()`.
+
+    Renamed from `test_all_six_*` when `send_accept` was promoted to
+    the strict-send path (2026-04-20, task 73378a0d follow-up).
+    Silent queue on a dead socket was actively dangerous for
+    task.accept — the daemon would never see the accept, the task
+    would sit in ASSIGNED while the worker burned tokens. Strict
+    semantics there surface the failure to `run_task`, which now
+    refuses to enter the SDK phase. `test_send_accept_is_strict`
+    locks in the new raise behavior as a sibling.
     """
     paths: list[tuple[str, Any, str]] = [
-        (
-            "send_accept",
-            lambda s: s.send_accept("task-1"),
-            "task.accept",
-        ),
         (
             "send_complete",
             lambda s: s.send_complete("task-1", summary="ok"),
@@ -384,6 +400,69 @@ async def test_all_six_send_paths_route_through_outbox() -> None:
 # ---------------------------------------------------------------------------
 
 
+async def test_send_accept_is_strict() -> None:
+    """send_accept MUST NOT silently queue on a dead writer.
+
+    The complementary test to `test_queueing_send_paths_route_through_outbox`
+    — where that test asserts five send_* paths DO queue, this one
+    asserts send_accept specifically does NOT. Silent queue on
+    task.accept was an observed live bug (2026-04-20, task
+    73378a0d): daemon never saw the accept, task sat in ASSIGNED
+    while the worker streamed an SDK response into the void.
+
+    Expected behavior now: raise `AgentClientError` so `run_task`
+    can refuse to enter the SDK phase. Outbox must remain empty —
+    a strict-send failure must NOT leak frames into the queue that
+    might flush later under a stale task id.
+    """
+    from agent_client import AgentClientError
+
+    # Dead writer — drain() raises BrokenPipeError.
+    w = DeadWriterOnDrain(BrokenPipeError)
+    sock = make_client(w)
+
+    raised = False
+    try:
+        await sock.send_accept("task-strict-1")
+    except AgentClientError:
+        raised = True
+    except BaseException as e:
+        check(
+            f"strict-accept: wrong exception type escaped ({type(e).__name__})",
+            False,
+            True,
+        )
+        return
+
+    check_true("strict-accept: raises on dead writer", raised)
+    check("strict-accept: outbox stays empty (no silent queue)", sock.pending_count(), 0)
+    check("strict-accept: zero drops", sock.dropped_count(), 0)
+
+    # Pre-connect variant: writer is None (never connected). Strict
+    # send must ALSO raise here — pre-fix the `if self._writer is
+    # None: self._enqueue(frame); return` branch of send() would
+    # silently queue task.accept even before the socket existed.
+    sock2 = AgentClient("never-connected")  # no _writer set
+    raised2 = False
+    try:
+        await sock2.send_accept("task-strict-2")
+    except AgentClientError:
+        raised2 = True
+    except BaseException as e:
+        check(
+            f"strict-accept pre-connect: wrong exception type ({type(e).__name__})",
+            False,
+            True,
+        )
+        return
+    check_true("strict-accept pre-connect: raises when no writer", raised2)
+    check(
+        "strict-accept pre-connect: outbox empty",
+        sock2.pending_count(),
+        0,
+    )
+
+
 async def test_disk_persist_round_trip() -> None:
     """Queued frames survive process restart via on-disk JSONL mirror.
 
@@ -421,7 +500,10 @@ async def test_disk_persist_cleared_on_empty() -> None:
 
         sock = AgentClient("clean", outbox_path=outbox_path)
         sock._writer = DeadWriterOnDrain()  # type: ignore[assignment]
-        await sock.send_accept("task-1")
+        # send_accept is now strict (raises on dead writer); use
+        # send_complete here since this test only cares about the
+        # disk-persist-then-clear behavior, not the specific kind.
+        await sock.send_complete("task-1", summary="ok")
         check("empty-cleanup: file written", outbox_path.exists(), True)
 
         # Swap to a live writer and drain.
@@ -477,7 +559,8 @@ async def test_disk_persist_in_memory_mode_writes_nothing() -> None:
     with tempfile.TemporaryDirectory() as td:
         sock = AgentClient("mem-only", outbox_path=None)
         sock._writer = DeadWriterOnDrain()  # type: ignore[assignment]
-        await sock.send_accept("t1")
+        # send_accept is strict now; send_complete still queues.
+        await sock.send_complete("t1", summary="ok")
         check("in-mem: 1 queued", sock.pending_count(), 1)
         # No file anywhere under the tmpdir.
         leftovers = list(Path(td).rglob("*"))
@@ -494,7 +577,8 @@ async def main() -> int:
     await test_oversized_frame_kept_when_empty()
     await test_flush_fifo_order()
     await test_partial_flush_keeps_remainder()
-    await test_all_six_send_paths_route_through_outbox()
+    await test_queueing_send_paths_route_through_outbox()
+    await test_send_accept_is_strict()
     await test_disk_persist_round_trip()
     await test_disk_persist_cleared_on_empty()
     await test_disk_persist_skips_corrupt_lines()

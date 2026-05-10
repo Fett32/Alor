@@ -1,0 +1,190 @@
+name: rust-ci
+
+# Rust CI for Alor. Mirrors python-tests.yml's trigger + path-filter
+# pattern so PRs that touch only Python (or only markdown) don't pay
+# the 10+ minute Rust compile cost.
+#
+# Three jobs, deliberately staged:
+#
+#   1. test       — `cargo test --workspace`. STRICT (blocks PRs).
+#                   Suite is clean today (~140 tests across 4
+#                   binaries: alor lib, reconcile_integration,
+#                   alor-cli, alor-wrapper). Regressions here catch
+#                   the thing the absence-of-CI has been missing —
+#                   a Rust change merged blind.
+#
+#   2. fmt        — `cargo fmt --all -- --check`. ADVISORY
+#                   (continue-on-error). The tree has ~260 pre-
+#                   existing fmt diffs that have accumulated since
+#                   inception because no CI was ever enforcing fmt;
+#                   running strict on day one would fail every
+#                   push. Advisory mode makes NEW drift visible in
+#                   the status column without blocking merges. Flip
+#                   to strict (remove continue-on-error) after a
+#                   cleanup PR runs `cargo fmt --all` across the
+#                   tree.
+#
+#   3. clippy     — `cargo clippy --workspace --all-targets --
+#                   -D warnings`. ADVISORY (continue-on-error) for
+#                   the same reason — ~44 existing warnings (unused
+#                   imports, too-many-args, item-after-test-module,
+#                   etc.). Same flip-to-strict story: a cleanup PR
+#                   scrubs the warnings, then CI becomes
+#                   authoritative.
+#
+# Caching: Swatinem/rust-cache@v2 is the standard for Rust CI —
+# caches registry + git + target/, keyed on Cargo.lock. First run
+# is a full build (~5-10min); subsequent runs hit the cache and
+# typically complete in under 2min for test-only changes.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "src-tauri/**"
+      - "wrapper/**"
+      - "cli/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust-ci.yml"
+  pull_request:
+    paths:
+      - "src-tauri/**"
+      - "wrapper/**"
+      - "cli/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust-ci.yml"
+  workflow_dispatch:
+
+# Cancel older runs on the same ref — a fresh push supersedes. Matches
+# the Python workflow's implicit behavior (no concurrency group needed
+# there because it's fast; Rust needs it because compiles are slow).
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -----------------------------------------------------------------
+  # 1) Tests — STRICT. Failure here blocks PRs.
+  # -----------------------------------------------------------------
+  test:
+    name: cargo test --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri system dependencies
+        # Mirrors bootstrap.sh's apt-get list. The tauri crate links
+        # against libwebkit2gtk-4.1-dev; without it, `cargo test` in
+        # the workspace root fails during src-tauri compilation.
+        # --no-install-recommends keeps the install minimal.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            pkg-config \
+            tmux \
+            wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache keys per job keep test/fmt/clippy from
+          # clobbering each other's target/ subdirs.
+          shared-key: "test"
+
+      - name: cargo test --workspace
+        # --workspace hits all three crates: alor (lib + Tauri bin),
+        # alor-wrapper, alor-cli. Integration tests in
+        # src-tauri/tests/reconcile_integration.rs exercise real
+        # tmux sessions; the runner gracefully skips tmux-gated
+        # tests when the binary isn't present (see
+        # src-tauri/tests/common::skip_if_tmux_not_runnable). We
+        # install tmux above so those tests ACTUALLY run in CI
+        # rather than silently passing via the skip path.
+        run: cargo test --workspace --verbose
+
+  # -----------------------------------------------------------------
+  # 2) Formatting — ADVISORY (continue-on-error: true).
+  #
+  # The tree has ~260 pre-existing fmt diffs (repo was never under
+  # fmt-enforcement). Strict mode would fail every push until a
+  # cleanup PR runs `cargo fmt --all`. Advisory mode makes NEW
+  # drift visible in the GitHub status column without blocking. To
+  # promote to strict: remove `continue-on-error: true`.
+  # -----------------------------------------------------------------
+  fmt:
+    name: cargo fmt --check (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+  # -----------------------------------------------------------------
+  # 3) Clippy — ADVISORY (continue-on-error: true).
+  #
+  # Same reasoning as fmt: ~44 pre-existing warnings. Advisory mode
+  # catches new warnings in PRs without blocking the backlog.
+  # Promote to strict after a cleanup PR (run
+  # `cargo clippy --fix --workspace --allow-dirty` + hand-fix the
+  # rest) has scrubbed the warning set.
+  # -----------------------------------------------------------------
+  clippy:
+    name: cargo clippy -D warnings (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri system dependencies
+        # Same set as the test job — clippy needs to actually type-
+        # check the Tauri crate, which links against webkit2gtk.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            pkg-config \
+            wget
+
+      - name: Install Rust toolchain (clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "clippy"
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        # --all-targets checks bins, examples, tests, benches — the
+        # full surface, matching what `cargo test` builds.
+        # `-- -D warnings` promotes every warning to an error so the
+        # job actually signals red on new drift. Advisory at the
+        # job level (continue-on-error) absorbs the red during the
+        # existing-drift transition window.
+        run: cargo clippy --workspace --all-targets -- -D warnings

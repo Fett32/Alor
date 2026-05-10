@@ -6,7 +6,9 @@ Kept intentionally small — anything specific to a role lives in its own module
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import subprocess
 import sys
 import time
 from typing import Awaitable, Callable
@@ -68,6 +70,65 @@ def print_footer(session_start: float, total_cost_usd: float, totals: dict[str, 
         f"{C_DIM}  in {t_in} · out {t_out} · cache_w {cw} · cache_r {cr} · "
         f"${total_cost_usd:.4f} · {h:02d}:{m:02d}:{s:02d}{C_RESET}"
     )
+
+
+# ---- tmux option hygiene ----------------------------------------------------
+
+# Default paste-time for roles that don't need the "tmux treats every LF as a
+# submit" behavior the wrapper path relies on.
+#
+# Background: `alor-wrapper` sets `assume-paste-time 0` on every session it
+# manages (wrapper/src/tmux.rs::ensure_session_defaults). That setting
+# disables tmux's timing heuristic for paste detection, which is load-
+# bearing for the framed-send path — `tmux send-keys -l <BEGIN\nbody\nEND>`
+# must land at the receiving worker.py as separate `read_line` calls per
+# line, or `stdin_loop`'s BEGIN/END state machine never observes the frame
+# boundary (it'd receive the whole thing as one bracketed-paste block).
+#
+# The side effect: interactive Fett pastes into ANY wrapper-managed pane
+# lose bracketed-paste behavior too — middle-click / Ctrl-Shift-V of a
+# multi-line clipboard lands as a stream of per-line submits, one Enter
+# per embedded LF. For the orchestrator pane this was a real papercut
+# (per the b2f03b69 verification incident: pasting a worker's multi-line
+# verdict reply into the orch turned a single message into a 6-turn
+# back-and-forth).
+#
+# Fix: roles that DON'T receive framed tmux sends (currently: orchestrator
+# only) reset `assume-paste-time` on their own session at startup. Workers
+# stay on the wrapper default because their framing requires it.
+#
+# 500ms is generous: anything typed slower than 2 key/sec stays keystroke-
+# style (prefix key processing, key bindings all work). Anything faster
+# than that is clearly a paste — tmux's heuristic kicks in and prompt_
+# toolkit's BracketedPaste handler runs with the full clipboard as
+# event.data. Bracketed-paste via the outer terminal's markers (xterm,
+# Alacritty, VTE, kitty) continues to work independently.
+ORCHESTRATOR_ASSUME_PASTE_TIME_MS = 500
+
+
+def reset_assume_paste_time(session: str, ms: int = ORCHESTRATOR_ASSUME_PASTE_TIME_MS) -> bool:
+    """Restore tmux paste-time heuristic on the given session.
+
+    Best-effort: silently skips when not running under tmux or when
+    `tmux` isn't on PATH. Returns True on successful set-option, False
+    otherwise — callers generally don't care, but tests use the return
+    value to gate "did we actually touch anything" assertions.
+
+    Callers: orchestrator's `main.py` on startup. See the module-level
+    `ORCHESTRATOR_ASSUME_PASTE_TIME_MS` comment for the full rationale.
+    """
+    if not os.environ.get("TMUX"):
+        return False
+    try:
+        result = subprocess.run(
+            ["tmux", "set-option", "-t", session, "assume-paste-time", str(ms)],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
 
 
 # ---- Paste sanitization ----------------------------------------------------

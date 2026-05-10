@@ -420,6 +420,36 @@ async def memory_get(args: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool(
+    "memory_append",
+    "Append a curated note to a project's Memory Hub file. Use this to "
+    "promote a noteworthy finding from a completed task (or a "
+    "cross-session learning) into the hub so future agents can read "
+    "it via memory_get. Pass project, file_name (basename only — "
+    "names with `..`, `/`, `\\`, or NUL are rejected), and text (up "
+    "to 16 KiB per call; split larger notes across multiple calls). "
+    "The daemon creates the file if missing and appends exactly one "
+    "trailing newline so subsequent entries stay line-separated. "
+    "Files named `automation_log.md` head-trim past 256 KiB (rolling "
+    "window of recent completions, also populated automatically by "
+    "the daemon on every task.complete); other files trim past 1 "
+    "MiB. Prefer structured multi-line entries starting with `- ` "
+    "for bullet lists or `## ` for section headers to match the "
+    "shape `memory_get` consumers expect. Response shape: "
+    "{project, file_name, path, bytes_written}.",
+    {"project": str, "file_name": str, "text": str},
+)
+async def memory_append(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _ok(await daemon.memory_append(
+            args["project"],
+            args["file_name"],
+            args["text"],
+        ))
+    except Exception as e:
+        return _err(str(e))
+
+
+@tool(
     "worker_response_get",
     "Fetch the full untruncated text of a prior worker.orch_response. "
     "Use ONLY when you just saw a truncated `[Alor event]` injection "
@@ -456,6 +486,7 @@ ALL_TOOLS = [
     project_get,
     project_list,
     memory_get,
+    memory_append,
     worker_response_get,
 ]
 
