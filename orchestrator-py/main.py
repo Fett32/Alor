@@ -491,6 +491,13 @@ async def main() -> int:
     # worker.py. Role is passed explicitly even though "orch" is the
     # default so the split is visible at this call site.
     alor_server = tools.build_server("orch")
+    # Scratch cwd so Claude Code's auto-memory (keyed by cwd) writes its
+    # own MEMORY.md into an isolated dir instead of clobbering Fett's
+    # ~/.claude/projects/-home-fett-Projects-Alor/memory/ tree. The orch
+    # has no Read/Edit/Bash/Grep and `setting_sources=[]`, so cwd is only
+    # an auto-memory key — moving it has no functional impact on routing.
+    orch_cwd = os.path.expanduser("~/.local/share/alor/orchestrator/cwd")
+    os.makedirs(orch_cwd, exist_ok=True)
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         mcp_servers={"alor": alor_server},
@@ -499,7 +506,7 @@ async def main() -> int:
         model=model,
         setting_sources=[],
         permission_mode="bypassPermissions",
-        cwd=os.path.expanduser("~/Projects/Alor"),
+        cwd=orch_cwd,
         # Deny host-UI-dependent tools (AskUserQuestion, EnterPlanMode,
         # ExitPlanMode) with a typed message pointing at assistant-text
         # prompting. See tool_gate.py — Fett reads the orch conversation
