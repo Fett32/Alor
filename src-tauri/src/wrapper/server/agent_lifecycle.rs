@@ -223,16 +223,37 @@ impl SocketServer {
         }
 
         // Resolve workdir once; both runtime branches use it.
+        // No project-scoped workdir → per-agent scratch. Claude Code's
+        // auto-memory directory is keyed off cwd: a default of ~/ would
+        // route worker writes into ~/.claude/projects/-home-fett/memory/
+        // — the user's primary curated brief. Scratch keeps that
+        // isolated. Always-pass --workdir means worker.py never falls
+        // back to its own default either.
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let expanded_workdir: Option<std::path::PathBuf> =
-            effective_working_dir.as_ref().map(|wd| {
+        let expanded_workdir: std::path::PathBuf = match effective_working_dir.as_ref() {
+            Some(wd) => {
                 if wd.starts_with('~') {
                     std::path::PathBuf::from(&home)
                         .join(wd.strip_prefix("~/").unwrap_or(&wd[1..]))
                 } else {
                     std::path::PathBuf::from(wd)
                 }
-            });
+            }
+            None => {
+                let scratch = std::path::PathBuf::from(&home)
+                    .join(".local/share/alor/workers")
+                    .join(&instance_id)
+                    .join("cwd");
+                if let Err(e) = std::fs::create_dir_all(&scratch) {
+                    tracing::warn!(
+                        "failed to create worker scratch dir {}: {}",
+                        scratch.display(),
+                        e
+                    );
+                }
+                scratch
+            }
+        };
 
         let mut cmd = if config.runtime == "claude-sdk" {
             // SDK worker path: run-worker.sh inside a tmux session.
@@ -248,16 +269,12 @@ impl SocketServer {
 
             let mut c = std::process::Command::new("tmux");
             c.args(["new-session", "-d", "-s", &session_name]);
-            if let Some(ref wd) = expanded_workdir {
-                c.arg("-c").arg(wd);
-            }
+            c.arg("-c").arg(&expanded_workdir);
             // Everything after `--` is the command line tmux runs inside.
             c.arg("--");
             c.arg(&config.command[0]);
             c.arg(&instance_id);
-            if let Some(ref wd) = expanded_workdir {
-                c.arg("--workdir").arg(wd);
-            }
+            c.arg("--workdir").arg(&expanded_workdir);
             if let Some(ref proj) = effective_project {
                 c.arg("--project").arg(proj);
             }
@@ -278,9 +295,7 @@ impl SocketServer {
             if !config.command.is_empty() {
                 c.arg("--command").arg(config.command.join(" "));
             }
-            if let Some(ref wd) = expanded_workdir {
-                c.arg("--workdir").arg(wd);
-            }
+            c.arg("--workdir").arg(&expanded_workdir);
             if let Some(ref sf) = config.startup_file {
                 let expanded = if sf.starts_with('~') {
                     std::path::PathBuf::from(&home)

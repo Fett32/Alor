@@ -110,7 +110,16 @@ def render_prompt(agent_id: str, project: str | None, workdir: str, model: str) 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Alor Claude worker")
     p.add_argument("agent_id", help="e.g. claude-alor, claude-mandaforge")
-    p.add_argument("--workdir", default=os.path.expanduser("~"), help="cwd for the SDK client")
+    p.add_argument(
+        "--workdir",
+        default=None,
+        help=(
+            "cwd for the SDK client. If omitted, falls back to a per-agent scratch "
+            "dir under ~/.local/share/alor/workers/<agent_id>/cwd so Claude Code's "
+            "cwd-keyed auto-memory does not write into the user's primary "
+            "~/.claude/projects/-home-fett/memory/ tree."
+        ),
+    )
     p.add_argument("--project", default=None, help="Project slug (for prompt + CLAUDE.md hints)")
     p.add_argument("--model", default=DEFAULT_MODEL)
     return p.parse_args()
@@ -912,7 +921,24 @@ async def stdin_loop(
 
 async def main() -> int:
     args = parse_args()
-    workdir = os.path.expanduser(args.workdir)
+    if args.workdir is None:
+        # No explicit --workdir: route to per-agent scratch. Claude Code's
+        # auto-memory dir is keyed off cwd, so a default of ~/ would put
+        # the worker's MEMORY.md writes into ~/.claude/projects/-home-fett/
+        # memory/ — the user's primary curated brief. Scratch keeps it
+        # isolated. Direct `python worker.py <id>` invocations hit this
+        # path; daemon-spawned workers get an explicit --workdir from
+        # agent_lifecycle.rs (which has its own scratch fallback).
+        workdir = os.path.expanduser(
+            f"~/.local/share/alor/workers/{args.agent_id}/cwd"
+        )
+        os.makedirs(workdir, exist_ok=True)
+        print(
+            f"[worker] no --workdir provided; using per-agent scratch: {workdir}",
+            file=sys.stderr,
+        )
+    else:
+        workdir = os.path.expanduser(args.workdir)
 
     system_prompt = render_prompt(args.agent_id, args.project, workdir, args.model)
 

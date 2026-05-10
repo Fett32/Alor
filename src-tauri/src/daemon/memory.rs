@@ -224,8 +224,29 @@ pub fn link_agent_memory(
     source_path: PathBuf,
 ) -> Result<PathBuf> {
     let source_path = expand_tilde(source_path);
+
+    // Refuse to pull anything out of ~/.claude/. This API does an
+    // `fs::rename` of source_path into the hub and replaces the
+    // original with a symlink — that's destructive against the user's
+    // shared Claude Code config tree (memory dir, settings, sessions).
+    // If a workflow needs to surface MEMORY.md to a worker, copy it
+    // into the hub or hand it off via a TASK BRIEF — don't link it.
+    if let Some(home) = std::env::var_os("HOME") {
+        let claude_root = PathBuf::from(&home).join(".claude");
+        if source_path.starts_with(&claude_root) {
+            bail!(
+                "refusing to link {}: path is under {} (the user's Claude \
+                 Code config tree). link_agent_memory does a destructive \
+                 rename — copy the file into the hub or pass it via the \
+                 task brief instead.",
+                source_path.display(),
+                claude_root.display()
+            );
+        }
+    }
+
     let hub_dir = super::project::memory_hub_dir(project_name)?;
-    
+
     // Ensure project hub exists
     super::project::ensure_project_dirs(project_name)?;
 
@@ -500,5 +521,49 @@ mod tests {
             assert!(content.contains("Multi-line title"));
             assert!(content.contains("Line one Line two  Paragraph two"));
         });
+    }
+
+    #[test]
+    fn link_agent_memory_refuses_paths_under_dot_claude() {
+        // Repoint HOME so the guard's `~/.claude` check triggers against
+        // a path we own, not the developer's actual config tree.
+        let tmp = TempDir::new().expect("tempdir");
+        let guard = crate::daemon::test_env::XDG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev_home = std::env::var("HOME").ok();
+        let prev_xdg = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+
+        let danger = tmp
+            .path()
+            .join(".claude/projects/-home-fett/memory/MEMORY.md");
+        let err = link_agent_memory("testproj", "claude", danger.clone())
+            .expect_err("must refuse paths under ~/.claude/");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing to link") && msg.contains(".claude"),
+            "error must name the guard: {msg}"
+        );
+
+        // A path outside ~/.claude/ still works (sanity: we didn't break
+        // the happy path with the guard).
+        let safe_src = tmp.path().join("scratch_memory.md");
+        std::fs::write(&safe_src, "seed\n").expect("write seed");
+        link_agent_memory("testproj", "claude", safe_src)
+            .expect("non-claude paths still link");
+
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(x) = prev_xdg {
+            std::env::set_var("XDG_DATA_HOME", x);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        drop(guard);
     }
 }
